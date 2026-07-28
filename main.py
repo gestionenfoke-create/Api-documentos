@@ -120,6 +120,17 @@ def copiar_plantilla(
     nombre_documento: str,
 ) -> dict[str, str]:
     drive_service = obtener_drive_service()
+    
+ # ======= AGREGAR ESTO =======
+    about = drive_service.about().get(
+        fields="user,storageQuota"
+    ).execute()
+
+    print("===== DRIVE INFO =====")
+    print(about)
+    print("======================")
+    # ============================
+
 
     metadata = {
         "name": nombre_documento,
