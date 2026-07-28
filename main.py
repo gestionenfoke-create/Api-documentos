@@ -6,7 +6,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-import google.auth
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
 import requests
 from flask import Flask, jsonify, request
 from googleapiclient.discovery import build
@@ -30,6 +31,27 @@ TABLA_VERSIONES = os.environ.get(
 
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN")
 
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get(
+    "GOOGLE_OAUTH_CLIENT_ID"
+)
+
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get(
+    "GOOGLE_OAUTH_CLIENT_SECRET"
+)
+
+GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get(
+    "GOOGLE_OAUTH_REFRESH_TOKEN"
+)
+
+GOOGLE_OAUTH_TOKEN_URI = os.environ.get(
+    "GOOGLE_OAUTH_TOKEN_URI",
+    "https://oauth2.googleapis.com/token",
+)
+
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+]
+
 
 def validar_configuracion() -> None:
     faltantes = []
@@ -42,6 +64,15 @@ def validar_configuracion() -> None:
 
     if not WEBHOOK_TOKEN:
         faltantes.append("WEBHOOK_TOKEN")
+
+    if not GOOGLE_OAUTH_CLIENT_ID:
+        faltantes.append("GOOGLE_OAUTH_CLIENT_ID")
+
+    if not GOOGLE_OAUTH_CLIENT_SECRET:
+        faltantes.append("GOOGLE_OAUTH_CLIENT_SECRET")
+
+    if not GOOGLE_OAUTH_REFRESH_TOKEN:
+        faltantes.append("GOOGLE_OAUTH_REFRESH_TOKEN")
 
     if faltantes:
         raise RuntimeError(
@@ -57,9 +88,21 @@ def validar_token() -> None:
 
 
 def obtener_drive_service():
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/drive"]
+    """
+    Crea el cliente de Google Drive usando OAuth 2.0 del usuario
+    gestion.enfoke@gmail.com. El access token se renueva
+    automáticamente mediante el refresh token guardado en Secret Manager.
+    """
+    credentials = Credentials(
+        token=None,
+        refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+        token_uri=GOOGLE_OAUTH_TOKEN_URI,
+        client_id=GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+        scopes=DRIVE_SCOPES,
     )
+
+    credentials.refresh(GoogleAuthRequest())
 
     return build(
         "drive",
@@ -120,17 +163,6 @@ def copiar_plantilla(
     nombre_documento: str,
 ) -> dict[str, str]:
     drive_service = obtener_drive_service()
-    
- # ======= AGREGAR ESTO =======
-    about = drive_service.about().get(
-        fields="user,storageQuota"
-    ).execute()
-
-    print("===== DRIVE INFO =====")
-    print(about)
-    print("======================")
-    # ============================
-
 
     metadata = {
         "name": nombre_documento,
