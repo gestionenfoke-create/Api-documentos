@@ -223,15 +223,19 @@ def copiar_plantilla(
     }
 
 
-def asegurar_permiso_editor(
+def asegurar_permiso_rol(
     drive_service: Any,
     file_id: str,
     email: str,
+    role: str,
 ) -> str:
+    """Crea o actualiza el permiso directo de un usuario sobre un archivo."""
+    roles_validos = {"reader", "commenter", "writer"}
+    if role not in roles_validos:
+        raise ValueError(f"Rol de Drive no válido: {role!r}")
+
     if not email or "@" not in email:
-        raise ValueError(
-            f"El encargado de orden 1 no tiene un correo válido: {email!r}"
-        )
+        raise ValueError(f"Correo de responsable no válido: {email!r}")
 
     permisos = (
         drive_service.permissions()
@@ -248,16 +252,22 @@ def asegurar_permiso_editor(
         if texto(permiso.get("emailAddress")).lower() != email.lower():
             continue
 
+        permission_id = texto(permiso.get("id"))
         rol_actual = texto(permiso.get("role")).lower()
-        if rol_actual in {"owner", "organizer", "fileorganizer", "writer"}:
-            return texto(permiso.get("id"))
+
+        # No se puede degradar al propietario mediante esta operación.
+        if rol_actual in {"owner", "organizer", "fileorganizer"}:
+            return permission_id
+
+        if rol_actual == role:
+            return permission_id
 
         permiso_actualizado = (
             drive_service.permissions()
             .update(
                 fileId=file_id,
-                permissionId=permiso["id"],
-                body={"role": "writer"},
+                permissionId=permission_id,
+                body={"role": role},
                 fields="id",
                 supportsAllDrives=True,
             )
@@ -271,7 +281,7 @@ def asegurar_permiso_editor(
             fileId=file_id,
             body={
                 "type": "user",
-                "role": "writer",
+                "role": role,
                 "emailAddress": email,
             },
             fields="id",
@@ -282,6 +292,91 @@ def asegurar_permiso_editor(
     )
 
     return texto(permiso_creado.get("id"))
+
+
+def asegurar_permiso_editor(
+    drive_service: Any,
+    file_id: str,
+    email: str,
+) -> str:
+    return asegurar_permiso_rol(
+        drive_service=drive_service,
+        file_id=file_id,
+        email=email,
+        role="writer",
+    )
+
+
+def escapar_consulta_drive(valor: str) -> str:
+    return valor.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def buscar_archivo_en_carpeta(
+    drive_service: Any,
+    folder_id: str,
+    nombre_archivo: str,
+) -> dict[str, str] | None:
+    """Busca un archivo exacto para reutilizarlo tras un reintento."""
+    nombre_q = escapar_consulta_drive(nombre_archivo)
+    folder_q = escapar_consulta_drive(folder_id)
+    consulta = (
+        f"name = '{nombre_q}' and "
+        f"'{folder_q}' in parents and trashed = false"
+    )
+
+    archivos = (
+        drive_service.files()
+        .list(
+            q=consulta,
+            fields="files(id,name,webViewLink)",
+            spaces="drive",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=10,
+        )
+        .execute()
+        .get("files", [])
+    )
+
+    if len(archivos) > 1:
+        raise RuntimeError(
+            f"Existen varios archivos con el nombre {nombre_archivo!r} "
+            "en la carpeta destino. Elimina los duplicados antes de continuar."
+        )
+
+    if not archivos:
+        return None
+
+    archivo = archivos[0]
+    file_id = texto(archivo.get("id"))
+    return {
+        "id": file_id,
+        "name": texto(archivo.get("name")) or nombre_archivo,
+        "url": texto(archivo.get("webViewLink"))
+        or f"https://docs.google.com/document/d/{file_id}/edit",
+    }
+
+
+def copiar_archivo_o_reutilizar(
+    drive_service: Any,
+    source_file_id: str,
+    folder_id: str,
+    nombre_archivo: str,
+) -> dict[str, str]:
+    existente = buscar_archivo_en_carpeta(
+        drive_service=drive_service,
+        folder_id=folder_id,
+        nombre_archivo=nombre_archivo,
+    )
+    if existente:
+        return existente
+
+    return copiar_plantilla(
+        drive_service=drive_service,
+        template_id=source_file_id,
+        folder_id=folder_id,
+        nombre_documento=nombre_archivo,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -493,6 +588,111 @@ def marcar_documento_error(id_documento: str, mensaje: str) -> None:
         traceback.print_exc()
 
 
+
+def registrar_error_transicion(id_documento: str, mensaje: str) -> None:
+    """Registra el error sin cambiar a ciegas el estado vigente."""
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "OBSERVACION_ACTUAL": mensaje[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+def buscar_aprobacion_actual(
+    id_aprobacion_actual: str,
+) -> dict[str, Any]:
+    selector = (
+        f"FILTER({TABLA_APROBADORES_ACTUAL}, "
+        f"[ID_APROBACION_ACTUAL] = "
+        f"{literal_appsheet(id_aprobacion_actual)})"
+    )
+    filas = appsheet_find(TABLA_APROBADORES_ACTUAL, selector)
+    if not filas:
+        raise LookupError(
+            "No se encontró ID_APROBACION_ACTUAL="
+            f"{id_aprobacion_actual}"
+        )
+    return filas[0]
+
+
+def buscar_cadena_actual_documento(
+    id_documento: str,
+    numero_version: int,
+) -> list[dict[str, Any]]:
+    selector = (
+        f"FILTER({TABLA_APROBADORES_ACTUAL}, "
+        f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)})"
+    )
+    filas = appsheet_find(TABLA_APROBADORES_ACTUAL, selector)
+    activas = [
+        fila
+        for fila in filas
+        if es_verdadero(fila.get("CADENA_ACTIVA"))
+        and entero(fila.get("NUMERO_VERSION"), "NUMERO_VERSION")
+        == numero_version
+    ]
+    return sorted(
+        activas,
+        key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"),
+    )
+
+
+def buscar_version_por_id(id_version: str) -> dict[str, Any]:
+    selector = (
+        f"FILTER({TABLA_VERSIONES}, "
+        f"[ID_VERSION] = {literal_appsheet(id_version)})"
+    )
+    filas = appsheet_find(TABLA_VERSIONES, selector)
+    if not filas:
+        raise LookupError(f"No se encontró ID_VERSION={id_version}")
+    return filas[0]
+
+
+def buscar_version_numero_revision(
+    id_documento: str,
+    numero_version: int,
+    numero_revision: int,
+) -> dict[str, Any] | None:
+    versiones = buscar_versiones_documento(id_documento)
+    coincidentes: list[dict[str, Any]] = []
+
+    for fila in versiones:
+        try:
+            version_fila = entero(
+                fila.get("NUMERO_VERSION"),
+                "NUMERO_VERSION",
+            )
+            revision_fila = entero(
+                fila.get("NUMERO_REVISION"),
+                "NUMERO_REVISION",
+            )
+        except ValueError:
+            continue
+
+        if (
+            version_fila == numero_version
+            and revision_fila == numero_revision
+        ):
+            coincidentes.append(fila)
+
+    if len(coincidentes) > 1:
+        raise RuntimeError(
+            "Existen varias filas de Documento_Versiones para "
+            f"V{numero_version:02d} REV{numero_revision:02d}"
+        )
+
+    return coincidentes[0] if coincidentes else None
+
+
 # -----------------------------------------------------------------------------
 # Flujo: creación inicial
 # -----------------------------------------------------------------------------
@@ -684,6 +884,163 @@ def health():
     }
 
 
+# -----------------------------------------------------------------------------
+# Flujo: envío a revisión
+# -----------------------------------------------------------------------------
+
+
+def crear_registro_version_revision(
+    id_version: str,
+    id_documento: str,
+    id_version_origen: str,
+    numero_version: int,
+    numero_revision: int,
+    nombre_archivo: str,
+    google_doc_id: str,
+    google_doc_url: str,
+    id_aprobacion_responsable: str,
+    orden_responsable: int,
+    creado_por: str,
+    fecha_creacion: str,
+    comentario: str,
+) -> None:
+    fila = {
+        "ID_VERSION": id_version,
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION_ORIGEN": id_version_origen,
+        "NUMERO_VERSION": numero_version,
+        "NUMERO_REVISION": numero_revision,
+        "ETAPA": "Revisión",
+        "ESTADO_VERSION": "Activa",
+        "NOMBRE_ARCHIVO": nombre_archivo,
+        "GOOGLE_DOC_ID": google_doc_id,
+        "GOOGLE_DOC_URL": google_doc_url,
+        "ID_APROBACION_RESPONSABLE": id_aprobacion_responsable,
+        "ORDEN_RESPONSABLE": orden_responsable,
+        "MOTIVO_CREACION": "Envío a revisión",
+        "COMENTARIO_CAMBIO": comentario,
+        "CREADO_POR": creado_por,
+        "FECHA_CREACION": fecha_creacion,
+    }
+    appsheet_action(TABLA_VERSIONES, "Add", [fila])
+
+
+def cerrar_version(id_version: str, fecha_cierre: str) -> None:
+    appsheet_action(
+        TABLA_VERSIONES,
+        "Edit",
+        [
+            {
+                "ID_VERSION": id_version,
+                "ESTADO_VERSION": "Cerrada",
+                "FECHA_CIERRE": fecha_cierre,
+            }
+        ],
+    )
+
+
+def actualizar_aprobadores_envio_revision(
+    actual: dict[str, Any],
+    siguiente: dict[str, Any],
+    id_version_nueva: str,
+    permission_id_siguiente: str,
+    comentario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_APROBADORES_ACTUAL,
+        "Edit",
+        [
+            {
+                "ID_APROBACION_ACTUAL": actual["ID_APROBACION_ACTUAL"],
+                "ESTADO": "Cerrado",
+                "RESULTADO": "Enviado",
+                "COMENTARIO": comentario,
+                "FECHA_RESPUESTA": fecha,
+            },
+            {
+                "ID_APROBACION_ACTUAL": siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ESTADO": "En revisión",
+                "ID_VERSION_TRABAJADA": id_version_nueva,
+                "FECHA_INICIO": fecha,
+                "PERMISSION_ID_DRIVE": permission_id_siguiente,
+            },
+        ],
+    )
+
+
+def actualizar_documento_envio_revision(
+    id_documento: str,
+    numero_version: int,
+    numero_revision: int,
+    id_version: str,
+    copia: dict[str, str],
+    siguiente: dict[str, Any],
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "En revisión",
+                "VERSION_ACTUAL": numero_version,
+                "REVISION_ACTUAL": numero_revision,
+                "ID_VERSION_ACTUAL": id_version,
+                "GOOGLE_DOC_ID": copia["id"],
+                "GOOGLE_DOC_URL": copia["url"],
+                "ORDEN_ACTUAL": siguiente["ORDEN"],
+                "ID_APROBACION_ACTUAL": siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ENCARGADO_ACTUAL_NOMBRE": siguiente.get("NOMBRE", ""),
+                "ENCARGADO_ACTUAL_EMAIL": siguiente.get("APROBADOR", ""),
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+            }
+        ],
+    )
+
+
+def crear_evento_envio_revision(
+    id_documento: str,
+    id_version: str,
+    id_aprobacion_actual: str,
+    usuario: str,
+    fecha: str,
+    comentario: str,
+    nombre_archivo: str,
+) -> None:
+    detalle = f"Se creó {nombre_archivo} y se entregó al siguiente responsable."
+    if comentario:
+        detalle += f" Comentario: {comentario}"
+
+    appsheet_action(
+        TABLA_EVENTOS,
+        "Add",
+        [
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": id_aprobacion_actual,
+                "TIPO_EVENTO": "Enviado a revisión",
+                "ESTADO_ANTERIOR": "Borrador",
+                "ESTADO_NUEVO": "En revisión",
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": detalle,
+            }
+        ],
+    )
+
+
 @app.route("/crear-documento", methods=["POST"])
 def crear_documento():
     id_documento = ""
@@ -867,6 +1224,306 @@ def crear_documento():
         traceback.print_exc()
         if id_documento:
             marcar_documento_error(id_documento, str(exc))
+        return {"error": str(exc)}, 500
+
+
+@app.route("/enviar-revision", methods=["POST"])
+def enviar_revision():
+    id_documento = ""
+
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        id_aprobacion_solicitud = texto(
+            data.get("id_aprobacion_actual")
+        )
+        usuario = texto(data.get("usuario"))
+        comentario = texto(data.get("comentario"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+
+        documento = buscar_documento(id_documento)
+        estado_documento = texto(documento.get("ESTADO"))
+
+        # Respuesta idempotente ante reintentos del Bot.
+        if estado_documento == "En revisión":
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "id_version": texto(documento.get("ID_VERSION_ACTUAL")),
+                    "google_doc_id": texto(documento.get("GOOGLE_DOC_ID")),
+                    "google_doc_url": texto(documento.get("GOOGLE_DOC_URL")),
+                    "estado": estado_documento,
+                    "mensaje": "El documento ya fue enviado a revisión.",
+                }
+            )
+
+        if estado_documento != "Borrador":
+            raise ValueError(
+                "Solo se puede enviar a revisión un documento en estado "
+                f"Borrador. Estado actual: {estado_documento!r}"
+            )
+
+        numero_version = entero(
+            documento.get("VERSION_ACTUAL") or 1,
+            "VERSION_ACTUAL",
+        )
+        revision_actual = entero(
+            documento.get("REVISION_ACTUAL") or 0,
+            "REVISION_ACTUAL",
+        )
+        numero_revision_nueva = revision_actual + 1
+
+        id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+        id_aprobacion_actual = texto(
+            documento.get("ID_APROBACION_ACTUAL")
+        )
+        google_doc_id_actual = texto(documento.get("GOOGLE_DOC_ID"))
+
+        if not id_version_actual:
+            raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
+        if not id_aprobacion_actual:
+            raise ValueError("Documentos no tiene ID_APROBACION_ACTUAL")
+        if not google_doc_id_actual:
+            raise ValueError("Documentos no tiene GOOGLE_DOC_ID")
+
+        if (
+            id_aprobacion_solicitud
+            and id_aprobacion_solicitud != id_aprobacion_actual
+        ):
+            raise ValueError(
+                "El encargado enviado por AppSheet ya no coincide con el "
+                "encargado actual del documento"
+            )
+
+        aprobacion_actual = buscar_aprobacion_actual(
+            id_aprobacion_actual
+        )
+
+        if not es_verdadero(aprobacion_actual.get("CADENA_ACTIVA")):
+            raise ValueError("La cadena de aprobación actual no está activa")
+
+        estado_aprobador = texto(aprobacion_actual.get("ESTADO"))
+        if estado_aprobador not in {"En elaboración", "Cerrado"}:
+            raise ValueError(
+                "El encargado actual no está en elaboración. "
+                f"Estado encontrado: {estado_aprobador!r}"
+            )
+
+        email_actual = texto(aprobacion_actual.get("APROBADOR"))
+        if usuario and email_actual.lower() != usuario.lower():
+            raise PermissionError(
+                "Solo el encargado actual puede enviar el documento "
+                "a revisión"
+            )
+        usuario = usuario or email_actual
+
+        cadena_actual = buscar_cadena_actual_documento(
+            id_documento=id_documento,
+            numero_version=numero_version,
+        )
+        orden_actual = entero(
+            aprobacion_actual.get("ORDEN"),
+            "ORDEN",
+        )
+
+        siguientes = [
+            fila
+            for fila in cadena_actual
+            if entero(fila.get("ORDEN"), "ORDEN") > orden_actual
+            and texto(fila.get("ESTADO")) in {"Pendiente", "En revisión"}
+        ]
+
+        if not siguientes:
+            raise ValueError(
+                "No existe un siguiente responsable en la cadena. "
+                "Cuando sea el último encargado se debe usar el flujo "
+                "Listo para firma."
+            )
+
+        siguiente = siguientes[0]
+        siguiente_email = texto(siguiente.get("APROBADOR"))
+        siguiente_orden = entero(siguiente.get("ORDEN"), "ORDEN")
+
+        if not siguiente_email:
+            raise ValueError(
+                f"El responsable de orden {siguiente_orden} no tiene correo"
+            )
+
+        version_actual = buscar_version_por_id(id_version_actual)
+        etapa_actual = texto(version_actual.get("ETAPA"))
+        if etapa_actual != "Borrador":
+            raise ValueError(
+                "La versión vigente no corresponde a un borrador. "
+                f"ETAPA encontrada: {etapa_actual!r}"
+            )
+
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
+        folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
+        if not folder_id:
+            raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
+
+        titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        nombre_archivo = limpiar_nombre_archivo(
+            f"{titulo}_V{numero_version:02d}_REV{numero_revision_nueva:02d}"
+        )
+        fecha = ahora_iso()
+
+        version_existente = buscar_version_numero_revision(
+            id_documento=id_documento,
+            numero_version=numero_version,
+            numero_revision=numero_revision_nueva,
+        )
+
+        drive_service = obtener_drive_service()
+
+        if version_existente:
+            id_version_nueva = texto(version_existente.get("ID_VERSION"))
+            copia = {
+                "id": texto(version_existente.get("GOOGLE_DOC_ID")),
+                "url": texto(version_existente.get("GOOGLE_DOC_URL")),
+                "name": texto(version_existente.get("NOMBRE_ARCHIVO"))
+                or nombre_archivo,
+            }
+            if not copia["id"]:
+                raise RuntimeError(
+                    "La versión de revisión existente no tiene GOOGLE_DOC_ID"
+                )
+        else:
+            id_version_nueva = nuevo_id()
+            copia = copiar_archivo_o_reutilizar(
+                drive_service=drive_service,
+                source_file_id=google_doc_id_actual,
+                folder_id=folder_id,
+                nombre_archivo=nombre_archivo,
+            )
+
+        # El archivo de borrador queda congelado para su elaborador.
+        asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=google_doc_id_actual,
+            email=email_actual,
+            role="reader",
+        )
+
+        # En la nueva revisión, el elaborador comenta y el siguiente revisa.
+        asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=copia["id"],
+            email=email_actual,
+            role="commenter",
+        )
+        permission_id_siguiente = asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=copia["id"],
+            email=siguiente_email,
+            role="writer",
+        )
+
+        if not version_existente:
+            crear_registro_version_revision(
+                id_version=id_version_nueva,
+                id_documento=id_documento,
+                id_version_origen=id_version_actual,
+                numero_version=numero_version,
+                numero_revision=numero_revision_nueva,
+                nombre_archivo=copia["name"],
+                google_doc_id=copia["id"],
+                google_doc_url=copia["url"],
+                id_aprobacion_responsable=siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                orden_responsable=siguiente_orden,
+                creado_por=usuario,
+                fecha_creacion=fecha,
+                comentario=comentario,
+            )
+
+        cerrar_version(id_version_actual, fecha)
+
+        actualizar_aprobadores_envio_revision(
+            actual=aprobacion_actual,
+            siguiente=siguiente,
+            id_version_nueva=id_version_nueva,
+            permission_id_siguiente=permission_id_siguiente,
+            comentario=comentario,
+            fecha=fecha,
+        )
+
+        actualizar_documento_envio_revision(
+            id_documento=id_documento,
+            numero_version=numero_version,
+            numero_revision=numero_revision_nueva,
+            id_version=id_version_nueva,
+            copia=copia,
+            siguiente=siguiente,
+            usuario=usuario,
+            fecha=fecha,
+        )
+
+        advertencias: list[str] = []
+        try:
+            crear_evento_envio_revision(
+                id_documento=id_documento,
+                id_version=id_version_nueva,
+                id_aprobacion_actual=siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                usuario=usuario,
+                fecha=fecha,
+                comentario=comentario,
+                nombre_archivo=copia["name"],
+            )
+        except Exception as exc_evento:
+            traceback.print_exc()
+            advertencias.append(
+                "La transición terminó, pero no se pudo crear el evento: "
+                f"{exc_evento}"
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "estado": "En revisión",
+                "numero_version": numero_version,
+                "numero_revision": numero_revision_nueva,
+                "id_version": id_version_nueva,
+                "google_doc_id": copia["id"],
+                "google_doc_url": copia["url"],
+                "nombre_archivo": copia["name"],
+                "orden_actual": siguiente_orden,
+                "id_aprobacion_actual": siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "encargado_actual": siguiente.get("NOMBRE", ""),
+                "encargado_email": siguiente_email,
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 500
 
 
