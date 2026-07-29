@@ -83,7 +83,11 @@ CHILE_TZ = ZoneInfo("America/Santiago")
 
 
 def ahora_iso() -> str:
-    return datetime.now(CHILE_TZ).isoformat(timespec="seconds")
+    """
+    Devuelve un DateTime compatible con la API de AppSheet cuando
+    Properties.Locale está configurado como es-CL.
+    """
+    return datetime.now(CHILE_TZ).strftime("%d/%m/%Y %H:%M:%S")
 
 
 def nuevo_id() -> str:
@@ -108,7 +112,15 @@ def entero(valor: Any, nombre_campo: str) -> int:
 def es_verdadero(valor: Any) -> bool:
     if isinstance(valor, bool):
         return valor
-    return texto(valor).lower() in {"true", "yes", "si", "sí", "1", "y"}
+    return texto(valor).lower() in {
+        "true",
+        "verdadero",
+        "yes",
+        "si",
+        "sí",
+        "1",
+        "y",
+    }
 
 
 def literal_appsheet(valor: str) -> str:
@@ -400,34 +412,56 @@ def buscar_plantilla(id_plantilla: str) -> dict[str, Any]:
 
 
 def buscar_cadena_plantilla(id_plantilla: str) -> list[dict[str, Any]]:
+    """
+    Busca todas las filas asociadas a la plantilla y filtra VIGENTE en
+    Python. Esto evita depender de cómo AppSheet serializa un Yes/No.
+    """
     selector = (
-        f"ORDERBY("
         f"FILTER({TABLA_APROBADORES}, "
-        f"AND("
-        f"[ID_PLANTILLA] = {literal_appsheet(id_plantilla)}, "
-        f"[VIGENTE] = TRUE"
-        f")), "
-        f"[ORDEN], FALSE"
-        f")"
+        f"[ID_PLANTILLA] = {literal_appsheet(id_plantilla)})"
     )
 
-    filas = appsheet_find(TABLA_APROBADORES, selector)
+    filas_plantilla = appsheet_find(TABLA_APROBADORES, selector)
 
-    if not filas:
+    if not filas_plantilla:
         raise ValueError(
-            "La plantilla no tiene una cadena vigente en "
-            f"{TABLA_APROBADORES}"
+            "No existen aprobadores asociados a la plantilla "
+            f"{id_plantilla!r} en {TABLA_APROBADORES}"
+        )
+
+    filas_vigentes = [
+        fila
+        for fila in filas_plantilla
+        if es_verdadero(fila.get("VIGENTE"))
+    ]
+
+    if not filas_vigentes:
+        valores_vigente = sorted(
+            {
+                texto(fila.get("VIGENTE")) or "<vacío>"
+                for fila in filas_plantilla
+            }
+        )
+        raise ValueError(
+            "La plantilla tiene aprobadores, pero ninguno está vigente. "
+            f"ID_PLANTILLA={id_plantilla!r}; "
+            f"valores encontrados en VIGENTE={valores_vigente}"
         )
 
     filas_ordenadas = sorted(
-        filas,
+        filas_vigentes,
         key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"),
     )
 
-    ordenes = [entero(fila.get("ORDEN"), "ORDEN") for fila in filas_ordenadas]
+    ordenes = [
+        entero(fila.get("ORDEN"), "ORDEN")
+        for fila in filas_ordenadas
+    ]
+
     if len(ordenes) != len(set(ordenes)):
         raise ValueError(
-            "La cadena de aprobación tiene dos o más responsables con el mismo ORDEN"
+            "La cadena de aprobación tiene dos o más responsables "
+            "vigentes con el mismo ORDEN"
         )
 
     return filas_ordenadas
