@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import traceback
 import uuid
 from datetime import datetime
+from email.message import EmailMessage
 from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -74,7 +76,16 @@ DRIVE_SEND_NOTIFICATION_EMAIL = os.environ.get(
     "false",
 ).strip().lower() in {"1", "true", "yes", "si", "sí"}
 
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+GMAIL_SENDER_EMAIL = os.environ.get(
+    "GMAIL_SENDER_EMAIL",
+    "gestion.enfoke@gmail.com",
+).strip()
+
 CHILE_TZ = ZoneInfo("America/Santiago")
 
 
@@ -169,22 +180,34 @@ def validar_token() -> None:
 # -----------------------------------------------------------------------------
 
 
-def obtener_drive_service():
+def obtener_google_credentials() -> Credentials:
     credentials = Credentials(
         token=None,
         refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
         token_uri=GOOGLE_OAUTH_TOKEN_URI,
         client_id=GOOGLE_OAUTH_CLIENT_ID,
         client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
-        scopes=DRIVE_SCOPES,
+        scopes=GOOGLE_SCOPES,
     )
 
     credentials.refresh(GoogleAuthRequest())
+    return credentials
 
+
+def obtener_drive_service():
     return build(
         "drive",
         "v3",
-        credentials=credentials,
+        credentials=obtener_google_credentials(),
+        cache_discovery=False,
+    )
+
+
+def obtener_gmail_service():
+    return build(
+        "gmail",
+        "v1",
+        credentials=obtener_google_credentials(),
         cache_discovery=False,
     )
 
@@ -2361,6 +2384,514 @@ def aprobar_revision():
         if id_documento:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 500
+
+
+# -----------------------------------------------------------------------------
+# Flujo: enviar a firma por correo
+# -----------------------------------------------------------------------------
+
+
+_EMAIL_RE = re.compile(
+    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$",
+    re.IGNORECASE,
+)
+
+
+def normalizar_destinatarios(valor: Any) -> list[str]:
+    """Acepta EnumList de AppSheet, lista JSON o texto separado por comas."""
+    elementos: list[Any]
+
+    if isinstance(valor, (list, tuple, set)):
+        elementos = list(valor)
+    else:
+        cadena = texto(valor)
+        if not cadena:
+            return []
+
+        # Acepta una lista JSON cuando el webhook la envía como arreglo.
+        if cadena.startswith("[") and cadena.endswith("]"):
+            try:
+                decodificado = json.loads(cadena)
+            except json.JSONDecodeError:
+                decodificado = None
+            if isinstance(decodificado, list):
+                elementos = decodificado
+            else:
+                elementos = re.split(r"[,;\n\r]+", cadena)
+        else:
+            elementos = re.split(r"[,;\n\r]+", cadena)
+
+    resultado: list[str] = []
+    vistos: set[str] = set()
+
+    for elemento in elementos:
+        email = texto(elemento).strip(' "\'<>')
+        if not email:
+            continue
+        email_normalizado = email.lower()
+        if not _EMAIL_RE.fullmatch(email_normalizado):
+            raise ValueError(f"Correo destinatario no válido: {email!r}")
+        if email_normalizado not in vistos:
+            vistos.add(email_normalizado)
+            resultado.append(email_normalizado)
+
+    return resultado
+
+
+def reemplazar_variables_email(
+    contenido: str,
+    variables: dict[str, Any],
+) -> str:
+    resultado = contenido
+    for nombre, valor in variables.items():
+        resultado = resultado.replace(
+            "{{" + nombre + "}}",
+            texto(valor),
+        )
+    return resultado
+
+
+def descargar_pdf_drive(
+    drive_service: Any,
+    file_id: str,
+) -> tuple[bytes, str]:
+    metadata = (
+        drive_service.files()
+        .get(
+            fileId=file_id,
+            fields="id,name,mimeType,size",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+    mime_type = texto(metadata.get("mimeType"))
+    if mime_type != "application/pdf":
+        raise ValueError(
+            "El archivo configurado en PDF_PARA_FIRMA_ID no es un PDF. "
+            f"MIME encontrado: {mime_type!r}"
+        )
+
+    contenido = (
+        drive_service.files()
+        .get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+    if not isinstance(contenido, bytes) or not contenido:
+        raise RuntimeError("Google Drive devolvió un PDF vacío")
+
+    nombre = texto(metadata.get("name")) or "documento_para_firma.pdf"
+    if not nombre.lower().endswith(".pdf"):
+        nombre += ".pdf"
+
+    return contenido, nombre
+
+
+def enviar_email_con_pdf(
+    gmail_service: Any,
+    destinatarios: list[str],
+    asunto: str,
+    cuerpo: str,
+    pdf_bytes: bytes,
+    pdf_nombre: str,
+    reply_to: str = "",
+) -> dict[str, str]:
+    mensaje = EmailMessage()
+    mensaje["To"] = ", ".join(destinatarios)
+    mensaje["From"] = GMAIL_SENDER_EMAIL
+    mensaje["Subject"] = asunto
+
+    if reply_to and _EMAIL_RE.fullmatch(reply_to.lower()):
+        mensaje["Reply-To"] = reply_to
+
+    mensaje.set_content(cuerpo)
+    mensaje.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=pdf_nombre,
+    )
+
+    raw = base64.urlsafe_b64encode(mensaje.as_bytes()).decode("ascii")
+    respuesta = (
+        gmail_service.users()
+        .messages()
+        .send(
+            userId="me",
+            body={"raw": raw},
+        )
+        .execute()
+    )
+
+    message_id = texto(respuesta.get("id"))
+    if not message_id:
+        raise RuntimeError("Gmail no devolvió el ID del mensaje enviado")
+
+    return {
+        "message_id": message_id,
+        "thread_id": texto(respuesta.get("threadId")),
+    }
+
+
+def marcar_envio_firma_en_proceso(
+    id_documento: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO_FIRMA": "Enviando",
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+            }
+        ],
+    )
+
+
+def actualizar_documento_enviado_firma(
+    *,
+    id_documento: str,
+    usuario: str,
+    destinatarios: list[str],
+    mensaje_adicional: str,
+    message_id: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "En firma",
+                "ESTADO_FIRMA": "Pendiente",
+                "DESTINATARIOS_FIRMA": ", ".join(destinatarios),
+                "MENSAJE_ADICIONAL_FIRMA": mensaje_adicional,
+                "ENVIADO_FIRMA_POR": usuario,
+                "EMAIL_FIRMA_MESSAGE_ID": message_id,
+                "FECHA_ENVIO_FIRMA": fecha,
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "ACCION_SOLICITADA": "",
+                "OBSERVACION_ACTUAL": "",
+            }
+        ],
+    )
+
+
+def restaurar_documento_tras_error_envio_firma(
+    id_documento: str,
+    mensaje: str,
+) -> None:
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "ESTADO_FIRMA": "No iniciado",
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": mensaje[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+def crear_evento_enviado_firma(
+    *,
+    id_documento: str,
+    id_version: str,
+    usuario: str,
+    fecha: str,
+    destinatarios: list[str],
+    pdf_nombre: str,
+    message_id: str,
+) -> None:
+    appsheet_action(
+        TABLA_EVENTOS,
+        "Add",
+        [
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": "",
+                "TIPO_EVENTO": "Enviado a firma",
+                "ESTADO_ANTERIOR": "Listo para firma",
+                "ESTADO_NUEVO": "En firma",
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": (
+                    f"Se envió {pdf_nombre} a "
+                    f"{', '.join(destinatarios)}. "
+                    f"Gmail message ID: {message_id}."
+                ),
+            }
+        ],
+    )
+
+
+@app.route("/enviar-firma", methods=["POST"])
+def enviar_firma():
+    id_documento = ""
+    correo_enviado = False
+    message_id = ""
+    fecha_envio = ""
+    datos_finales: dict[str, Any] = {}
+
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        usuario = texto(data.get("usuario"))
+        destinatarios_entrada = data.get("destinatarios")
+        mensaje_adicional = texto(data.get("mensaje_adicional"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+
+        documento = buscar_documento(id_documento)
+        estado = texto(documento.get("ESTADO"))
+        estado_firma = texto(documento.get("ESTADO_FIRMA"))
+        message_id_existente = texto(
+            documento.get("EMAIL_FIRMA_MESSAGE_ID")
+        )
+
+        if estado == "En firma" and message_id_existente:
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "estado": estado,
+                    "estado_firma": estado_firma,
+                    "message_id": message_id_existente,
+                    "fecha_envio_firma": texto(
+                        documento.get("FECHA_ENVIO_FIRMA")
+                    ),
+                }
+            )
+
+        if estado_firma == "Enviando":
+            return {
+                "error": (
+                    "Ya existe un envío en proceso para este documento. "
+                    "Revisa el registro antes de volver a intentarlo."
+                )
+            }, 409
+
+        if estado != "Listo para firma":
+            raise ValueError(
+                "Solo se puede enviar a firma un documento en estado "
+                f"Listo para firma. Estado actual: {estado!r}"
+            )
+
+        if estado_firma not in {"", "No iniciado", "Error"}:
+            raise ValueError(
+                "El estado de firma no permite iniciar el envío. "
+                f"Estado actual: {estado_firma!r}"
+            )
+
+        pdf_id = texto(documento.get("PDF_PARA_FIRMA_ID"))
+        id_version = texto(documento.get("ID_VERSION_ACTUAL"))
+        if not pdf_id:
+            raise ValueError("Documentos no tiene PDF_PARA_FIRMA_ID")
+        if not id_version:
+            raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
+
+        usuario_registrado = texto(
+            documento.get("ENVIADO_FIRMA_POR")
+        )
+        usuario = usuario or usuario_registrado
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("El usuario que envía a firma no es válido")
+        if (
+            usuario_registrado
+            and usuario_registrado.lower() != usuario.lower()
+        ):
+            raise PermissionError(
+                "El usuario del webhook no coincide con quien solicitó "
+                "el envío a firma"
+            )
+
+        if destinatarios_entrada in (None, ""):
+            destinatarios_entrada = documento.get(
+                "DESTINATARIOS_FIRMA"
+            )
+        destinatarios = normalizar_destinatarios(
+            destinatarios_entrada
+        )
+        if not destinatarios:
+            raise ValueError("No se indicaron destinatarios para la firma")
+
+        if not mensaje_adicional:
+            mensaje_adicional = texto(
+                documento.get("MENSAJE_ADICIONAL_FIRMA")
+            )
+
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
+
+        fecha_envio = ahora_iso()
+        variables = {
+            "TITULO": texto(documento.get("TITULO")),
+            "TIPO_DOCUMENTO": texto(
+                documento.get("TIPO_DOCUMENTO")
+            ),
+            "ID_PROYECTO": texto(documento.get("ID_PROYECTO")),
+            "ENVIADO_POR": usuario,
+            "FECHA_ENVIO": fecha_envio,
+        }
+
+        asunto_base = texto(plantilla.get("ASUNTO_EMAIL_FIRMA"))
+        cuerpo_base = texto(plantilla.get("CUERPO_EMAIL_FIRMA"))
+
+        if not asunto_base:
+            asunto_base = "Documento para firma: {{TITULO}}"
+        if not cuerpo_base:
+            cuerpo_base = (
+                "Estimado/a:\n\n"
+                "Adjuntamos el documento {{TITULO}} para su firma.\n\n"
+                "Una vez firmado, agradeceremos devolver el archivo PDF "
+                "respondiendo a este correo.\n\n"
+                "Saludos."
+            )
+
+        asunto = reemplazar_variables_email(
+            asunto_base,
+            variables,
+        ).strip()
+        cuerpo = reemplazar_variables_email(
+            cuerpo_base,
+            variables,
+        ).strip()
+
+        if mensaje_adicional:
+            cuerpo += (
+                "\n\nIndicaciones adicionales:\n"
+                + mensaje_adicional
+            )
+
+        marcar_envio_firma_en_proceso(
+            id_documento=id_documento,
+            fecha=fecha_envio,
+        )
+
+        drive_service = obtener_drive_service()
+        gmail_service = obtener_gmail_service()
+        pdf_bytes, pdf_nombre = descargar_pdf_drive(
+            drive_service=drive_service,
+            file_id=pdf_id,
+        )
+
+        respuesta_gmail = enviar_email_con_pdf(
+            gmail_service=gmail_service,
+            destinatarios=destinatarios,
+            asunto=asunto,
+            cuerpo=cuerpo,
+            pdf_bytes=pdf_bytes,
+            pdf_nombre=pdf_nombre,
+            reply_to=usuario,
+        )
+        correo_enviado = True
+        message_id = respuesta_gmail["message_id"]
+
+        datos_finales = {
+            "id_documento": id_documento,
+            "usuario": usuario,
+            "destinatarios": destinatarios,
+            "mensaje_adicional": mensaje_adicional,
+            "message_id": message_id,
+            "fecha": fecha_envio,
+        }
+        actualizar_documento_enviado_firma(**datos_finales)
+
+        advertencias: list[str] = []
+        try:
+            crear_evento_enviado_firma(
+                id_documento=id_documento,
+                id_version=id_version,
+                usuario=usuario,
+                fecha=fecha_envio,
+                destinatarios=destinatarios,
+                pdf_nombre=pdf_nombre,
+                message_id=message_id,
+            )
+        except Exception as exc_evento:
+            traceback.print_exc()
+            advertencias.append(
+                "El correo se envió, pero no se pudo crear el evento: "
+                f"{exc_evento}"
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "estado": "En firma",
+                "estado_firma": "Pendiente",
+                "message_id": message_id,
+                "destinatarios": destinatarios,
+                "pdf_id": pdf_id,
+                "pdf_nombre": pdf_nombre,
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento and not correo_enviado:
+            restaurar_documento_tras_error_envio_firma(
+                id_documento,
+                str(exc),
+            )
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        if id_documento and not correo_enviado:
+            restaurar_documento_tras_error_envio_firma(
+                id_documento,
+                str(exc),
+            )
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+
+        # Si Gmail ya respondió con éxito, nunca se reinicia a "No iniciado",
+        # porque un reintento automático podría enviar el correo dos veces.
+        if id_documento and correo_enviado and datos_finales:
+            try:
+                actualizar_documento_enviado_firma(**datos_finales)
+            except Exception:
+                traceback.print_exc()
+        elif id_documento:
+            restaurar_documento_tras_error_envio_firma(
+                id_documento,
+                str(exc),
+            )
+
+        return {
+            "error": str(exc),
+            "correo_enviado": correo_enviado,
+            "message_id": message_id,
+        }, 500
 
 
 if __name__ == "__main__":
