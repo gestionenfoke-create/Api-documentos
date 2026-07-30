@@ -15,6 +15,7 @@ from flask import Flask, jsonify, request
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 
 
 app = Flask(__name__)
@@ -1507,6 +1508,841 @@ def enviar_revision():
                 "encargado_actual": siguiente.get("NOMBRE", ""),
                 "encargado_email": siguiente_email,
                 "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 500
+
+
+# -----------------------------------------------------------------------------
+# Flujo: aprobar revisión
+# -----------------------------------------------------------------------------
+
+
+def exportar_pdf_o_reutilizar(
+    drive_service: Any,
+    google_doc_id: str,
+    folder_id: str,
+    nombre_pdf: str,
+) -> dict[str, str]:
+    """
+    Exporta un Google Docs a PDF y guarda el archivo en la carpeta destino.
+    Si ya existe un PDF con el mismo nombre, lo reutiliza para tolerar
+    reintentos del Bot.
+    """
+    existente = buscar_archivo_en_carpeta(
+        drive_service=drive_service,
+        folder_id=folder_id,
+        nombre_archivo=nombre_pdf,
+    )
+    if existente:
+        return existente
+
+    contenido_pdf = (
+        drive_service.files()
+        .export(
+            fileId=google_doc_id,
+            mimeType="application/pdf",
+        )
+        .execute()
+    )
+
+    media = MediaInMemoryUpload(
+        contenido_pdf,
+        mimetype="application/pdf",
+        resumable=False,
+    )
+
+    archivo = (
+        drive_service.files()
+        .create(
+            body={
+                "name": nombre_pdf,
+                "parents": [folder_id],
+                "mimeType": "application/pdf",
+            },
+            media_body=media,
+            fields="id,name,webViewLink,webContentLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+    file_id = texto(archivo.get("id"))
+    return {
+        "id": file_id,
+        "name": texto(archivo.get("name")) or nombre_pdf,
+        "url": (
+            texto(archivo.get("webViewLink"))
+            or texto(archivo.get("webContentLink"))
+            or f"https://drive.google.com/file/d/{file_id}/view"
+        ),
+    }
+
+
+def actualizar_estado_version(
+    id_version: str,
+    estado_version: str,
+    fecha_cierre: str,
+) -> None:
+    appsheet_action(
+        TABLA_VERSIONES,
+        "Edit",
+        [
+            {
+                "ID_VERSION": id_version,
+                "ESTADO_VERSION": estado_version,
+                "FECHA_CIERRE": fecha_cierre,
+            }
+        ],
+    )
+
+
+def crear_registro_version_por_aprobacion(
+    *,
+    id_version: str,
+    id_documento: str,
+    id_version_origen: str,
+    numero_version: int,
+    numero_revision: int,
+    etapa: str,
+    nombre_archivo: str,
+    google_doc_id: str,
+    google_doc_url: str,
+    id_aprobacion_responsable: str,
+    orden_responsable: int,
+    motivo_creacion: str,
+    comentario: str,
+    creado_por: str,
+    fecha_creacion: str,
+    pdf_version_id: str = "",
+    pdf_version_url: str = "",
+) -> None:
+    fila = {
+        "ID_VERSION": id_version,
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION_ORIGEN": id_version_origen,
+        "NUMERO_VERSION": numero_version,
+        "NUMERO_REVISION": numero_revision,
+        "ETAPA": etapa,
+        "ESTADO_VERSION": "Activa",
+        "NOMBRE_ARCHIVO": nombre_archivo,
+        "GOOGLE_DOC_ID": google_doc_id,
+        "GOOGLE_DOC_URL": google_doc_url,
+        "PDF_VERSION_ID": pdf_version_id,
+        "PDF_VERSION_URL": pdf_version_url,
+        "ID_APROBACION_RESPONSABLE": id_aprobacion_responsable,
+        "ORDEN_RESPONSABLE": orden_responsable,
+        "MOTIVO_CREACION": motivo_creacion,
+        "COMENTARIO_CAMBIO": comentario,
+        "CREADO_POR": creado_por,
+        "FECHA_CREACION": fecha_creacion,
+    }
+    appsheet_action(TABLA_VERSIONES, "Add", [fila])
+
+
+def actualizar_aprobadores_aprobacion_intermedia(
+    actual: dict[str, Any],
+    siguiente: dict[str, Any],
+    id_version_nueva: str,
+    permission_id_siguiente: str,
+    comentario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_APROBADORES_ACTUAL,
+        "Edit",
+        [
+            {
+                "ID_APROBACION_ACTUAL": actual[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ESTADO": "Cerrado",
+                "RESULTADO": "Aprobado",
+                "COMENTARIO": comentario,
+                "FECHA_RESPUESTA": fecha,
+            },
+            {
+                "ID_APROBACION_ACTUAL": siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ESTADO": "En revisión",
+                "ID_VERSION_TRABAJADA": id_version_nueva,
+                "FECHA_INICIO": fecha,
+                "PERMISSION_ID_DRIVE": permission_id_siguiente,
+            },
+        ],
+    )
+
+
+def cerrar_cadena_para_firma(
+    cadena_actual: list[dict[str, Any]],
+    aprobacion_actual: dict[str, Any],
+    comentario: str,
+    fecha: str,
+) -> None:
+    filas: list[dict[str, Any]] = []
+    id_actual = texto(
+        aprobacion_actual.get("ID_APROBACION_ACTUAL")
+    )
+
+    for fila in cadena_actual:
+        id_fila = texto(fila.get("ID_APROBACION_ACTUAL"))
+        cambios: dict[str, Any] = {
+            "ID_APROBACION_ACTUAL": id_fila,
+            "CADENA_ACTIVA": False,
+        }
+
+        if id_fila == id_actual:
+            cambios.update(
+                {
+                    "ESTADO": "Cerrado",
+                    "RESULTADO": "Aprobado",
+                    "COMENTARIO": comentario,
+                    "FECHA_RESPUESTA": fecha,
+                }
+            )
+
+        filas.append(cambios)
+
+    appsheet_action(
+        TABLA_APROBADORES_ACTUAL,
+        "Edit",
+        filas,
+    )
+
+
+def actualizar_documento_aprobacion_intermedia(
+    *,
+    id_documento: str,
+    numero_version: int,
+    numero_revision: int,
+    id_version: str,
+    copia: dict[str, str],
+    siguiente: dict[str, Any],
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "En revisión",
+                "VERSION_ACTUAL": numero_version,
+                "REVISION_ACTUAL": numero_revision,
+                "ID_VERSION_ACTUAL": id_version,
+                "GOOGLE_DOC_ID": copia["id"],
+                "GOOGLE_DOC_URL": copia["url"],
+                "ORDEN_ACTUAL": siguiente["ORDEN"],
+                "ID_APROBACION_ACTUAL": siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ENCARGADO_ACTUAL_NOMBRE": siguiente.get("NOMBRE", ""),
+                "ENCARGADO_ACTUAL_EMAIL": siguiente.get("APROBADOR", ""),
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
+    )
+
+
+def actualizar_documento_listo_para_firma(
+    *,
+    id_documento: str,
+    numero_version: int,
+    numero_revision: int,
+    id_version: str,
+    copia: dict[str, str],
+    pdf: dict[str, str],
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "Listo para firma",
+                "VERSION_ACTUAL": numero_version,
+                "REVISION_ACTUAL": numero_revision,
+                "ID_VERSION_ACTUAL": id_version,
+                "GOOGLE_DOC_ID": copia["id"],
+                "GOOGLE_DOC_URL": copia["url"],
+                "ORDEN_ACTUAL": "",
+                "ID_APROBACION_ACTUAL": "",
+                "ENCARGADO_ACTUAL_NOMBRE": "",
+                "ENCARGADO_ACTUAL_EMAIL": "",
+                "PDF_PARA_FIRMA_ID": pdf["id"],
+                "PDF_PARA_FIRMA_URL": pdf["url"],
+                "ESTADO_FIRMA": "No iniciado",
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
+    )
+
+
+def crear_evento_revision_aprobada(
+    *,
+    id_documento: str,
+    id_version: str,
+    id_aprobacion_actual: str,
+    usuario: str,
+    fecha: str,
+    comentario: str,
+    orden_actual: int,
+    orden_siguiente: int | None,
+) -> None:
+    if orden_siguiente is None:
+        estado_nuevo = "Listo para firma"
+        detalle = (
+            f"El responsable de orden {orden_actual} aprobó la revisión final."
+        )
+    else:
+        estado_nuevo = f"En revisión - Orden {orden_siguiente}"
+        detalle = (
+            f"El responsable de orden {orden_actual} aprobó la revisión "
+            f"y el documento avanzó al orden {orden_siguiente}."
+        )
+
+    if comentario:
+        detalle += f" Comentario: {comentario}"
+
+    appsheet_action(
+        TABLA_EVENTOS,
+        "Add",
+        [
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": id_aprobacion_actual,
+                "TIPO_EVENTO": "Revisión aprobada",
+                "ESTADO_ANTERIOR": f"En revisión - Orden {orden_actual}",
+                "ESTADO_NUEVO": estado_nuevo,
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": detalle,
+            }
+        ],
+    )
+
+
+def crear_evento_preparado_firma(
+    *,
+    id_documento: str,
+    id_version: str,
+    id_aprobacion_actual: str,
+    usuario: str,
+    fecha: str,
+    nombre_archivo: str,
+    nombre_pdf: str,
+) -> None:
+    appsheet_action(
+        TABLA_EVENTOS,
+        "Add",
+        [
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": id_aprobacion_actual,
+                "TIPO_EVENTO": "Preparado para firma",
+                "ESTADO_ANTERIOR": "En revisión",
+                "ESTADO_NUEVO": "Listo para firma",
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": (
+                    f"Se creó {nombre_archivo} y se exportó {nombre_pdf}."
+                ),
+            }
+        ],
+    )
+
+
+@app.route("/aprobar-revision", methods=["POST"])
+def aprobar_revision():
+    id_documento = ""
+
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        id_aprobacion_solicitud = texto(
+            data.get("id_aprobacion_actual")
+        )
+        usuario = texto(data.get("usuario"))
+        comentario = texto(data.get("comentario"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+
+        documento = buscar_documento(id_documento)
+        estado_documento = texto(documento.get("ESTADO"))
+
+        if estado_documento == "Listo para firma":
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "estado": estado_documento,
+                    "id_version": texto(
+                        documento.get("ID_VERSION_ACTUAL")
+                    ),
+                    "google_doc_id": texto(
+                        documento.get("GOOGLE_DOC_ID")
+                    ),
+                    "google_doc_url": texto(
+                        documento.get("GOOGLE_DOC_URL")
+                    ),
+                    "pdf_id": texto(
+                        documento.get("PDF_PARA_FIRMA_ID")
+                    ),
+                    "pdf_url": texto(
+                        documento.get("PDF_PARA_FIRMA_URL")
+                    ),
+                }
+            )
+
+        # Si el Bot repite la petición después de una aprobación intermedia,
+        # reconoce la fila cerrada y responde sin crear otra copia.
+        if id_aprobacion_solicitud:
+            aprobacion_solicitada = buscar_aprobacion_actual(
+                id_aprobacion_solicitud
+            )
+            if (
+                texto(aprobacion_solicitada.get("ESTADO")) == "Cerrado"
+                and texto(aprobacion_solicitada.get("RESULTADO"))
+                == "Aprobado"
+            ):
+                return jsonify(
+                    {
+                        "ok": True,
+                        "ya_procesado": True,
+                        "id_documento": id_documento,
+                        "estado": estado_documento,
+                        "id_version": texto(
+                            documento.get("ID_VERSION_ACTUAL")
+                        ),
+                        "google_doc_id": texto(
+                            documento.get("GOOGLE_DOC_ID")
+                        ),
+                        "google_doc_url": texto(
+                            documento.get("GOOGLE_DOC_URL")
+                        ),
+                    }
+                )
+
+        if estado_documento != "En revisión":
+            raise ValueError(
+                "Solo se puede aprobar un documento en estado En revisión. "
+                f"Estado actual: {estado_documento!r}"
+            )
+
+        numero_version = entero(
+            documento.get("VERSION_ACTUAL"),
+            "VERSION_ACTUAL",
+        )
+        revision_actual = entero(
+            documento.get("REVISION_ACTUAL"),
+            "REVISION_ACTUAL",
+        )
+        numero_revision_nueva = revision_actual + 1
+
+        id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+        id_aprobacion_actual = texto(
+            documento.get("ID_APROBACION_ACTUAL")
+        )
+        google_doc_id_actual = texto(documento.get("GOOGLE_DOC_ID"))
+
+        if not id_version_actual:
+            raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
+        if not id_aprobacion_actual:
+            raise ValueError("Documentos no tiene ID_APROBACION_ACTUAL")
+        if not google_doc_id_actual:
+            raise ValueError("Documentos no tiene GOOGLE_DOC_ID")
+
+        if (
+            id_aprobacion_solicitud
+            and id_aprobacion_solicitud != id_aprobacion_actual
+        ):
+            raise ValueError(
+                "El aprobador enviado por AppSheet ya no coincide con el "
+                "encargado actual del documento"
+            )
+
+        aprobacion_actual = buscar_aprobacion_actual(
+            id_aprobacion_actual
+        )
+
+        if not es_verdadero(aprobacion_actual.get("CADENA_ACTIVA")):
+            raise ValueError("La cadena de aprobación actual no está activa")
+
+        if texto(aprobacion_actual.get("ESTADO")) != "En revisión":
+            raise ValueError(
+                "El encargado actual no se encuentra En revisión. "
+                f"Estado encontrado: "
+                f"{texto(aprobacion_actual.get('ESTADO'))!r}"
+            )
+
+        email_actual = texto(aprobacion_actual.get("APROBADOR"))
+        if usuario and email_actual.lower() != usuario.lower():
+            raise PermissionError(
+                "Solo el encargado actual puede aprobar la revisión"
+            )
+        usuario = usuario or email_actual
+
+        version_actual = buscar_version_por_id(id_version_actual)
+        if texto(version_actual.get("ETAPA")) != "Revisión":
+            raise ValueError(
+                "La versión vigente no corresponde a una revisión"
+            )
+
+        cadena_actual = buscar_cadena_actual_documento(
+            id_documento=id_documento,
+            numero_version=numero_version,
+        )
+        orden_actual = entero(
+            aprobacion_actual.get("ORDEN"),
+            "ORDEN",
+        )
+
+        siguientes = [
+            fila
+            for fila in cadena_actual
+            if entero(fila.get("ORDEN"), "ORDEN") > orden_actual
+            and texto(fila.get("ESTADO")) == "Pendiente"
+        ]
+        siguiente = siguientes[0] if siguientes else None
+
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
+        folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
+        if not folder_id:
+            raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
+
+        titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        fecha = ahora_iso()
+        drive_service = obtener_drive_service()
+
+        if siguiente is not None:
+            siguiente_orden = entero(siguiente.get("ORDEN"), "ORDEN")
+            siguiente_email = texto(siguiente.get("APROBADOR"))
+            if not siguiente_email:
+                raise ValueError(
+                    f"El responsable de orden {siguiente_orden} no tiene correo"
+                )
+
+            nombre_archivo = limpiar_nombre_archivo(
+                f"{titulo}_V{numero_version:02d}"
+                f"_REV{numero_revision_nueva:02d}"
+            )
+
+            version_existente = buscar_version_numero_revision(
+                id_documento=id_documento,
+                numero_version=numero_version,
+                numero_revision=numero_revision_nueva,
+            )
+
+            if version_existente:
+                id_version_nueva = texto(
+                    version_existente.get("ID_VERSION")
+                )
+                copia = {
+                    "id": texto(
+                        version_existente.get("GOOGLE_DOC_ID")
+                    ),
+                    "url": texto(
+                        version_existente.get("GOOGLE_DOC_URL")
+                    ),
+                    "name": (
+                        texto(version_existente.get("NOMBRE_ARCHIVO"))
+                        or nombre_archivo
+                    ),
+                }
+            else:
+                id_version_nueva = nuevo_id()
+                copia = copiar_archivo_o_reutilizar(
+                    drive_service=drive_service,
+                    source_file_id=google_doc_id_actual,
+                    folder_id=folder_id,
+                    nombre_archivo=nombre_archivo,
+                )
+
+            asegurar_permiso_rol(
+                drive_service=drive_service,
+                file_id=google_doc_id_actual,
+                email=email_actual,
+                role="reader",
+            )
+            asegurar_permiso_rol(
+                drive_service=drive_service,
+                file_id=copia["id"],
+                email=email_actual,
+                role="commenter",
+            )
+            permission_id_siguiente = asegurar_permiso_rol(
+                drive_service=drive_service,
+                file_id=copia["id"],
+                email=siguiente_email,
+                role="writer",
+            )
+
+            if not version_existente:
+                crear_registro_version_por_aprobacion(
+                    id_version=id_version_nueva,
+                    id_documento=id_documento,
+                    id_version_origen=id_version_actual,
+                    numero_version=numero_version,
+                    numero_revision=numero_revision_nueva,
+                    etapa="Revisión",
+                    nombre_archivo=copia["name"],
+                    google_doc_id=copia["id"],
+                    google_doc_url=copia["url"],
+                    id_aprobacion_responsable=siguiente[
+                        "ID_APROBACION_ACTUAL"
+                    ],
+                    orden_responsable=siguiente_orden,
+                    motivo_creacion="Aprobación de etapa",
+                    comentario=comentario,
+                    creado_por=usuario,
+                    fecha_creacion=fecha,
+                )
+
+            actualizar_estado_version(
+                id_version=id_version_actual,
+                estado_version="Cerrada",
+                fecha_cierre=fecha,
+            )
+
+            actualizar_aprobadores_aprobacion_intermedia(
+                actual=aprobacion_actual,
+                siguiente=siguiente,
+                id_version_nueva=id_version_nueva,
+                permission_id_siguiente=permission_id_siguiente,
+                comentario=comentario,
+                fecha=fecha,
+            )
+
+            actualizar_documento_aprobacion_intermedia(
+                id_documento=id_documento,
+                numero_version=numero_version,
+                numero_revision=numero_revision_nueva,
+                id_version=id_version_nueva,
+                copia=copia,
+                siguiente=siguiente,
+                usuario=usuario,
+                fecha=fecha,
+            )
+
+            crear_evento_revision_aprobada(
+                id_documento=id_documento,
+                id_version=id_version_nueva,
+                id_aprobacion_actual=siguiente[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                usuario=usuario,
+                fecha=fecha,
+                comentario=comentario,
+                orden_actual=orden_actual,
+                orden_siguiente=siguiente_orden,
+            )
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": False,
+                    "ultimo_aprobador": False,
+                    "id_documento": id_documento,
+                    "estado": "En revisión",
+                    "numero_version": numero_version,
+                    "numero_revision": numero_revision_nueva,
+                    "id_version": id_version_nueva,
+                    "google_doc_id": copia["id"],
+                    "google_doc_url": copia["url"],
+                    "nombre_archivo": copia["name"],
+                    "orden_actual": siguiente_orden,
+                    "id_aprobacion_actual": siguiente[
+                        "ID_APROBACION_ACTUAL"
+                    ],
+                    "encargado_actual": siguiente.get("NOMBRE", ""),
+                    "encargado_email": siguiente_email,
+                }
+            )
+
+        # Último aprobador: prepara el Google Docs y el PDF para firma.
+        nombre_archivo = limpiar_nombre_archivo(
+            f"{titulo}_V{numero_version:02d}_PARA_FIRMA"
+        )
+        nombre_pdf = limpiar_nombre_archivo(
+            f"{titulo}_V{numero_version:02d}_PARA_FIRMA.pdf"
+        )
+
+        version_existente = buscar_version_numero_revision(
+            id_documento=id_documento,
+            numero_version=numero_version,
+            numero_revision=numero_revision_nueva,
+        )
+
+        if version_existente:
+            id_version_nueva = texto(version_existente.get("ID_VERSION"))
+            copia = {
+                "id": texto(version_existente.get("GOOGLE_DOC_ID")),
+                "url": texto(version_existente.get("GOOGLE_DOC_URL")),
+                "name": (
+                    texto(version_existente.get("NOMBRE_ARCHIVO"))
+                    or nombre_archivo
+                ),
+            }
+            pdf = {
+                "id": texto(version_existente.get("PDF_VERSION_ID")),
+                "url": texto(version_existente.get("PDF_VERSION_URL")),
+                "name": nombre_pdf,
+            }
+        else:
+            id_version_nueva = nuevo_id()
+            copia = copiar_archivo_o_reutilizar(
+                drive_service=drive_service,
+                source_file_id=google_doc_id_actual,
+                folder_id=folder_id,
+                nombre_archivo=nombre_archivo,
+            )
+            pdf = exportar_pdf_o_reutilizar(
+                drive_service=drive_service,
+                google_doc_id=copia["id"],
+                folder_id=folder_id,
+                nombre_pdf=nombre_pdf,
+            )
+
+        # Todos los participantes conservan lectura sobre el archivo final.
+        emails: set[str] = set()
+        for fila in cadena_actual:
+            email = texto(fila.get("APROBADOR")).lower()
+            if email and "@" in email:
+                emails.add(email)
+
+        for email in emails:
+            asegurar_permiso_rol(
+                drive_service=drive_service,
+                file_id=copia["id"],
+                email=email,
+                role="reader",
+            )
+
+        asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=google_doc_id_actual,
+            email=email_actual,
+            role="reader",
+        )
+
+        if not version_existente:
+            crear_registro_version_por_aprobacion(
+                id_version=id_version_nueva,
+                id_documento=id_documento,
+                id_version_origen=id_version_actual,
+                numero_version=numero_version,
+                numero_revision=numero_revision_nueva,
+                etapa="Para firma",
+                nombre_archivo=copia["name"],
+                google_doc_id=copia["id"],
+                google_doc_url=copia["url"],
+                pdf_version_id=pdf["id"],
+                pdf_version_url=pdf["url"],
+                id_aprobacion_responsable=id_aprobacion_actual,
+                orden_responsable=orden_actual,
+                motivo_creacion="Preparación para firma",
+                comentario=comentario,
+                creado_por=usuario,
+                fecha_creacion=fecha,
+            )
+
+        actualizar_estado_version(
+            id_version=id_version_actual,
+            estado_version="Aprobada",
+            fecha_cierre=fecha,
+        )
+
+        cerrar_cadena_para_firma(
+            cadena_actual=cadena_actual,
+            aprobacion_actual=aprobacion_actual,
+            comentario=comentario,
+            fecha=fecha,
+        )
+
+        actualizar_documento_listo_para_firma(
+            id_documento=id_documento,
+            numero_version=numero_version,
+            numero_revision=numero_revision_nueva,
+            id_version=id_version_nueva,
+            copia=copia,
+            pdf=pdf,
+            usuario=usuario,
+            fecha=fecha,
+        )
+
+        crear_evento_revision_aprobada(
+            id_documento=id_documento,
+            id_version=id_version_nueva,
+            id_aprobacion_actual=id_aprobacion_actual,
+            usuario=usuario,
+            fecha=fecha,
+            comentario=comentario,
+            orden_actual=orden_actual,
+            orden_siguiente=None,
+        )
+        crear_evento_preparado_firma(
+            id_documento=id_documento,
+            id_version=id_version_nueva,
+            id_aprobacion_actual=id_aprobacion_actual,
+            usuario=usuario,
+            fecha=fecha,
+            nombre_archivo=copia["name"],
+            nombre_pdf=pdf["name"],
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "ultimo_aprobador": True,
+                "id_documento": id_documento,
+                "estado": "Listo para firma",
+                "numero_version": numero_version,
+                "numero_revision": numero_revision_nueva,
+                "id_version": id_version_nueva,
+                "google_doc_id": copia["id"],
+                "google_doc_url": copia["url"],
+                "nombre_archivo": copia["name"],
+                "pdf_id": pdf["id"],
+                "pdf_url": pdf["url"],
+                "pdf_nombre": pdf["name"],
             }
         )
 
