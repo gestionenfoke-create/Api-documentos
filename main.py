@@ -9,7 +9,8 @@ import uuid
 from datetime import datetime
 from email.message import EmailMessage
 from typing import Any
-from urllib.parse import quote
+from pathlib import PurePosixPath
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -1240,13 +1241,13 @@ def crear_documento():
         return {"error": str(exc)}, 403
 
     except (ValueError, LookupError) as exc:
-        if id_documento:
+        if id_documento and not documento_cerrado:
             marcar_documento_error(id_documento, str(exc))
         return {"error": str(exc)}, 400
 
     except Exception as exc:
         traceback.print_exc()
-        if id_documento:
+        if id_documento and not documento_cerrado:
             marcar_documento_error(id_documento, str(exc))
         return {"error": str(exc)}, 500
 
@@ -1535,7 +1536,7 @@ def enviar_revision():
         )
 
     except PermissionError as exc:
-        if id_documento:
+        if id_documento and not documento_cerrado:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 403
 
@@ -2667,6 +2668,9 @@ def enviar_firma():
             return {"error": "Falta id_documento"}, 400
 
         documento = buscar_documento(id_documento)
+        if not comentario:
+            comentario = texto(documento.get("OBSERVACION_ACTUAL"))
+
         estado = texto(documento.get("ESTADO"))
         estado_firma = texto(documento.get("ESTADO_FIRMA"))
         message_id_existente = texto(
@@ -2891,6 +2895,612 @@ def enviar_firma():
             "error": str(exc),
             "correo_enviado": correo_enviado,
             "message_id": message_id,
+        }, 500
+
+
+# -----------------------------------------------------------------------------
+# Flujo: registrar PDF firmado y cerrar documento
+# -----------------------------------------------------------------------------
+
+
+def extraer_drive_id(valor: str) -> str:
+    """Extrae un ID de Drive desde una URL conocida; si no hay, devuelve vacío."""
+    valor = texto(valor)
+    if not valor:
+        return ""
+
+    patrones = (
+        r"/d/([A-Za-z0-9_-]{20,})",
+        r"/file/d/([A-Za-z0-9_-]{20,})",
+        r"/document/d/([A-Za-z0-9_-]{20,})",
+    )
+    for patron in patrones:
+        coincidencia = re.search(patron, valor)
+        if coincidencia:
+            return coincidencia.group(1)
+
+    try:
+        consulta = parse_qs(urlparse(valor).query)
+        candidato = texto((consulta.get("id") or [""])[0])
+        if re.fullmatch(r"[A-Za-z0-9_-]{20,}", candidato):
+            return candidato
+    except Exception:
+        pass
+
+    return ""
+
+
+def nombre_archivo_desde_valor_appsheet(valor: str) -> str:
+    """Obtiene el nombre final desde un File relativo o una URL."""
+    valor = unquote(texto(valor)).replace("\\", "/")
+    if not valor:
+        return ""
+
+    if "://" in valor:
+        ruta = urlparse(valor).path
+    else:
+        ruta = valor.split("?", 1)[0].split("#", 1)[0]
+
+    nombre = PurePosixPath(ruta).name.strip()
+    return nombre
+
+
+def obtener_metadata_pdf_drive(
+    drive_service: Any,
+    file_id: str,
+) -> dict[str, Any]:
+    archivo = (
+        drive_service.files()
+        .get(
+            fileId=file_id,
+            fields=(
+                "id,name,mimeType,size,createdTime,modifiedTime,parents,"
+                "webViewLink,webContentLink,md5Checksum"
+            ),
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+    nombre = texto(archivo.get("name"))
+    mime_type = texto(archivo.get("mimeType")).lower()
+    tamano = entero(archivo.get("size") or 0, "size")
+
+    if mime_type != "application/pdf" and not nombre.lower().endswith(".pdf"):
+        raise ValueError(
+            f"El archivo cargado no es PDF: {nombre!r} ({mime_type!r})"
+        )
+    if tamano <= 0:
+        raise ValueError("El PDF firmado está vacío")
+
+    return archivo
+
+
+def buscar_pdf_cargado_appsheet(
+    drive_service: Any,
+    valor_pdf: str,
+) -> dict[str, Any]:
+    """
+    Localiza el archivo que AppSheet guardó en Drive.
+
+    AppSheet almacena en la columna File el nombre o ruta relativa. Primero se
+    acepta una URL de Drive; en caso contrario se busca por el nombre exacto.
+    """
+    drive_id = extraer_drive_id(valor_pdf)
+    if drive_id:
+        return obtener_metadata_pdf_drive(drive_service, drive_id)
+
+    nombre = nombre_archivo_desde_valor_appsheet(valor_pdf)
+    if not nombre:
+        raise ValueError("No se pudo obtener el nombre desde PDF_FIRMADO")
+    if not nombre.lower().endswith(".pdf"):
+        raise ValueError("PDF_FIRMADO debe corresponder a un archivo .pdf")
+
+    nombre_q = escapar_consulta_drive(nombre)
+    consulta = f"name = '{nombre_q}' and trashed = false"
+    respuesta = (
+        drive_service.files()
+        .list(
+            q=consulta,
+            fields=(
+                "files(id,name,mimeType,size,createdTime,modifiedTime,parents,"
+                "webViewLink,webContentLink,md5Checksum)"
+            ),
+            spaces="drive",
+            corpora="user",
+            orderBy="modifiedTime desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=20,
+        )
+        .execute()
+    )
+    archivos = respuesta.get("files", [])
+
+    if not archivos:
+        raise LookupError(
+            "No se encontró en Google Drive el archivo cargado en "
+            f"PDF_FIRMADO: {nombre!r}. Confirma que AppSheet y Cloud Run "
+            "usen una cuenta con acceso al mismo Drive."
+        )
+
+    archivos_pdf = [
+        archivo
+        for archivo in archivos
+        if texto(archivo.get("mimeType")).lower() == "application/pdf"
+        or texto(archivo.get("name")).lower().endswith(".pdf")
+    ]
+
+    if len(archivos_pdf) > 1:
+        ids = ", ".join(texto(fila.get("id")) for fila in archivos_pdf[:5])
+        raise RuntimeError(
+            "Se encontraron varios archivos PDF con el mismo nombre en Drive. "
+            f"Nombre={nombre!r}; IDs={ids}. Renombra o elimina los duplicados."
+        )
+
+    if not archivos_pdf:
+        raise ValueError(f"El archivo encontrado no es PDF: {nombre!r}")
+
+    return obtener_metadata_pdf_drive(
+        drive_service,
+        texto(archivos_pdf[0].get("id")),
+    )
+
+
+def copiar_pdf_firmado_o_reutilizar(
+    drive_service: Any,
+    source_file_id: str,
+    folder_id: str,
+    nombre_final: str,
+) -> dict[str, str]:
+    """Copia el PDF firmado a la carpeta del documento con nombre canónico."""
+    existente = buscar_archivo_en_carpeta(
+        drive_service=drive_service,
+        folder_id=folder_id,
+        nombre_archivo=nombre_final,
+    )
+    if existente:
+        metadata = obtener_metadata_pdf_drive(
+            drive_service,
+            existente["id"],
+        )
+        return {
+            "id": texto(metadata.get("id")),
+            "name": texto(metadata.get("name")) or nombre_final,
+            "url": texto(metadata.get("webViewLink"))
+            or texto(metadata.get("webContentLink"))
+            or f"https://drive.google.com/file/d/{metadata['id']}/view",
+        }
+
+    copia = (
+        drive_service.files()
+        .copy(
+            fileId=source_file_id,
+            body={
+                "name": nombre_final,
+                "parents": [folder_id],
+            },
+            fields=(
+                "id,name,mimeType,size,webViewLink,webContentLink,md5Checksum"
+            ),
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+    file_id = texto(copia.get("id"))
+    if not file_id:
+        raise RuntimeError("Drive no devolvió el ID del PDF firmado copiado")
+
+    return {
+        "id": file_id,
+        "name": texto(copia.get("name")) or nombre_final,
+        "url": texto(copia.get("webViewLink"))
+        or texto(copia.get("webContentLink"))
+        or f"https://drive.google.com/file/d/{file_id}/view",
+    }
+
+
+def buscar_version_firmada(
+    id_documento: str,
+    numero_version: int,
+) -> dict[str, Any] | None:
+    versiones = buscar_versiones_documento(id_documento)
+    encontradas = [
+        fila
+        for fila in versiones
+        if entero(fila.get("NUMERO_VERSION"), "NUMERO_VERSION")
+        == numero_version
+        and texto(fila.get("ETAPA")).lower() == "firmado"
+    ]
+
+    if len(encontradas) > 1:
+        raise RuntimeError(
+            "Existen varias filas Firmado para la misma versión documental"
+        )
+    return encontradas[0] if encontradas else None
+
+
+def marcar_registro_firma_en_proceso(
+    id_documento: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO_FIRMA": "Procesando",
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+            }
+        ],
+    )
+
+
+def crear_version_firmada(
+    *,
+    id_version: str,
+    id_documento: str,
+    id_version_origen: str,
+    numero_version: int,
+    numero_revision: int,
+    nombre_archivo: str,
+    google_doc_id: str,
+    google_doc_url: str,
+    pdf_id: str,
+    pdf_url: str,
+    comentario: str,
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_VERSIONES,
+        "Add",
+        [
+            {
+                "ID_VERSION": id_version,
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION_ORIGEN": id_version_origen,
+                "NUMERO_VERSION": numero_version,
+                "NUMERO_REVISION": numero_revision,
+                "ETAPA": "Firmado",
+                "ESTADO_VERSION": "Firmada",
+                "NOMBRE_ARCHIVO": nombre_archivo,
+                "GOOGLE_DOC_ID": google_doc_id,
+                "GOOGLE_DOC_URL": google_doc_url,
+                "PDF_VERSION_ID": pdf_id,
+                "PDF_VERSION_URL": pdf_url,
+                "ID_APROBACION_RESPONSABLE": "",
+                "ORDEN_RESPONSABLE": "",
+                "MOTIVO_CREACION": "Carga de documento firmado",
+                "COMENTARIO_CAMBIO": comentario,
+                "CREADO_POR": usuario,
+                "FECHA_CREACION": fecha,
+                "FECHA_CIERRE": fecha,
+            }
+        ],
+    )
+
+
+def actualizar_documento_proceso_terminado(
+    *,
+    id_documento: str,
+    id_version_final: str,
+    pdf_final: dict[str, str],
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "Proceso terminado",
+                "ESTADO_FIRMA": "Firmado",
+                "ID_VERSION_ACTUAL": id_version_final,
+                "PDF_FIRMADO_ID": pdf_final["id"],
+                "PDF_FIRMADO_URL": pdf_final["url"],
+                "FECHA_FIRMA_COMPLETA": fecha,
+                "CARGADO_POR": usuario,
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "FECHA_CIERRE": fecha,
+                "ACCION_SOLICITADA": "",
+                "OBSERVACION_ACTUAL": "",
+            }
+        ],
+    )
+
+
+def restaurar_documento_tras_error_registro_firma(
+    id_documento: str,
+    mensaje: str,
+) -> None:
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "ESTADO_FIRMA": "Pendiente",
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": mensaje[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+def crear_eventos_cierre_firma(
+    *,
+    id_documento: str,
+    id_version: str,
+    usuario: str,
+    fecha: str,
+    nombre_origen: str,
+    nombre_final: str,
+    comentario: str,
+) -> None:
+    detalle_carga = (
+        f"Se cargó {nombre_origen} y se archivó como {nombre_final}."
+    )
+    if comentario:
+        detalle_carga += f" Comentario: {comentario}"
+
+    appsheet_action(
+        TABLA_EVENTOS,
+        "Add",
+        [
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": "",
+                "TIPO_EVENTO": "PDF firmado cargado",
+                "ESTADO_ANTERIOR": "En firma",
+                "ESTADO_NUEVO": "En firma",
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": detalle_carga,
+            },
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": "",
+                "TIPO_EVENTO": "Proceso terminado",
+                "ESTADO_ANTERIOR": "En firma",
+                "ESTADO_NUEVO": "Proceso terminado",
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": (
+                    "El documento quedó cerrado con su PDF firmado definitivo."
+                ),
+            },
+        ],
+    )
+
+
+@app.route("/registrar-firma", methods=["POST"])
+def registrar_firma():
+    id_documento = ""
+    pdf_final_creado = False
+    documento_cerrado = False
+
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        usuario = texto(data.get("usuario"))
+        valor_pdf_firmado = texto(data.get("pdf_firmado"))
+        comentario = texto(data.get("comentario"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+
+        documento = buscar_documento(id_documento)
+        estado = texto(documento.get("ESTADO"))
+        estado_firma = texto(documento.get("ESTADO_FIRMA"))
+        pdf_final_existente = texto(documento.get("PDF_FIRMADO_ID"))
+
+        if estado == "Proceso terminado" and pdf_final_existente:
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "estado": estado,
+                    "estado_firma": estado_firma,
+                    "pdf_firmado_id": pdf_final_existente,
+                    "pdf_firmado_url": texto(
+                        documento.get("PDF_FIRMADO_URL")
+                    ),
+                }
+            )
+
+        if estado_firma == "Procesando":
+            return {
+                "error": (
+                    "Ya existe un cierre de firma en proceso. Revisa el registro "
+                    "antes de volver a intentarlo."
+                )
+            }, 409
+
+        if estado != "En firma":
+            raise ValueError(
+                "Solo se puede registrar la firma cuando el documento está "
+                f"En firma. Estado actual: {estado!r}"
+            )
+        if estado_firma not in {"Pendiente", "Error"}:
+            raise ValueError(
+                "El estado de firma no permite cerrar el documento. "
+                f"Estado actual: {estado_firma!r}"
+            )
+
+        valor_pdf_firmado = valor_pdf_firmado or texto(
+            documento.get("PDF_FIRMADO")
+        )
+        if not valor_pdf_firmado:
+            raise ValueError("Debe cargar un archivo en PDF_FIRMADO")
+
+        usuario_registrado = texto(documento.get("CARGADO_POR"))
+        usuario = usuario or usuario_registrado
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("CARGADO_POR debe ser un correo válido")
+        if (
+            usuario_registrado
+            and usuario_registrado.lower() != usuario.lower()
+        ):
+            raise PermissionError(
+                "El usuario del webhook no coincide con CARGADO_POR"
+            )
+
+        id_version_origen = texto(documento.get("ID_VERSION_ACTUAL"))
+        if not id_version_origen:
+            raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
+        version_origen = buscar_version_por_id(id_version_origen)
+
+        numero_version = entero(
+            documento.get("VERSION_ACTUAL"),
+            "VERSION_ACTUAL",
+        )
+        numero_revision = entero(
+            documento.get("REVISION_ACTUAL") or 0,
+            "REVISION_ACTUAL",
+        )
+
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
+        folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
+        if not folder_id:
+            raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
+
+        fecha = ahora_iso()
+        marcar_registro_firma_en_proceso(id_documento, fecha)
+
+        drive_service = obtener_drive_service()
+        pdf_subido = buscar_pdf_cargado_appsheet(
+            drive_service,
+            valor_pdf_firmado,
+        )
+
+        titulo = limpiar_nombre_archivo(texto(documento.get("TITULO")))
+        nombre_final = f"{titulo}_V{numero_version:02d}_FIRMADO.pdf"
+        pdf_final = copiar_pdf_firmado_o_reutilizar(
+            drive_service=drive_service,
+            source_file_id=texto(pdf_subido.get("id")),
+            folder_id=folder_id,
+            nombre_final=nombre_final,
+        )
+        pdf_final_creado = True
+
+        version_firmada_existente = buscar_version_firmada(
+            id_documento,
+            numero_version,
+        )
+        if version_firmada_existente:
+            id_version_final = texto(
+                version_firmada_existente.get("ID_VERSION")
+            )
+        else:
+            id_version_final = nuevo_id()
+            actualizar_estado_version(
+                id_version=id_version_origen,
+                estado_version="Cerrada",
+                fecha_cierre=fecha,
+            )
+            crear_version_firmada(
+                id_version=id_version_final,
+                id_documento=id_documento,
+                id_version_origen=id_version_origen,
+                numero_version=numero_version,
+                numero_revision=numero_revision,
+                nombre_archivo=nombre_final,
+                google_doc_id=texto(version_origen.get("GOOGLE_DOC_ID")),
+                google_doc_url=texto(version_origen.get("GOOGLE_DOC_URL")),
+                pdf_id=pdf_final["id"],
+                pdf_url=pdf_final["url"],
+                comentario=comentario,
+                usuario=usuario,
+                fecha=fecha,
+            )
+
+        actualizar_documento_proceso_terminado(
+            id_documento=id_documento,
+            id_version_final=id_version_final,
+            pdf_final=pdf_final,
+            usuario=usuario,
+            fecha=fecha,
+        )
+        documento_cerrado = True
+
+        advertencias: list[str] = []
+        try:
+            crear_eventos_cierre_firma(
+                id_documento=id_documento,
+                id_version=id_version_final,
+                usuario=usuario,
+                fecha=fecha,
+                nombre_origen=texto(pdf_subido.get("name")),
+                nombre_final=pdf_final["name"],
+                comentario=comentario,
+            )
+        except Exception as exc_evento:
+            traceback.print_exc()
+            advertencias.append(
+                "El documento se cerró, pero no se pudieron crear todos los "
+                f"eventos: {exc_evento}"
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "estado": "Proceso terminado",
+                "estado_firma": "Firmado",
+                "id_version_final": id_version_final,
+                "pdf_firmado_id": pdf_final["id"],
+                "pdf_firmado_url": pdf_final["url"],
+                "pdf_firmado_nombre": pdf_final["name"],
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            restaurar_documento_tras_error_registro_firma(
+                id_documento,
+                str(exc),
+            )
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            restaurar_documento_tras_error_registro_firma(
+                id_documento,
+                str(exc),
+            )
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            restaurar_documento_tras_error_registro_firma(
+                id_documento,
+                str(exc),
+            )
+        return {
+            "error": str(exc),
+            "pdf_final_creado": pdf_final_creado,
         }, 500
 
 
