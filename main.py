@@ -3450,6 +3450,17 @@ def obtener_cadena_notificacion(
         ),
     )
 
+def obtener_email_notificacion(
+    aprobador: dict[str, Any],
+) -> str:
+    """
+    Obtiene el correo usado exclusivamente para las notificaciones internas.
+    La fuente es la columna virtual Aprobador_v de
+    Documentos_Aprobadores_Actual.
+    """
+    return texto(
+        aprobador.get("Aprobador_v")
+    ).strip().lower()
 
 def deduplicar_cadena_por_email(
     cadena: list[dict[str, Any]],
@@ -3459,10 +3470,10 @@ def deduplicar_cadena_por_email(
     vistos: set[str] = set()
 
     for fila in cadena:
-        email = texto(fila.get("APROBADOR")).lower()
+        email = obtener_email_notificacion(fila)
         if not email:
             app.logger.warning(
-                "Se omitió un responsable sin APROBADOR: %s",
+                "Se omitió un responsable sin Aprovador_v: %s",
                 fila.get("ID_APROBACION_ACTUAL"),
             )
             continue
@@ -3871,7 +3882,7 @@ def crear_notificacion_pendiente(
     link_documento: str,
     link_appsheet: str,
 ) -> tuple[dict[str, Any], bool]:
-    email = texto(aprobador.get("APROBADOR")).lower()
+    email = obtener_email_notificacion(aprobador)
     clave = construir_clave_idempotencia(
         id_evento=id_evento,
         email=email,
@@ -4048,7 +4059,7 @@ def procesar_notificacion_individual(
         texto(evento.get("ID_VERSION"))
         or texto(documento.get("ID_VERSION_ACTUAL"))
     )
-    email = texto(aprobador.get("APROBADOR")).lower()
+    email = obtener_email_notificacion(aprobador)
 
     # Por diseño, solo las notificaciones de Acción requerida guardan
     # y muestran el enlace directo al documento editable.
@@ -4227,7 +4238,7 @@ def notificar_destinatarios_internos(
             )
             continue
 
-        email = texto(aprobador.get("APROBADOR")).lower()
+        email = obtener_email_notificacion(aprobador)
         if not email or email in correos_procesados:
             continue
 
@@ -4415,8 +4426,8 @@ def diagnostico_notificacion():
                 "id_documento": id_documento,
                 "id_evento": texto(evento.get("ID_EVENTO")),
                 "id_aprobacion_actual": id_aprobacion_actual,
-                "destinatario_email": texto(
-                    aprobador.get("APROBADOR")
+                "destinatario_email": obtener_email_notificacion(
+                    aprobador
                 ),
                 "destinatario_nombre": texto(
                     aprobador.get("NOMBRE")
