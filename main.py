@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import re
@@ -61,6 +62,22 @@ TABLA_EVENTOS = os.environ.get(
     "TABLA_EVENTOS",
     "Documento_Eventos",
 )
+
+TABLA_NOTIFICACIONES = os.environ.get(
+    "TABLA_NOTIFICACIONES",
+    "Documento_Notificaciones",
+)
+
+APPSHEET_DOCUMENT_VIEW_URL = os.environ.get(
+    "APPSHEET_DOCUMENT_VIEW_URL",
+    "",
+).strip()
+
+NOMBRE_APLICACION = (
+    os.environ.get("NOMBRE_APLICACION")
+    or os.environ.get("Nombre_Aplicacion")
+    or "Gestión documental"
+).strip()
 
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN")
 
@@ -233,6 +250,7 @@ def validar_configuracion() -> None:
         "GOOGLE_OAUTH_CLIENT_ID": GOOGLE_OAUTH_CLIENT_ID,
         "GOOGLE_OAUTH_CLIENT_SECRET": GOOGLE_OAUTH_CLIENT_SECRET,
         "GOOGLE_OAUTH_REFRESH_TOKEN": GOOGLE_OAUTH_REFRESH_TOKEN,
+        "APPSHEET_DOCUMENT_VIEW_URL": APPSHEET_DOCUMENT_VIEW_URL,
     }
 
     for nombre, valor in variables_obligatorias.items():
@@ -3336,6 +3354,1094 @@ def enviar_email_con_pdf(
         "message_id": message_id,
         "thread_id": texto(respuesta.get("threadId")),
     }
+
+
+
+# -----------------------------------------------------------------------------
+# Notificaciones internas por email - Fase 2
+# -----------------------------------------------------------------------------
+
+TIPOS_NOTIFICACION_VALIDOS = {
+    "Acción requerida",
+    "Informativa",
+    "Confirmación",
+    "Cierre",
+}
+
+ESTADOS_NOTIFICACION_REINTENTABLES = {
+    "Pendiente",
+    "Error",
+}
+
+
+def construir_link_appsheet(id_documento: str) -> str:
+    """
+    Construye un enlace web hacia la fila de Documentos.
+
+    APPSHEET_DOCUMENT_VIEW_URL debe contener la URL completa de la vista
+    Detail, por ejemplo:
+    https://www.appsheet.com/start/...#view=Documentos_Notificacion_Detail
+    """
+    base = APPSHEET_DOCUMENT_VIEW_URL.strip()
+    if not base:
+        raise RuntimeError(
+            "APPSHEET_DOCUMENT_VIEW_URL no está configurada"
+        )
+
+    id_codificado = quote(texto(id_documento), safe="")
+    if not id_codificado:
+        raise ValueError("No se puede construir el enlace sin ID_DOCUMENTO")
+
+    # Reemplaza un parámetro row existente para evitar enlaces ambiguos.
+    if re.search(r"([&#])row=[^&#]*", base, flags=re.IGNORECASE):
+        return re.sub(
+            r"([&#])row=[^&#]*",
+            lambda coincidencia: (
+                f"{coincidencia.group(1)}row={id_codificado}"
+            ),
+            base,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    if "#" in base:
+        separador = "&"
+    else:
+        separador = "#"
+
+    return f"{base}{separador}row={id_codificado}"
+
+
+def obtener_cadena_notificacion(
+    id_documento: str,
+    numero_version: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Obtiene destinatarios exclusivamente desde
+    Documentos_Aprobadores_Actual.
+    """
+    selector = (
+        f"FILTER({TABLA_APROBADORES_ACTUAL}, "
+        f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)})"
+    )
+    filas = appsheet_find(TABLA_APROBADORES_ACTUAL, selector)
+
+    resultado: list[dict[str, Any]] = []
+    for fila in filas:
+        if numero_version is not None:
+            try:
+                version_fila = entero(
+                    fila.get("NUMERO_VERSION"),
+                    "NUMERO_VERSION",
+                )
+            except ValueError:
+                continue
+
+            if version_fila != numero_version:
+                continue
+
+        resultado.append(fila)
+
+    return sorted(
+        resultado,
+        key=lambda fila: entero(
+            fila.get("ORDEN"),
+            "ORDEN",
+        ),
+    )
+
+
+def deduplicar_cadena_por_email(
+    cadena: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Elimina correos repetidos y omite direcciones inválidas."""
+    resultado: list[dict[str, Any]] = []
+    vistos: set[str] = set()
+
+    for fila in cadena:
+        email = texto(fila.get("APROBADOR")).lower()
+        if not email:
+            app.logger.warning(
+                "Se omitió un responsable sin APROBADOR: %s",
+                fila.get("ID_APROBACION_ACTUAL"),
+            )
+            continue
+
+        if not _EMAIL_RE.fullmatch(email):
+            app.logger.warning(
+                "Se omitió un responsable con correo inválido: %s",
+                email,
+            )
+            continue
+
+        if email in vistos:
+            continue
+
+        vistos.add(email)
+        resultado.append(fila)
+
+    return resultado
+
+
+def buscar_eventos_documento(
+    id_documento: str,
+) -> list[dict[str, Any]]:
+    selector = (
+        f"FILTER({TABLA_EVENTOS}, "
+        f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)})"
+    )
+    return appsheet_find(TABLA_EVENTOS, selector)
+
+
+def buscar_evento_por_id(
+    id_evento: str,
+) -> dict[str, Any]:
+    selector = (
+        f"FILTER({TABLA_EVENTOS}, "
+        f"[ID_EVENTO] = {literal_appsheet(id_evento)})"
+    )
+    filas = appsheet_find(TABLA_EVENTOS, selector)
+    if not filas:
+        raise LookupError(f"No se encontró ID_EVENTO={id_evento}")
+    return filas[0]
+
+
+def parsear_fecha_appsheet(valor: Any) -> datetime:
+    fecha_texto = texto(valor)
+    if not fecha_texto:
+        return datetime.min
+
+    formatos = (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+    )
+
+    for formato in formatos:
+        try:
+            fecha = datetime.strptime(fecha_texto, formato)
+            if fecha.tzinfo is not None:
+                fecha = fecha.astimezone(CHILE_TZ).replace(tzinfo=None)
+            return fecha
+        except ValueError:
+            continue
+
+    return datetime.min
+
+
+def construir_historial_comentarios(
+    id_documento: str,
+) -> tuple[str, str]:
+    """
+    Construye el historial usando Documento_Eventos como fuente formal.
+    Solo incluye eventos que contienen comentario.
+    """
+    eventos = buscar_eventos_documento(id_documento)
+    eventos.sort(
+        key=lambda fila: parsear_fecha_appsheet(
+            fila.get("FECHA_EVENTO")
+        )
+    )
+
+    lineas_texto: list[str] = []
+    bloques_html: list[str] = []
+
+    for evento in eventos:
+        comentario = texto(evento.get("COMENTARIO"))
+        if not comentario:
+            continue
+
+        fecha = texto(evento.get("FECHA_EVENTO"))
+        usuario = texto(evento.get("USUARIO")) or "Sistema"
+        tipo_evento = (
+            texto(evento.get("TIPO_EVENTO"))
+            or "Actualización"
+        )
+        estado_nuevo = texto(evento.get("ESTADO_NUEVO"))
+
+        encabezado_estado = tipo_evento
+        if estado_nuevo:
+            encabezado_estado += f" — {estado_nuevo}"
+
+        lineas_texto.append(
+            f"{fecha}\n"
+            f"{usuario}\n"
+            f"{encabezado_estado}\n"
+            f"{comentario}"
+        )
+
+        bloques_html.append(
+            """
+            <div style="
+                margin:0 0 16px 0;
+                padding:10px 12px;
+                border-left:3px solid #6b7280;
+                background:#f9fafb;
+            ">
+                <div style="font-weight:700;">{fecha}</div>
+                <div>{usuario}</div>
+                <div style="margin-top:3px;">
+                    <strong>{movimiento}</strong>
+                </div>
+                <div style="margin-top:7px; white-space:pre-wrap;">
+                    {comentario}
+                </div>
+            </div>
+            """.format(
+                fecha=html.escape(fecha),
+                usuario=html.escape(usuario),
+                movimiento=html.escape(encabezado_estado),
+                comentario=html.escape(comentario),
+            )
+        )
+
+    if not lineas_texto:
+        return (
+            "Todavía no existen comentarios registrados.",
+            "<p>Todavía no existen comentarios registrados.</p>",
+        )
+
+    return "\n\n".join(lineas_texto), "".join(bloques_html)
+
+
+def construir_email_notificacion(
+    *,
+    documento: dict[str, Any],
+    destinatario: dict[str, Any],
+    tipo_notificacion: str,
+    movimiento: str,
+    comentario_principal: str,
+    historial_texto: str,
+    historial_html: str,
+    link_documento: str,
+    link_appsheet: str,
+) -> tuple[str, str, str]:
+    if tipo_notificacion not in TIPOS_NOTIFICACION_VALIDOS:
+        raise ValueError(
+            f"TIPO_NOTIFICACION no válido: {tipo_notificacion!r}"
+        )
+
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    titulo = texto(documento.get("TITULO")) or id_documento
+    tipo_documento = texto(documento.get("TIPO_DOCUMENTO"))
+    estado = texto(documento.get("ESTADO"))
+    version = texto(documento.get("VERSION_ACTUAL")) or "-"
+    revision = texto(documento.get("REVISION_ACTUAL")) or "-"
+    responsable = texto(
+        documento.get("ENCARGADO_ACTUAL_NOMBRE")
+    )
+    nombre_destinatario = (
+        texto(destinatario.get("NOMBRE"))
+        or texto(destinatario.get("DESTINATARIO_NOMBRE"))
+        or "usuario/a"
+    )
+
+    prefijo = {
+        "Acción requerida": "Acción requerida",
+        "Confirmación": "Confirmación",
+        "Informativa": "Información",
+        "Cierre": "Proceso documental",
+    }[tipo_notificacion]
+
+    asunto = f"[{prefijo}] {titulo} — {id_documento}"
+
+    comentario_texto = (
+        comentario_principal
+        or "No se registró un comentario adicional."
+    )
+
+    lineas_enlaces = [f"Abrir en AppSheet: {link_appsheet}"]
+    if tipo_notificacion == "Acción requerida" and link_documento:
+        lineas_enlaces.insert(
+            0,
+            f"Abrir documento: {link_documento}",
+        )
+
+    cuerpo_texto = (
+        f"{tipo_notificacion.upper()}\n\n"
+        f"Estimado/a {nombre_destinatario}:\n\n"
+        f"Se registró un movimiento en {NOMBRE_APLICACION}.\n\n"
+        f"Documento: {titulo}\n"
+        f"Tipo: {tipo_documento}\n"
+        f"Estado actual: {estado}\n"
+        f"Versión: V{version} — REV{revision}\n"
+        f"Responsable actual: {responsable}\n\n"
+        f"Último movimiento:\n{movimiento}\n\n"
+        f"Comentario:\n{comentario_texto}\n\n"
+        + "\n".join(lineas_enlaces)
+        + "\n\nHISTORIAL DEL FLUJO\n\n"
+        + historial_texto
+        + f"\n\nEste mensaje fue enviado por {NOMBRE_APLICACION}."
+    )
+
+    botones_html: list[str] = []
+    if tipo_notificacion == "Acción requerida" and link_documento:
+        botones_html.append(
+            """
+            <a href="{url}" style="
+                display:inline-block;
+                padding:11px 18px;
+                margin:4px 8px 4px 0;
+                background:#4f46e5;
+                color:#ffffff;
+                text-decoration:none;
+                border-radius:6px;
+                font-weight:700;
+            ">Abrir documento</a>
+            """.format(url=html.escape(link_documento, quote=True))
+        )
+
+    botones_html.append(
+        """
+        <a href="{url}" style="
+            display:inline-block;
+            padding:11px 18px;
+            margin:4px 8px 4px 0;
+            background:#111827;
+            color:#ffffff;
+            text-decoration:none;
+            border-radius:6px;
+            font-weight:700;
+        ">Abrir en AppSheet</a>
+        """.format(url=html.escape(link_appsheet, quote=True))
+    )
+
+    cuerpo_html = """
+    <html>
+      <body style="
+          margin:0;
+          padding:0;
+          background:#f3f4f6;
+          font-family:Arial,Helvetica,sans-serif;
+          color:#111827;
+      ">
+        <div style="
+            max-width:720px;
+            margin:24px auto;
+            background:#ffffff;
+            border:1px solid #e5e7eb;
+            border-radius:10px;
+            overflow:hidden;
+        ">
+          <div style="
+              padding:20px 24px;
+              background:#111827;
+              color:#ffffff;
+          ">
+            <div style="font-size:13px; opacity:.85;">{aplicacion}</div>
+            <div style="font-size:22px; font-weight:700; margin-top:4px;">
+              {tipo_notificacion}
+            </div>
+          </div>
+
+          <div style="padding:24px;">
+            <p>Estimado/a <strong>{nombre_destinatario}</strong>:</p>
+            <p>Se registró un movimiento en el flujo documental.</p>
+
+            <table style="
+                width:100%;
+                border-collapse:collapse;
+                margin:18px 0;
+            ">
+              <tr><td style="{td_label}">Documento</td><td style="{td_value}">{titulo}</td></tr>
+              <tr><td style="{td_label}">Tipo</td><td style="{td_value}">{tipo_documento}</td></tr>
+              <tr><td style="{td_label}">Estado</td><td style="{td_value}">{estado}</td></tr>
+              <tr><td style="{td_label}">Versión</td><td style="{td_value}">V{version} — REV{revision}</td></tr>
+              <tr><td style="{td_label}">Responsable actual</td><td style="{td_value}">{responsable}</td></tr>
+            </table>
+
+            <div style="
+                padding:14px 16px;
+                margin:18px 0;
+                border-radius:8px;
+                background:#eef2ff;
+            ">
+              <div style="font-weight:700; margin-bottom:5px;">
+                Último movimiento
+              </div>
+              <div>{movimiento}</div>
+            </div>
+
+            <div style="
+                padding:14px 16px;
+                margin:18px 0;
+                border-radius:8px;
+                background:#fff7ed;
+            ">
+              <div style="font-weight:700; margin-bottom:5px;">
+                Comentario
+              </div>
+              <div style="white-space:pre-wrap;">{comentario_principal}</div>
+            </div>
+
+            <div style="margin:22px 0;">
+              {botones}
+            </div>
+
+            <h3 style="margin-top:28px;">Historial del flujo</h3>
+            {historial_html}
+          </div>
+
+          <div style="
+              padding:14px 24px;
+              background:#f9fafb;
+              color:#6b7280;
+              font-size:12px;
+          ">
+            Mensaje automático de {aplicacion}.
+          </div>
+        </div>
+      </body>
+    </html>
+    """.format(
+        aplicacion=html.escape(NOMBRE_APLICACION),
+        tipo_notificacion=html.escape(tipo_notificacion),
+        nombre_destinatario=html.escape(nombre_destinatario),
+        titulo=html.escape(titulo),
+        tipo_documento=html.escape(tipo_documento),
+        estado=html.escape(estado),
+        version=html.escape(version),
+        revision=html.escape(revision),
+        responsable=html.escape(responsable),
+        movimiento=html.escape(movimiento),
+        comentario_principal=html.escape(comentario_texto),
+        botones="".join(botones_html),
+        historial_html=historial_html,
+        td_label=(
+            "padding:8px 10px;border-bottom:1px solid #e5e7eb;"
+            "font-weight:700;width:35%;vertical-align:top;"
+        ),
+        td_value=(
+            "padding:8px 10px;border-bottom:1px solid #e5e7eb;"
+            "vertical-align:top;"
+        ),
+    )
+
+    return asunto, cuerpo_texto, cuerpo_html
+
+
+def construir_clave_idempotencia(
+    id_evento: str,
+    email: str,
+    tipo_notificacion: str,
+) -> str:
+    id_evento_limpio = texto(id_evento)
+    email_limpio = texto(email).lower()
+    tipo_limpio = texto(tipo_notificacion)
+
+    if not id_evento_limpio:
+        raise ValueError(
+            "ID_EVENTO es obligatorio para la idempotencia"
+        )
+
+    return (
+        f"{id_evento_limpio}|"
+        f"{email_limpio}|"
+        f"{tipo_limpio}"
+    )
+
+
+def buscar_notificacion_por_clave(
+    clave: str,
+) -> dict[str, Any] | None:
+    selector = (
+        f"FILTER({TABLA_NOTIFICACIONES}, "
+        f"[CLAVE_IDEMPOTENCIA] = {literal_appsheet(clave)})"
+    )
+    filas = appsheet_find(TABLA_NOTIFICACIONES, selector)
+    if len(filas) > 1:
+        raise RuntimeError(
+            "Existen varias notificaciones con la misma "
+            "CLAVE_IDEMPOTENCIA"
+        )
+    return filas[0] if filas else None
+
+
+def crear_notificacion_pendiente(
+    *,
+    id_evento: str,
+    id_documento: str,
+    id_version: str,
+    aprobador: dict[str, Any],
+    tipo_notificacion: str,
+    asunto: str,
+    cuerpo: str,
+    link_documento: str,
+    link_appsheet: str,
+) -> tuple[dict[str, Any], bool]:
+    email = texto(aprobador.get("APROBADOR")).lower()
+    clave = construir_clave_idempotencia(
+        id_evento=id_evento,
+        email=email,
+        tipo_notificacion=tipo_notificacion,
+    )
+
+    existente = buscar_notificacion_por_clave(clave)
+    if existente:
+        return existente, False
+
+    fila = {
+        "ID_NOTIFICACION": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_EVENTO": id_evento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": texto(
+            aprobador.get("ID_APROBACION_ACTUAL")
+        ),
+        "DESTINATARIO_EMAIL": email,
+        "DESTINATARIO_NOMBRE": texto(
+            aprobador.get("NOMBRE")
+        ),
+        "ORDEN_DESTINATARIO": aprobador.get("ORDEN", ""),
+        "ROL_DESTINATARIO": texto(
+            aprobador.get("ROL_FLUJO")
+        ),
+        "TIPO_NOTIFICACION": tipo_notificacion,
+        "ASUNTO": asunto,
+        "CUERPO": cuerpo,
+        "LINK_DOCUMENTO": link_documento,
+        "LINK_APPSHEET": link_appsheet,
+        "ESTADO_ENVIO": "Pendiente",
+        "INTENTOS": 0,
+        "FECHA_CREACION": ahora_iso(),
+        "CLAVE_IDEMPOTENCIA": clave,
+    }
+
+    appsheet_action(
+        TABLA_NOTIFICACIONES,
+        "Add",
+        [fila],
+    )
+    return fila, True
+
+
+def enviar_email_notificacion(
+    *,
+    gmail_service: Any,
+    destinatario: str,
+    asunto: str,
+    cuerpo_texto: str,
+    cuerpo_html: str,
+) -> dict[str, str]:
+    email = texto(destinatario).lower()
+    if not _EMAIL_RE.fullmatch(email):
+        raise ValueError(
+            f"Correo de notificación no válido: {destinatario!r}"
+        )
+
+    mensaje = EmailMessage()
+    mensaje["To"] = email
+    mensaje["From"] = GMAIL_SENDER_EMAIL
+    mensaje["Subject"] = asunto
+    mensaje.set_content(cuerpo_texto)
+    mensaje.add_alternative(cuerpo_html, subtype="html")
+
+    raw = base64.urlsafe_b64encode(
+        mensaje.as_bytes()
+    ).decode("ascii")
+
+    respuesta = (
+        gmail_service.users()
+        .messages()
+        .send(
+            userId="me",
+            body={"raw": raw},
+        )
+        .execute()
+    )
+
+    message_id = texto(respuesta.get("id"))
+    if not message_id:
+        raise RuntimeError(
+            "Gmail no devolvió el ID del mensaje de notificación"
+        )
+
+    return {
+        "message_id": message_id,
+        "thread_id": texto(respuesta.get("threadId")),
+    }
+
+
+def marcar_notificacion_enviada(
+    *,
+    id_notificacion: str,
+    intentos: int,
+    message_id: str,
+    thread_id: str,
+) -> None:
+    appsheet_action(
+        TABLA_NOTIFICACIONES,
+        "Edit",
+        [
+            {
+                "ID_NOTIFICACION": id_notificacion,
+                "ESTADO_ENVIO": "Enviada",
+                "INTENTOS": intentos + 1,
+                "FECHA_ENVIO": ahora_iso(),
+                "ERROR_ENVIO": "",
+                "GMAIL_MESSAGE_ID": message_id,
+                "GMAIL_THREAD_ID": thread_id,
+            }
+        ],
+    )
+
+
+def marcar_notificacion_error(
+    *,
+    id_notificacion: str,
+    intentos: int,
+    mensaje_error: str,
+) -> None:
+    appsheet_action(
+        TABLA_NOTIFICACIONES,
+        "Edit",
+        [
+            {
+                "ID_NOTIFICACION": id_notificacion,
+                "ESTADO_ENVIO": "Error",
+                "INTENTOS": intentos + 1,
+                "ERROR_ENVIO": texto(mensaje_error)[:1500],
+            }
+        ],
+    )
+
+
+def actualizar_resumen_notificacion_documento(
+    *,
+    id_documento: str,
+    message_id: str,
+    thread_id: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "GMAIL_THREAD_ID_FLUJO": thread_id,
+                "GMAIL_ULTIMO_MESSAGE_ID_FLUJO": message_id,
+                "FECHA_ULTIMA_NOTIFICACION": ahora_iso(),
+            }
+        ],
+    )
+
+
+def procesar_notificacion_individual(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    aprobador: dict[str, Any],
+    tipo_notificacion: str,
+    movimiento: str,
+    comentario_principal: str,
+    link_documento: str,
+) -> dict[str, Any]:
+    """
+    Crea, envía y registra una notificación sin propagar errores al flujo
+    documental que la invoque.
+    """
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_evento = texto(evento.get("ID_EVENTO"))
+    id_version = (
+        texto(evento.get("ID_VERSION"))
+        or texto(documento.get("ID_VERSION_ACTUAL"))
+    )
+    email = texto(aprobador.get("APROBADOR")).lower()
+
+    # Por diseño, solo las notificaciones de Acción requerida guardan
+    # y muestran el enlace directo al documento editable.
+    link_documento = (
+        normalizar_url_appsheet(link_documento)
+        if tipo_notificacion == "Acción requerida"
+        else ""
+    )
+
+    if not email or not _EMAIL_RE.fullmatch(email):
+        return {
+            "ok": False,
+            "omitida": True,
+            "destinatario": email,
+            "mensaje": "Correo interno inválido o vacío.",
+        }
+
+    try:
+        link_appsheet = construir_link_appsheet(id_documento)
+        historial_texto, historial_html = (
+            construir_historial_comentarios(id_documento)
+        )
+
+        asunto, cuerpo_texto, cuerpo_html = (
+            construir_email_notificacion(
+                documento=documento,
+                destinatario=aprobador,
+                tipo_notificacion=tipo_notificacion,
+                movimiento=movimiento,
+                comentario_principal=comentario_principal,
+                historial_texto=historial_texto,
+                historial_html=historial_html,
+                link_documento=link_documento,
+                link_appsheet=link_appsheet,
+            )
+        )
+
+        notificacion, creada = crear_notificacion_pendiente(
+            id_evento=id_evento,
+            id_documento=id_documento,
+            id_version=id_version,
+            aprobador=aprobador,
+            tipo_notificacion=tipo_notificacion,
+            asunto=asunto,
+            cuerpo=cuerpo_texto,
+            link_documento=link_documento,
+            link_appsheet=link_appsheet,
+        )
+
+        estado_existente = texto(
+            notificacion.get("ESTADO_ENVIO")
+        )
+        id_notificacion = texto(
+            notificacion.get("ID_NOTIFICACION")
+        )
+        intentos = 0
+        try:
+            intentos = entero(
+                notificacion.get("INTENTOS") or 0,
+                "INTENTOS",
+            )
+        except ValueError:
+            intentos = 0
+
+        if not creada and estado_existente == "Enviada":
+            return {
+                "ok": True,
+                "omitida": True,
+                "duplicada": True,
+                "id_notificacion": id_notificacion,
+                "destinatario": email,
+                "mensaje": "La notificación ya había sido enviada.",
+            }
+
+        if (
+            not creada
+            and estado_existente
+            not in ESTADOS_NOTIFICACION_REINTENTABLES
+        ):
+            return {
+                "ok": False,
+                "omitida": True,
+                "id_notificacion": id_notificacion,
+                "destinatario": email,
+                "mensaje": (
+                    "La notificación existente no permite reintento. "
+                    f"Estado: {estado_existente!r}"
+                ),
+            }
+
+        gmail_service = obtener_gmail_service()
+        respuesta_gmail = enviar_email_notificacion(
+            gmail_service=gmail_service,
+            destinatario=email,
+            asunto=asunto,
+            cuerpo_texto=cuerpo_texto,
+            cuerpo_html=cuerpo_html,
+        )
+
+        marcar_notificacion_enviada(
+            id_notificacion=id_notificacion,
+            intentos=intentos,
+            message_id=respuesta_gmail["message_id"],
+            thread_id=respuesta_gmail["thread_id"],
+        )
+
+        try:
+            actualizar_resumen_notificacion_documento(
+                id_documento=id_documento,
+                message_id=respuesta_gmail["message_id"],
+                thread_id=respuesta_gmail["thread_id"],
+            )
+        except Exception:
+            traceback.print_exc()
+
+        return {
+            "ok": True,
+            "omitida": False,
+            "id_notificacion": id_notificacion,
+            "destinatario": email,
+            "tipo_notificacion": tipo_notificacion,
+            "message_id": respuesta_gmail["message_id"],
+            "thread_id": respuesta_gmail["thread_id"],
+        }
+
+    except Exception as exc:
+        traceback.print_exc()
+
+        # Si ya alcanzamos a crear la fila, registra el error en ella.
+        try:
+            id_notificacion_local = texto(
+                locals().get("id_notificacion")
+            )
+            intentos_local = locals().get("intentos", 0)
+            if id_notificacion_local:
+                marcar_notificacion_error(
+                    id_notificacion=id_notificacion_local,
+                    intentos=int(intentos_local),
+                    mensaje_error=str(exc),
+                )
+        except Exception:
+            traceback.print_exc()
+
+        return {
+            "ok": False,
+            "omitida": False,
+            "destinatario": email,
+            "tipo_notificacion": tipo_notificacion,
+            "error": str(exc),
+        }
+
+
+def notificar_destinatarios_internos(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    destinatarios: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Procesa una lista de especificaciones. Cada elemento debe contener:
+    aprobador, tipo_notificacion, movimiento, comentario_principal y
+    link_documento.
+    """
+    resultados: list[dict[str, Any]] = []
+    correos_procesados: set[str] = set()
+
+    for especificacion in destinatarios:
+        aprobador = especificacion.get("aprobador")
+        if not isinstance(aprobador, dict):
+            resultados.append(
+                {
+                    "ok": False,
+                    "omitida": True,
+                    "error": "Especificación sin aprobador válido.",
+                }
+            )
+            continue
+
+        email = texto(aprobador.get("APROBADOR")).lower()
+        if not email or email in correos_procesados:
+            continue
+
+        correos_procesados.add(email)
+        resultados.append(
+            procesar_notificacion_individual(
+                documento=documento,
+                evento=evento,
+                aprobador=aprobador,
+                tipo_notificacion=texto(
+                    especificacion.get("tipo_notificacion")
+                ),
+                movimiento=texto(
+                    especificacion.get("movimiento")
+                ),
+                comentario_principal=texto(
+                    especificacion.get("comentario_principal")
+                ),
+                link_documento=normalizar_url_appsheet(
+                    especificacion.get("link_documento")
+                ),
+            )
+        )
+
+    return resultados
+
+
+def construir_evento_diagnostico(
+    documento: dict[str, Any],
+) -> dict[str, Any]:
+    """Crea un evento virtual cuando el documento aún no tiene bitácora."""
+    return {
+        "ID_EVENTO": f"diagnostico-{texto(documento.get('ID_DOCUMENTO'))}",
+        "ID_DOCUMENTO": texto(documento.get("ID_DOCUMENTO")),
+        "ID_VERSION": texto(documento.get("ID_VERSION_ACTUAL")),
+        "ID_APROBACION_ACTUAL": texto(
+            documento.get("ID_APROBACION_ACTUAL")
+        ),
+        "TIPO_EVENTO": "Diagnóstico de notificación",
+        "ESTADO_ANTERIOR": "",
+        "ESTADO_NUEVO": texto(documento.get("ESTADO")),
+        "USUARIO": "Sistema",
+        "FECHA_EVENTO": ahora_iso(),
+        "COMENTARIO": (
+            "Vista previa técnica. No se creó ni envió una notificación."
+        ),
+    }
+
+
+def seleccionar_evento_diagnostico(
+    *,
+    id_documento: str,
+    id_evento: str,
+    documento: dict[str, Any],
+) -> dict[str, Any]:
+    if id_evento:
+        evento = buscar_evento_por_id(id_evento)
+        if texto(evento.get("ID_DOCUMENTO")) != id_documento:
+            raise ValueError(
+                "El evento indicado no pertenece al documento"
+            )
+        return evento
+
+    eventos = buscar_eventos_documento(id_documento)
+    if not eventos:
+        return construir_evento_diagnostico(documento)
+
+    eventos.sort(
+        key=lambda fila: parsear_fecha_appsheet(
+            fila.get("FECHA_EVENTO")
+        )
+    )
+    return eventos[-1]
+
+
+@app.route("/diagnostico-notificacion", methods=["POST"])
+def diagnostico_notificacion():
+    """
+    Construye una vista previa. No crea filas y no envía correos.
+    """
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        id_aprobacion_actual = texto(
+            data.get("id_aprobacion_actual")
+        )
+        id_evento = texto(data.get("id_evento"))
+        tipo_notificacion = (
+            texto(data.get("tipo_notificacion"))
+            or "Acción requerida"
+        )
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+        if tipo_notificacion not in TIPOS_NOTIFICACION_VALIDOS:
+            return {
+                "error": (
+                    "tipo_notificacion debe ser Acción requerida, "
+                    "Informativa, Confirmación o Cierre"
+                )
+            }, 400
+
+        documento = buscar_documento(id_documento)
+
+        id_aprobacion_actual = (
+            id_aprobacion_actual
+            or texto(documento.get("ID_APROBACION_ACTUAL"))
+        )
+        if not id_aprobacion_actual:
+            raise ValueError(
+                "No se pudo identificar un encargado para el diagnóstico"
+            )
+
+        aprobador = buscar_aprobacion_actual(
+            id_aprobacion_actual
+        )
+        if texto(aprobador.get("ID_DOCUMENTO")) != id_documento:
+            raise ValueError(
+                "El encargado indicado no pertenece al documento"
+            )
+
+        evento = seleccionar_evento_diagnostico(
+            id_documento=id_documento,
+            id_evento=id_evento,
+            documento=documento,
+        )
+
+        id_version = (
+            texto(aprobador.get("ID_VERSION_TRABAJADA"))
+            or texto(documento.get("ID_VERSION_ACTUAL"))
+        )
+        link_documento = normalizar_url_appsheet(
+            documento.get("GOOGLE_DOC_URL")
+        )
+
+        if id_version:
+            try:
+                version = buscar_version_por_id(id_version)
+                link_documento_version = normalizar_url_appsheet(
+                    version.get("GOOGLE_DOC_URL")
+                )
+                if link_documento_version:
+                    link_documento = link_documento_version
+            except Exception:
+                traceback.print_exc()
+
+        link_appsheet = construir_link_appsheet(id_documento)
+        historial_texto, historial_html = (
+            construir_historial_comentarios(id_documento)
+        )
+
+        movimiento = (
+            texto(data.get("movimiento"))
+            or texto(evento.get("TIPO_EVENTO"))
+            or "Actualización del flujo documental"
+        )
+        comentario_principal = (
+            texto(data.get("comentario_principal"))
+            or texto(evento.get("COMENTARIO"))
+        )
+
+        asunto, cuerpo_texto, cuerpo_html = (
+            construir_email_notificacion(
+                documento=documento,
+                destinatario=aprobador,
+                tipo_notificacion=tipo_notificacion,
+                movimiento=movimiento,
+                comentario_principal=comentario_principal,
+                historial_texto=historial_texto,
+                historial_html=historial_html,
+                link_documento=link_documento,
+                link_appsheet=link_appsheet,
+            )
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "solo_diagnostico": True,
+                "no_envia_email": True,
+                "no_crea_notificacion": True,
+                "id_documento": id_documento,
+                "id_evento": texto(evento.get("ID_EVENTO")),
+                "id_aprobacion_actual": id_aprobacion_actual,
+                "destinatario_email": texto(
+                    aprobador.get("APROBADOR")
+                ),
+                "destinatario_nombre": texto(
+                    aprobador.get("NOMBRE")
+                ),
+                "tipo_notificacion": tipo_notificacion,
+                "link_documento": link_documento,
+                "link_appsheet": link_appsheet,
+                "asunto": asunto,
+                "movimiento": movimiento,
+                "comentario_principal": comentario_principal,
+                "historial_texto": historial_texto,
+                "cuerpo_texto": cuerpo_texto,
+                "cuerpo_html": cuerpo_html,
+            }
+        )
+
+    except PermissionError as exc:
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+        return {"error": str(exc)}, 500
 
 
 def marcar_envio_firma_en_proceso(
