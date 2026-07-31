@@ -4332,6 +4332,465 @@ def registrar_firma():
         }, 500
 
 
+# -----------------------------------------------------------------------------
+# Flujo: observaciones/rechazo después del envío a firma
+# -----------------------------------------------------------------------------
+
+
+def actualizar_documento_reinicio_firma(
+    *,
+    id_documento: str,
+    numero_version: int,
+    id_version: str,
+    copia: dict[str, str],
+    primer_encargado: dict[str, Any],
+    usuario: str,
+    fecha: str,
+) -> None:
+    """Apunta la cabecera a un nuevo borrador y reinicia el flujo completo."""
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "Borrador",
+                "VERSION_ACTUAL": numero_version,
+                "REVISION_ACTUAL": 0,
+                "ID_VERSION_ACTUAL": id_version,
+                "GOOGLE_DOC_ID": copia["id"],
+                "GOOGLE_DOC_URL": copia["url"],
+                "ORDEN_ACTUAL": primer_encargado["ORDEN"],
+                "ID_APROBACION_ACTUAL": primer_encargado[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ENCARGADO_ACTUAL_NOMBRE": primer_encargado.get(
+                    "NOMBRE", ""
+                ),
+                "ENCARGADO_ACTUAL_EMAIL": primer_encargado.get(
+                    "APROBADOR", ""
+                ),
+                # El resultado del ciclo de firma anterior queda en el
+                # historial. La cabecera ya no debe apuntar a su PDF.
+                "PDF_PARA_FIRMA_ID": "",
+                "PDF_PARA_FIRMA_URL": "",
+                "ESTADO_FIRMA": "Observado",
+                "PDF_FIRMADO": "",
+                "PDF_FIRMADO_ID": "",
+                "PDF_FIRMADO_URL": "",
+                "FECHA_ENVIO_FIRMA": "",
+                "FECHA_FIRMA_COMPLETA": "",
+                "CARGADO_POR": "",
+                "DESTINATARIOS_FIRMA": "",
+                "MENSAJE_ADICIONAL_FIRMA": "",
+                "ENVIADO_FIRMA_POR": "",
+                "EMAIL_FIRMA_MESSAGE_ID": "",
+                "FECHA_CIERRE": "",
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
+    )
+
+
+def crear_eventos_reinicio_firma(
+    *,
+    id_documento: str,
+    id_version_observada: str,
+    id_version_nueva: str,
+    id_aprobacion_nueva: str,
+    usuario: str,
+    fecha: str,
+    comentario: str,
+    numero_version_nueva: int,
+    nombre_archivo: str,
+) -> list[str]:
+    advertencias: list[str] = []
+    eventos = [
+        {
+            "ID_EVENTO": nuevo_id(),
+            "ID_DOCUMENTO": id_documento,
+            "ID_VERSION": id_version_observada,
+            "ID_APROBACION_ACTUAL": "",
+            "TIPO_EVENTO": "Proceso reiniciado",
+            "ESTADO_ANTERIOR": "En firma",
+            "ESTADO_NUEVO": "Borrador",
+            "USUARIO": usuario,
+            "FECHA_EVENTO": fecha,
+            "COMENTARIO": (
+                "El documento recibió observaciones durante la firma. "
+                f"Motivo: {comentario}"
+            ),
+        },
+        {
+            "ID_EVENTO": nuevo_id(),
+            "ID_DOCUMENTO": id_documento,
+            "ID_VERSION": id_version_nueva,
+            "ID_APROBACION_ACTUAL": id_aprobacion_nueva,
+            "TIPO_EVENTO": "Nueva versión creada",
+            "ESTADO_ANTERIOR": "Observado en firma",
+            "ESTADO_NUEVO": "Borrador",
+            "USUARIO": usuario,
+            "FECHA_EVENTO": fecha,
+            "COMENTARIO": (
+                f"Se creó la versión {numero_version_nueva}: "
+                f"{nombre_archivo}. La cadena de aprobación se reinició "
+                "desde el primer responsable."
+            ),
+        },
+    ]
+
+    try:
+        appsheet_action(TABLA_EVENTOS, "Add", eventos)
+    except Exception as exc:
+        traceback.print_exc()
+        advertencias.append(
+            "La transición terminó, pero no se pudieron crear los eventos: "
+            f"{exc}"
+        )
+
+    return advertencias
+
+
+@app.route("/rechazar-firma", methods=["POST"])
+def rechazar_firma():
+    id_documento = ""
+
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        id_version_solicitud = texto(data.get("id_version_firma"))
+        usuario = texto(data.get("usuario"))
+        comentario = texto(data.get("comentario"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+        if not comentario:
+            return {
+                "error": (
+                    "El comentario es obligatorio para reiniciar el proceso "
+                    "por observaciones durante la firma"
+                )
+            }, 400
+
+        documento = buscar_documento(id_documento)
+        id_version_documento = texto(documento.get("ID_VERSION_ACTUAL"))
+        id_version_origen = id_version_solicitud or id_version_documento
+        if not id_version_origen:
+            raise ValueError("No se pudo identificar la versión enviada a firma")
+
+        version_origen = buscar_version_por_id(id_version_origen)
+        numero_version_anterior = entero(
+            version_origen.get("NUMERO_VERSION"),
+            "NUMERO_VERSION",
+        )
+        estado_version_origen = texto(
+            version_origen.get("ESTADO_VERSION")
+        )
+        etapa_origen = texto(version_origen.get("ETAPA"))
+
+        numero_version_documento = entero(
+            documento.get("VERSION_ACTUAL"),
+            "VERSION_ACTUAL",
+        )
+        estado_documento = texto(documento.get("ESTADO"))
+
+        # Reintento del mismo webhook después de una transición ya terminada.
+        if (
+            estado_version_origen == "Observada"
+            and numero_version_documento > numero_version_anterior
+            and estado_documento in {"Borrador", "En revisión"}
+        ):
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "estado": estado_documento,
+                    "estado_firma": texto(
+                        documento.get("ESTADO_FIRMA")
+                    ),
+                    "numero_version": numero_version_documento,
+                    "numero_revision": entero(
+                        documento.get("REVISION_ACTUAL") or 0,
+                        "REVISION_ACTUAL",
+                    ),
+                    "id_version": texto(
+                        documento.get("ID_VERSION_ACTUAL")
+                    ),
+                    "google_doc_id": texto(
+                        documento.get("GOOGLE_DOC_ID")
+                    ),
+                    "google_doc_url": normalizar_url_appsheet(
+                        documento.get("GOOGLE_DOC_URL")
+                    ),
+                }
+            )
+
+        estado_firma = texto(documento.get("ESTADO_FIRMA"))
+        if estado_documento != "En firma":
+            raise ValueError(
+                "Solo se puede rechazar por observaciones un documento En firma. "
+                f"Estado actual: {estado_documento!r}"
+            )
+        if estado_firma != "Pendiente":
+            raise ValueError(
+                "El estado de firma debe ser Pendiente para reiniciar el proceso. "
+                f"Estado actual: {estado_firma!r}"
+            )
+        if id_version_documento != id_version_origen:
+            raise ValueError(
+                "La versión enviada por AppSheet ya no coincide con la versión "
+                "actual del documento"
+            )
+        if etapa_origen != "Para firma":
+            raise ValueError(
+                "La versión que se intenta observar no corresponde a la etapa "
+                f"Para firma. Etapa encontrada: {etapa_origen!r}"
+            )
+
+        usuario_envio = texto(documento.get("ENVIADO_FIRMA_POR"))
+        usuario = usuario or usuario_envio
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("El usuario que reinicia la aprobación no es válido")
+        if usuario_envio and usuario_envio.lower() != usuario.lower():
+            raise PermissionError(
+                "Solo el usuario que envió el documento a firma puede "
+                "reiniciar la aprobación"
+            )
+
+        google_doc_id_origen = texto(
+            version_origen.get("GOOGLE_DOC_ID")
+        ) or texto(documento.get("GOOGLE_DOC_ID"))
+        if not google_doc_id_origen:
+            raise ValueError(
+                "La versión Para firma no tiene GOOGLE_DOC_ID para crear "
+                "el nuevo borrador"
+            )
+
+        cadena_anterior = buscar_cadena_documento_version(
+            id_documento=id_documento,
+            numero_version=numero_version_anterior,
+        )
+        if not cadena_anterior:
+            raise ValueError(
+                "No se encontró la cadena de aprobación de la versión enviada "
+                "a firma"
+            )
+
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
+        folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
+        if not folder_id:
+            raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
+
+        numero_version_nueva = numero_version_anterior + 1
+        numero_revision_nueva = 0
+        titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        nombre_archivo = limpiar_nombre_archivo(
+            f"{titulo}_V{numero_version_nueva:02d}_BORRADOR"
+        )
+        fecha = ahora_iso()
+        drive_service = obtener_drive_service()
+
+        version_existente = buscar_version_numero_revision(
+            id_documento=id_documento,
+            numero_version=numero_version_nueva,
+            numero_revision=numero_revision_nueva,
+        )
+
+        if version_existente:
+            id_version_nueva = texto(version_existente.get("ID_VERSION"))
+            copia = {
+                "id": texto(version_existente.get("GOOGLE_DOC_ID")),
+                "url": normalizar_url_appsheet(
+                    version_existente.get("GOOGLE_DOC_URL")
+                ),
+                "name": (
+                    texto(version_existente.get("NOMBRE_ARCHIVO"))
+                    or nombre_archivo
+                ),
+            }
+            if not copia["id"]:
+                raise RuntimeError(
+                    "La nueva versión existente no tiene GOOGLE_DOC_ID"
+                )
+        else:
+            id_version_nueva = nuevo_id()
+            copia = copiar_archivo_o_reutilizar(
+                drive_service=drive_service,
+                source_file_id=google_doc_id_origen,
+                folder_id=folder_id,
+                nombre_archivo=nombre_archivo,
+            )
+
+        # La versión Para firma queda congelada. El nuevo borrador comienza
+        # nuevamente con edición exclusiva para el primer responsable.
+        for fila in cadena_anterior:
+            email = texto(fila.get("APROBADOR"))
+            if email:
+                asegurar_permiso_rol(
+                    drive_service=drive_service,
+                    file_id=google_doc_id_origen,
+                    email=email,
+                    role="reader",
+                )
+
+        primer_anterior = cadena_anterior[0]
+        email_primero = texto(primer_anterior.get("APROBADOR"))
+        if not email_primero:
+            raise ValueError("El primer responsable no tiene correo")
+
+        permission_id_primero = asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=copia["id"],
+            email=email_primero,
+            role="writer",
+        )
+
+        cadena_nueva_existente = buscar_cadena_documento_version(
+            id_documento=id_documento,
+            numero_version=numero_version_nueva,
+        )
+
+        if cadena_nueva_existente:
+            primeros = [
+                fila
+                for fila in cadena_nueva_existente
+                if entero(fila.get("ORDEN"), "ORDEN")
+                == entero(primer_anterior.get("ORDEN"), "ORDEN")
+            ]
+            if len(primeros) != 1:
+                raise RuntimeError(
+                    "La cadena nueva existente no tiene un único primer "
+                    "responsable"
+                )
+            primer_nuevo = primeros[0]
+            actualizar_destino_cadena_reutilizada(
+                destino=primer_nuevo,
+                id_version_nueva=id_version_nueva,
+                permission_id_destino=permission_id_primero,
+                estado_destino="En elaboración",
+                fecha=fecha,
+            )
+        else:
+            filas_nuevas, primer_nuevo = construir_cadena_nueva_por_rechazo(
+                cadena_anterior=cadena_anterior,
+                id_documento=id_documento,
+                id_plantilla=id_plantilla,
+                numero_version_anterior=numero_version_anterior,
+                numero_version_nueva=numero_version_nueva,
+                indice_destino=0,
+                id_version_nueva=id_version_nueva,
+                permission_id_destino=permission_id_primero,
+                fecha=fecha,
+            )
+            appsheet_action(
+                TABLA_APROBADORES_ACTUAL,
+                "Add",
+                filas_nuevas,
+            )
+
+        if not version_existente:
+            crear_registro_version_por_aprobacion(
+                id_version=id_version_nueva,
+                id_documento=id_documento,
+                id_version_origen=id_version_origen,
+                numero_version=numero_version_nueva,
+                numero_revision=0,
+                etapa="Borrador",
+                nombre_archivo=copia["name"],
+                google_doc_id=copia["id"],
+                google_doc_url=copia["url"],
+                id_aprobacion_responsable=primer_nuevo[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                orden_responsable=entero(
+                    primer_nuevo.get("ORDEN"),
+                    "ORDEN",
+                ),
+                motivo_creacion="Reinicio por observaciones de firma",
+                comentario=comentario,
+                creado_por=usuario,
+                fecha_creacion=fecha,
+            )
+
+        actualizar_estado_version(
+            id_version=id_version_origen,
+            estado_version="Observada",
+            fecha_cierre=fecha,
+        )
+
+        actualizar_documento_reinicio_firma(
+            id_documento=id_documento,
+            numero_version=numero_version_nueva,
+            id_version=id_version_nueva,
+            copia=copia,
+            primer_encargado=primer_nuevo,
+            usuario=usuario,
+            fecha=fecha,
+        )
+
+        advertencias = crear_eventos_reinicio_firma(
+            id_documento=id_documento,
+            id_version_observada=id_version_origen,
+            id_version_nueva=id_version_nueva,
+            id_aprobacion_nueva=primer_nuevo[
+                "ID_APROBACION_ACTUAL"
+            ],
+            usuario=usuario,
+            fecha=fecha,
+            comentario=comentario,
+            numero_version_nueva=numero_version_nueva,
+            nombre_archivo=copia["name"],
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "estado": "Borrador",
+                "estado_firma": "Observado",
+                "numero_version": numero_version_nueva,
+                "numero_revision": 0,
+                "id_version": id_version_nueva,
+                "google_doc_id": copia["id"],
+                "google_doc_url": copia["url"],
+                "nombre_archivo": copia["name"],
+                "orden_actual": primer_nuevo["ORDEN"],
+                "id_aprobacion_actual": primer_nuevo[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "encargado_actual": primer_nuevo.get("NOMBRE", ""),
+                "encargado_email": email_primero,
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
