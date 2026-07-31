@@ -108,8 +108,31 @@ def nuevo_id() -> str:
 
 
 def texto(valor: Any) -> str:
+    """
+    Convierte valores de AppSheet a texto simple.
+
+    AppSheet puede devolver columnas URL como un objeto:
+    {"Url": "...", "LinkText": "..."}.
+    Al volver a enviar ese objeto a una columna de tipo Url, la API lo
+    rechaza. Esta función extrae únicamente la URL real.
+    """
     if valor is None:
         return ""
+
+    if isinstance(valor, dict):
+        for clave in ("Url", "URL", "url"):
+            contenido = valor.get(clave)
+            if contenido is not None:
+                return str(contenido).strip()
+
+        # Otros valores enriquecidos de AppSheet pueden traer Value.
+        for clave in ("Value", "value"):
+            contenido = valor.get(clave)
+            if contenido is not None:
+                return str(contenido).strip()
+
+        return ""
+
     return str(valor).strip()
 
 
