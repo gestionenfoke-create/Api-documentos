@@ -136,6 +136,58 @@ def texto(valor: Any) -> str:
     return str(valor).strip()
 
 
+def normalizar_url_appsheet(valor: Any) -> str:
+    """
+    Devuelve una URL plana aunque AppSheet la entregue como:
+
+    - dict: {"Url": "...", "LinkText": "..."}
+    - string JSON: '{"Url":"...","LinkText":"..."}'
+    - URL normal: "https://..."
+
+    Si recibe cualquier otro texto, intenta extraer la primera URL http/https.
+    """
+    if valor is None:
+        return ""
+
+    if isinstance(valor, dict):
+        for clave in ("Url", "URL", "url", "Value", "value"):
+            if clave in valor:
+                return normalizar_url_appsheet(valor.get(clave))
+        return ""
+
+    if isinstance(valor, (list, tuple)):
+        for item in valor:
+            url = normalizar_url_appsheet(item)
+            if url:
+                return url
+        return ""
+
+    valor_texto = str(valor).strip()
+    if not valor_texto:
+        return ""
+
+    # AppSheet puede devolver el objeto URL serializado como texto JSON.
+    if valor_texto.startswith("{") and valor_texto.endswith("}"):
+        try:
+            objeto = json.loads(valor_texto)
+        except json.JSONDecodeError:
+            objeto = None
+
+        if objeto is not None:
+            url = normalizar_url_appsheet(objeto)
+            if url:
+                return url
+
+    if valor_texto.lower().startswith(("https://", "http://")):
+        return valor_texto
+
+    coincidencia = re.search(r'https?://[^"\'\s}<]+', valor_texto)
+    if coincidencia:
+        return coincidencia.group(0)
+
+    return ""
+
+
 def entero(valor: Any, nombre_campo: str) -> int:
     try:
         return int(float(str(valor).strip()))
@@ -3177,6 +3229,29 @@ def crear_version_firmada(
     usuario: str,
     fecha: str,
 ) -> None:
+    google_doc_id_limpio = texto(google_doc_id)
+    google_doc_url_limpia = normalizar_url_appsheet(google_doc_url)
+
+    # Para esta versión, el ID de Google Docs es la fuente más confiable.
+    # Si AppSheet devolvió una URL enriquecida o inválida, la reconstruimos.
+    if google_doc_id_limpio:
+        google_doc_url_limpia = (
+            f"https://docs.google.com/document/d/"
+            f"{google_doc_id_limpio}/edit"
+        )
+
+    pdf_url_limpia = normalizar_url_appsheet(pdf_url)
+    if not pdf_url_limpia and texto(pdf_id):
+        pdf_url_limpia = (
+            f"https://drive.google.com/file/d/{texto(pdf_id)}/view"
+        )
+
+    app.logger.info(
+        "Creando versión firmada: google_doc_id=%s, google_doc_url=%s",
+        google_doc_id_limpio,
+        google_doc_url_limpia,
+    )
+
     appsheet_action(
         TABLA_VERSIONES,
         "Add",
@@ -3190,10 +3265,10 @@ def crear_version_firmada(
                 "ETAPA": "Firmado",
                 "ESTADO_VERSION": "Firmada",
                 "NOMBRE_ARCHIVO": nombre_archivo,
-                "GOOGLE_DOC_ID": google_doc_id,
-                "GOOGLE_DOC_URL": google_doc_url,
-                "PDF_VERSION_ID": pdf_id,
-                "PDF_VERSION_URL": pdf_url,
+                "GOOGLE_DOC_ID": google_doc_id_limpio,
+                "GOOGLE_DOC_URL": google_doc_url_limpia,
+                "PDF_VERSION_ID": texto(pdf_id),
+                "PDF_VERSION_URL": pdf_url_limpia,
                 "ID_APROBACION_RESPONSABLE": "",
                 "ORDEN_RESPONSABLE": "",
                 "MOTIVO_CREACION": "Carga de documento firmado",
@@ -3440,6 +3515,13 @@ def registrar_firma():
                 estado_version="Cerrada",
                 fecha_cierre=fecha,
             )
+            google_doc_id_origen = texto(
+                version_origen.get("GOOGLE_DOC_ID")
+            )
+            google_doc_url_origen = normalizar_url_appsheet(
+                version_origen.get("GOOGLE_DOC_URL")
+            )
+
             crear_version_firmada(
                 id_version=id_version_final,
                 id_documento=id_documento,
@@ -3447,8 +3529,8 @@ def registrar_firma():
                 numero_version=numero_version,
                 numero_revision=numero_revision,
                 nombre_archivo=nombre_final,
-                google_doc_id=texto(version_origen.get("GOOGLE_DOC_ID")),
-                google_doc_url=texto(version_origen.get("GOOGLE_DOC_URL")),
+                google_doc_id=google_doc_id_origen,
+                google_doc_url=google_doc_url_origen,
                 pdf_id=pdf_final["id"],
                 pdf_url=pdf_final["url"],
                 comentario=comentario,
