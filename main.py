@@ -2463,6 +2463,729 @@ def aprobar_revision():
 
 
 # -----------------------------------------------------------------------------
+# Flujo: rechazar revisión
+# -----------------------------------------------------------------------------
+
+
+def buscar_cadena_documento_version(
+    id_documento: str,
+    numero_version: int,
+) -> list[dict[str, Any]]:
+    """Devuelve la cadena de una versión, esté activa o histórica."""
+    selector = (
+        f"FILTER({TABLA_APROBADORES_ACTUAL}, "
+        f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)})"
+    )
+    filas = appsheet_find(TABLA_APROBADORES_ACTUAL, selector)
+    coincidentes: list[dict[str, Any]] = []
+
+    for fila in filas:
+        try:
+            version_fila = entero(
+                fila.get("NUMERO_VERSION"),
+                "NUMERO_VERSION",
+            )
+        except ValueError:
+            continue
+
+        if version_fila == numero_version:
+            coincidentes.append(fila)
+
+    return sorted(
+        coincidentes,
+        key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"),
+    )
+
+
+def construir_cadena_nueva_por_rechazo(
+    *,
+    cadena_anterior: list[dict[str, Any]],
+    id_documento: str,
+    id_plantilla: str,
+    numero_version_anterior: int,
+    numero_version_nueva: int,
+    indice_destino: int,
+    id_version_nueva: str,
+    permission_id_destino: str,
+    fecha: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Crea una nueva instancia de la cadena sin alterar el historial anterior.
+
+    - Responsables anteriores al destino: aprobación heredada.
+    - Responsable destino: vuelve a elaboración o revisión.
+    - Responsables posteriores: pendientes.
+    """
+    filas_nuevas: list[dict[str, Any]] = []
+    destino_nuevo: dict[str, Any] | None = None
+
+    for indice, fila_anterior in enumerate(cadena_anterior):
+        orden = entero(fila_anterior.get("ORDEN"), "ORDEN")
+        rol_flujo = texto(fila_anterior.get("ROL_FLUJO"))
+        fila_nueva: dict[str, Any] = {
+            "ID_APROBACION_ACTUAL": nuevo_id(),
+            "ID_APROBACION_PLANTILLA": texto(
+                fila_anterior.get("ID_APROBACION_PLANTILLA")
+            ),
+            "ID_PLANTILLA": id_plantilla,
+            "ID_DOCUMENTO": id_documento,
+            "NUMERO_VERSION": numero_version_nueva,
+            "ORDEN": orden,
+            "APROBADOR": texto(fila_anterior.get("APROBADOR")),
+            "NOMBRE": texto(fila_anterior.get("NOMBRE")),
+            "ROL_FLUJO": rol_flujo,
+            "CADENA_ACTIVA": True,
+        }
+
+        if indice < indice_destino:
+            fila_nueva.update(
+                {
+                    "ESTADO": "Heredado",
+                    "RESULTADO": "Aprobación heredada",
+                    "COMENTARIO": (
+                        "Aprobación heredada desde la versión "
+                        f"{numero_version_anterior}."
+                    ),
+                    "FECHA_RESPUESTA": fecha,
+                }
+            )
+        elif indice == indice_destino:
+            estado_destino = (
+                "En elaboración"
+                if indice_destino == 0
+                or rol_flujo.lower() == "elaborador"
+                else "En revisión"
+            )
+            fila_nueva.update(
+                {
+                    "ID_VERSION_TRABAJADA": id_version_nueva,
+                    "ESTADO": estado_destino,
+                    "FECHA_INICIO": fecha,
+                    "PERMISSION_ID_DRIVE": permission_id_destino,
+                }
+            )
+            destino_nuevo = fila_nueva
+        else:
+            fila_nueva["ESTADO"] = "Pendiente"
+
+        filas_nuevas.append(fila_nueva)
+
+    if destino_nuevo is None:
+        raise RuntimeError(
+            "No fue posible construir el responsable de retorno"
+        )
+
+    return filas_nuevas, destino_nuevo
+
+
+def cerrar_cadena_anterior_por_rechazo(
+    *,
+    cadena_anterior: list[dict[str, Any]],
+    id_aprobacion_rechaza: str,
+    comentario: str,
+    fecha: str,
+) -> None:
+    filas: list[dict[str, Any]] = []
+
+    for fila in cadena_anterior:
+        id_fila = texto(fila.get("ID_APROBACION_ACTUAL"))
+        cambios: dict[str, Any] = {
+            "ID_APROBACION_ACTUAL": id_fila,
+            "CADENA_ACTIVA": False,
+        }
+
+        if id_fila == id_aprobacion_rechaza:
+            cambios.update(
+                {
+                    "ESTADO": "Cerrado",
+                    "RESULTADO": "Rechazado",
+                    "COMENTARIO": comentario,
+                    "FECHA_RESPUESTA": fecha,
+                }
+            )
+
+        filas.append(cambios)
+
+    appsheet_action(
+        TABLA_APROBADORES_ACTUAL,
+        "Edit",
+        filas,
+    )
+
+
+def actualizar_destino_cadena_reutilizada(
+    *,
+    destino: dict[str, Any],
+    id_version_nueva: str,
+    permission_id_destino: str,
+    estado_destino: str,
+    fecha: str,
+) -> None:
+    """Completa una cadena ya creada por una ejecución parcial anterior."""
+    appsheet_action(
+        TABLA_APROBADORES_ACTUAL,
+        "Edit",
+        [
+            {
+                "ID_APROBACION_ACTUAL": destino[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ID_VERSION_TRABAJADA": id_version_nueva,
+                "ESTADO": estado_destino,
+                "RESULTADO": "",
+                "COMENTARIO": "",
+                "FECHA_INICIO": fecha,
+                "FECHA_RESPUESTA": "",
+                "PERMISSION_ID_DRIVE": permission_id_destino,
+                "CADENA_ACTIVA": True,
+            }
+        ],
+    )
+
+
+def actualizar_documento_rechazo_revision(
+    *,
+    id_documento: str,
+    numero_version: int,
+    numero_revision: int,
+    id_version: str,
+    copia: dict[str, str],
+    destino: dict[str, Any],
+    estado_documento: str,
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": estado_documento,
+                "VERSION_ACTUAL": numero_version,
+                "REVISION_ACTUAL": numero_revision,
+                "ID_VERSION_ACTUAL": id_version,
+                "GOOGLE_DOC_ID": copia["id"],
+                "GOOGLE_DOC_URL": copia["url"],
+                "ORDEN_ACTUAL": destino["ORDEN"],
+                "ID_APROBACION_ACTUAL": destino[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ENCARGADO_ACTUAL_NOMBRE": destino.get("NOMBRE", ""),
+                "ENCARGADO_ACTUAL_EMAIL": destino.get("APROBADOR", ""),
+                "ESTADO_FIRMA": "No iniciado",
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
+    )
+
+
+def crear_eventos_rechazo_revision(
+    *,
+    id_documento: str,
+    id_version_rechazada: str,
+    id_version_nueva: str,
+    id_aprobacion_rechaza: str,
+    id_aprobacion_destino: str,
+    usuario: str,
+    fecha: str,
+    comentario: str,
+    orden_rechaza: int,
+    orden_destino: int,
+    numero_version_nueva: int,
+    nombre_archivo: str,
+    estado_nuevo: str,
+) -> list[str]:
+    advertencias: list[str] = []
+
+    eventos = [
+        {
+            "ID_EVENTO": nuevo_id(),
+            "ID_DOCUMENTO": id_documento,
+            "ID_VERSION": id_version_rechazada,
+            "ID_APROBACION_ACTUAL": id_aprobacion_rechaza,
+            "TIPO_EVENTO": "Revisión rechazada",
+            "ESTADO_ANTERIOR": f"En revisión - Orden {orden_rechaza}",
+            "ESTADO_NUEVO": (
+                f"{estado_nuevo} - Orden {orden_destino}"
+            ),
+            "USUARIO": usuario,
+            "FECHA_EVENTO": fecha,
+            "COMENTARIO": comentario,
+        },
+        {
+            "ID_EVENTO": nuevo_id(),
+            "ID_DOCUMENTO": id_documento,
+            "ID_VERSION": id_version_nueva,
+            "ID_APROBACION_ACTUAL": id_aprobacion_destino,
+            "TIPO_EVENTO": "Nueva versión creada",
+            "ESTADO_ANTERIOR": "Revisión rechazada",
+            "ESTADO_NUEVO": estado_nuevo,
+            "USUARIO": usuario,
+            "FECHA_EVENTO": fecha,
+            "COMENTARIO": (
+                f"Se creó la versión {numero_version_nueva}: "
+                f"{nombre_archivo}. El flujo retrocedió desde el orden "
+                f"{orden_rechaza} al orden {orden_destino}."
+            ),
+        },
+    ]
+
+    try:
+        appsheet_action(TABLA_EVENTOS, "Add", eventos)
+    except Exception as exc:
+        traceback.print_exc()
+        advertencias.append(
+            "La transición terminó, pero no se pudieron crear los eventos: "
+            f"{exc}"
+        )
+
+    return advertencias
+
+
+@app.route("/rechazar-revision", methods=["POST"])
+def rechazar_revision():
+    id_documento = ""
+
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        id_aprobacion_solicitud = texto(
+            data.get("id_aprobacion_actual")
+        )
+        usuario = texto(data.get("usuario"))
+        comentario = texto(data.get("comentario"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+        if not comentario:
+            return {
+                "error": "El comentario es obligatorio para rechazar una revisión"
+            }, 400
+
+        documento = buscar_documento(id_documento)
+
+        # El ID enviado por AppSheet identifica de forma inequívoca la etapa
+        # que tomó la decisión, incluso si una ejecución anterior quedó parcial.
+        if not id_aprobacion_solicitud:
+            id_aprobacion_solicitud = texto(
+                documento.get("ID_APROBACION_ACTUAL")
+            )
+        if not id_aprobacion_solicitud:
+            raise ValueError("Falta ID_APROBACION_ACTUAL")
+
+        aprobacion_actual = buscar_aprobacion_actual(
+            id_aprobacion_solicitud
+        )
+        numero_version_anterior = entero(
+            aprobacion_actual.get("NUMERO_VERSION"),
+            "NUMERO_VERSION",
+        )
+        estado_aprobacion = texto(aprobacion_actual.get("ESTADO"))
+        resultado_aprobacion = texto(
+            aprobacion_actual.get("RESULTADO")
+        )
+        ya_rechazada = (
+            estado_aprobacion == "Cerrado"
+            and resultado_aprobacion == "Rechazado"
+        )
+
+        version_documento = entero(
+            documento.get("VERSION_ACTUAL"),
+            "VERSION_ACTUAL",
+        )
+
+        # Reintento posterior a una transición ya completada.
+        if ya_rechazada and version_documento > numero_version_anterior:
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "estado": texto(documento.get("ESTADO")),
+                    "numero_version": version_documento,
+                    "numero_revision": entero(
+                        documento.get("REVISION_ACTUAL") or 0,
+                        "REVISION_ACTUAL",
+                    ),
+                    "id_version": texto(
+                        documento.get("ID_VERSION_ACTUAL")
+                    ),
+                    "google_doc_id": texto(
+                        documento.get("GOOGLE_DOC_ID")
+                    ),
+                    "google_doc_url": normalizar_url_appsheet(
+                        documento.get("GOOGLE_DOC_URL")
+                    ),
+                }
+            )
+
+        estado_documento_actual = texto(documento.get("ESTADO"))
+        if estado_documento_actual != "En revisión":
+            raise ValueError(
+                "Solo se puede rechazar un documento en estado En revisión. "
+                f"Estado actual: {estado_documento_actual!r}"
+            )
+
+        id_aprobacion_documento = texto(
+            documento.get("ID_APROBACION_ACTUAL")
+        )
+        if (
+            not ya_rechazada
+            and id_aprobacion_documento != id_aprobacion_solicitud
+        ):
+            raise ValueError(
+                "El aprobador enviado por AppSheet ya no coincide con el "
+                "encargado actual del documento"
+            )
+
+        if not ya_rechazada:
+            if not es_verdadero(aprobacion_actual.get("CADENA_ACTIVA")):
+                raise ValueError(
+                    "La cadena de aprobación actual no está activa"
+                )
+            if estado_aprobacion != "En revisión":
+                raise ValueError(
+                    "El encargado actual no se encuentra En revisión. "
+                    f"Estado encontrado: {estado_aprobacion!r}"
+                )
+
+        email_rechaza = texto(aprobacion_actual.get("APROBADOR"))
+        if usuario and email_rechaza.lower() != usuario.lower():
+            raise PermissionError(
+                "Solo el encargado actual puede rechazar la revisión"
+            )
+        usuario = usuario or email_rechaza
+
+        id_version_rechazada = texto(
+            aprobacion_actual.get("ID_VERSION_TRABAJADA")
+        ) or texto(documento.get("ID_VERSION_ACTUAL"))
+        if not id_version_rechazada:
+            raise ValueError(
+                "No se pudo identificar la versión que fue rechazada"
+            )
+
+        version_rechazada = buscar_version_por_id(
+            id_version_rechazada
+        )
+        if texto(version_rechazada.get("ETAPA")) != "Revisión":
+            raise ValueError(
+                "La versión rechazada no corresponde a una revisión"
+            )
+
+        google_doc_id_rechazado = texto(
+            version_rechazada.get("GOOGLE_DOC_ID")
+        ) or texto(documento.get("GOOGLE_DOC_ID"))
+        if not google_doc_id_rechazado:
+            raise ValueError(
+                "La versión rechazada no tiene GOOGLE_DOC_ID"
+            )
+
+        cadena_anterior = buscar_cadena_documento_version(
+            id_documento=id_documento,
+            numero_version=numero_version_anterior,
+        )
+        if not cadena_anterior:
+            raise ValueError(
+                "No se encontró la cadena asociada a la versión rechazada"
+            )
+
+        ids_cadena = [
+            texto(fila.get("ID_APROBACION_ACTUAL"))
+            for fila in cadena_anterior
+        ]
+        if id_aprobacion_solicitud not in ids_cadena:
+            raise ValueError(
+                "El responsable que rechaza no pertenece a la cadena indicada"
+            )
+
+        indice_rechaza = ids_cadena.index(id_aprobacion_solicitud)
+        if indice_rechaza == 0:
+            raise ValueError(
+                "El primer responsable de la cadena no puede rechazar hacia atrás"
+            )
+
+        indice_destino = indice_rechaza - 1
+        destino_anterior = cadena_anterior[indice_destino]
+        orden_rechaza = entero(
+            aprobacion_actual.get("ORDEN"),
+            "ORDEN",
+        )
+        orden_destino = entero(
+            destino_anterior.get("ORDEN"),
+            "ORDEN",
+        )
+        email_destino = texto(destino_anterior.get("APROBADOR"))
+        rol_destino = texto(destino_anterior.get("ROL_FLUJO"))
+        if not email_destino:
+            raise ValueError(
+                f"El responsable de orden {orden_destino} no tiene correo"
+            )
+
+        numero_version_nueva = numero_version_anterior + 1
+        es_borrador = (
+            indice_destino == 0
+            or rol_destino.lower() == "elaborador"
+        )
+        numero_revision_nueva = 0 if es_borrador else indice_destino
+        etapa_nueva = "Borrador" if es_borrador else "Revisión"
+        estado_documento_nuevo = (
+            "Borrador" if es_borrador else "En revisión"
+        )
+        estado_destino = (
+            "En elaboración" if es_borrador else "En revisión"
+        )
+
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
+        folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
+        if not folder_id:
+            raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
+
+        titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        if es_borrador:
+            nombre_archivo = limpiar_nombre_archivo(
+                f"{titulo}_V{numero_version_nueva:02d}_BORRADOR"
+            )
+        else:
+            nombre_archivo = limpiar_nombre_archivo(
+                f"{titulo}_V{numero_version_nueva:02d}"
+                f"_REV{numero_revision_nueva:02d}"
+            )
+
+        fecha = ahora_iso()
+        drive_service = obtener_drive_service()
+
+        version_existente = buscar_version_numero_revision(
+            id_documento=id_documento,
+            numero_version=numero_version_nueva,
+            numero_revision=numero_revision_nueva,
+        )
+
+        if version_existente:
+            id_version_nueva = texto(
+                version_existente.get("ID_VERSION")
+            )
+            copia = {
+                "id": texto(version_existente.get("GOOGLE_DOC_ID")),
+                "url": normalizar_url_appsheet(
+                    version_existente.get("GOOGLE_DOC_URL")
+                ),
+                "name": (
+                    texto(version_existente.get("NOMBRE_ARCHIVO"))
+                    or nombre_archivo
+                ),
+            }
+            if not copia["id"]:
+                raise RuntimeError(
+                    "La nueva versión existente no tiene GOOGLE_DOC_ID"
+                )
+        else:
+            id_version_nueva = nuevo_id()
+            copia = copiar_archivo_o_reutilizar(
+                drive_service=drive_service,
+                source_file_id=google_doc_id_rechazado,
+                folder_id=folder_id,
+                nombre_archivo=nombre_archivo,
+            )
+
+        # El archivo rechazado queda congelado para todos los participantes.
+        emails_cadena = {
+            texto(fila.get("APROBADOR")).lower()
+            for fila in cadena_anterior
+            if texto(fila.get("APROBADOR"))
+            and "@" in texto(fila.get("APROBADOR"))
+        }
+        for email in emails_cadena:
+            asegurar_permiso_rol(
+                drive_service=drive_service,
+                file_id=google_doc_id_rechazado,
+                email=email,
+                role="reader",
+            )
+
+        # En el nuevo archivo, el responsable anterior edita y quien rechazó
+        # conserva permiso de comentario para responder observaciones.
+        for fila in cadena_anterior[:indice_destino]:
+            email_anterior = texto(fila.get("APROBADOR"))
+            if email_anterior:
+                asegurar_permiso_rol(
+                    drive_service=drive_service,
+                    file_id=copia["id"],
+                    email=email_anterior,
+                    role="reader",
+                )
+
+        permission_id_destino = asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=copia["id"],
+            email=email_destino,
+            role="writer",
+        )
+        asegurar_permiso_rol(
+            drive_service=drive_service,
+            file_id=copia["id"],
+            email=email_rechaza,
+            role="commenter",
+        )
+
+        cadena_nueva_existente = buscar_cadena_documento_version(
+            id_documento=id_documento,
+            numero_version=numero_version_nueva,
+        )
+
+        if cadena_nueva_existente:
+            destinos = [
+                fila
+                for fila in cadena_nueva_existente
+                if entero(fila.get("ORDEN"), "ORDEN") == orden_destino
+            ]
+            if len(destinos) != 1:
+                raise RuntimeError(
+                    "La cadena nueva existente no tiene un único responsable "
+                    f"de orden {orden_destino}"
+                )
+            destino_nuevo = destinos[0]
+            actualizar_destino_cadena_reutilizada(
+                destino=destino_nuevo,
+                id_version_nueva=id_version_nueva,
+                permission_id_destino=permission_id_destino,
+                estado_destino=estado_destino,
+                fecha=fecha,
+            )
+        else:
+            filas_nuevas, destino_nuevo = (
+                construir_cadena_nueva_por_rechazo(
+                    cadena_anterior=cadena_anterior,
+                    id_documento=id_documento,
+                    id_plantilla=id_plantilla,
+                    numero_version_anterior=numero_version_anterior,
+                    numero_version_nueva=numero_version_nueva,
+                    indice_destino=indice_destino,
+                    id_version_nueva=id_version_nueva,
+                    permission_id_destino=permission_id_destino,
+                    fecha=fecha,
+                )
+            )
+            appsheet_action(
+                TABLA_APROBADORES_ACTUAL,
+                "Add",
+                filas_nuevas,
+            )
+
+        if not version_existente:
+            crear_registro_version_por_aprobacion(
+                id_version=id_version_nueva,
+                id_documento=id_documento,
+                id_version_origen=id_version_rechazada,
+                numero_version=numero_version_nueva,
+                numero_revision=numero_revision_nueva,
+                etapa=etapa_nueva,
+                nombre_archivo=copia["name"],
+                google_doc_id=copia["id"],
+                google_doc_url=copia["url"],
+                id_aprobacion_responsable=destino_nuevo[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                orden_responsable=orden_destino,
+                motivo_creacion="Rechazo",
+                comentario=comentario,
+                creado_por=usuario,
+                fecha_creacion=fecha,
+            )
+
+        # Primero se cierra el historial rechazado. Si una operación posterior
+        # falla, el endpoint puede reconstruir la transición usando la cadena
+        # histórica y los recursos ya creados.
+        actualizar_estado_version(
+            id_version=id_version_rechazada,
+            estado_version="Rechazada",
+            fecha_cierre=fecha,
+        )
+        cerrar_cadena_anterior_por_rechazo(
+            cadena_anterior=cadena_anterior,
+            id_aprobacion_rechaza=id_aprobacion_solicitud,
+            comentario=comentario,
+            fecha=fecha,
+        )
+
+        actualizar_documento_rechazo_revision(
+            id_documento=id_documento,
+            numero_version=numero_version_nueva,
+            numero_revision=numero_revision_nueva,
+            id_version=id_version_nueva,
+            copia=copia,
+            destino=destino_nuevo,
+            estado_documento=estado_documento_nuevo,
+            usuario=usuario,
+            fecha=fecha,
+        )
+
+        advertencias = crear_eventos_rechazo_revision(
+            id_documento=id_documento,
+            id_version_rechazada=id_version_rechazada,
+            id_version_nueva=id_version_nueva,
+            id_aprobacion_rechaza=id_aprobacion_solicitud,
+            id_aprobacion_destino=destino_nuevo[
+                "ID_APROBACION_ACTUAL"
+            ],
+            usuario=usuario,
+            fecha=fecha,
+            comentario=comentario,
+            orden_rechaza=orden_rechaza,
+            orden_destino=orden_destino,
+            numero_version_nueva=numero_version_nueva,
+            nombre_archivo=copia["name"],
+            estado_nuevo=estado_documento_nuevo,
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "estado": estado_documento_nuevo,
+                "numero_version": numero_version_nueva,
+                "numero_revision": numero_revision_nueva,
+                "id_version": id_version_nueva,
+                "google_doc_id": copia["id"],
+                "google_doc_url": copia["url"],
+                "nombre_archivo": copia["name"],
+                "orden_actual": orden_destino,
+                "id_aprobacion_actual": destino_nuevo[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "encargado_actual": destino_nuevo.get("NOMBRE", ""),
+                "encargado_email": email_destino,
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 403
+
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 400
+
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            registrar_error_transicion(id_documento, str(exc))
+        return {"error": str(exc)}, 500
+
+
+# -----------------------------------------------------------------------------
 # Flujo: enviar a firma por correo
 # -----------------------------------------------------------------------------
 
