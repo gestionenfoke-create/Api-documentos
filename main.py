@@ -3466,8 +3466,6 @@ def enviar_firma():
             return {"error": "Falta id_documento"}, 400
 
         documento = buscar_documento(id_documento)
-        if not comentario:
-            comentario = texto(documento.get("OBSERVACION_ACTUAL"))
 
         estado = texto(documento.get("ESTADO"))
         estado_firma = texto(documento.get("ESTADO_FIRMA"))
