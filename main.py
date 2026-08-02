@@ -3373,6 +3373,20 @@ ESTADOS_NOTIFICACION_REINTENTABLES = {
     "Error",
 }
 
+# Eventos que aportan información relevante en los emails.
+# Los demás eventos continúan guardados en Documento_Eventos,
+# pero no se muestran en el correo.
+EVENTOS_HISTORIAL_EMAIL = {
+    "Enviado a revisión",
+    "Revisión aprobada",
+    "Revisión rechazada",
+    "Proceso reiniciado",
+    "Enviado a firma",
+    "Proceso terminado",
+}
+
+# Cantidad máxima de eventos anteriores mostrados en cada correo.
+MAX_EVENTOS_HISTORIAL_EMAIL = 8
 
 def construir_link_appsheet(id_documento: str) -> str:
     """
@@ -3541,81 +3555,184 @@ def parsear_fecha_appsheet(valor: Any) -> datetime:
 
     return datetime.min
 
+def formatear_fecha_historial(valor: Any) -> str:
+    """
+    Convierte la fecha recibida desde AppSheet al formato chileno
+    utilizado en los emails.
+    """
+    fecha = parsear_fecha_appsheet(valor)
+
+    if fecha == datetime.min:
+        return texto(valor)
+
+    return fecha.strftime("%d/%m/%Y %H:%M")
 
 def construir_historial_comentarios(
     id_documento: str,
+    id_evento_excluir: str = "",
 ) -> tuple[str, str]:
     """
-    Construye el historial usando Documento_Eventos como fuente formal.
-    Solo incluye eventos que contienen comentario.
+    Construye una versión resumida del historial para los emails.
+
+    Reglas:
+    - Solo muestra eventos relevantes.
+    - Solo muestra eventos con comentario.
+    - Excluye el evento actual, porque ya aparece destacado arriba.
+    - Limita el historial a los últimos eventos configurados.
+    - Mantiene todos los eventos originales en Documento_Eventos.
     """
     eventos = buscar_eventos_documento(id_documento)
-    eventos.sort(
+
+    eventos_relevantes: list[dict[str, Any]] = []
+
+    for evento in eventos:
+        id_evento = texto(evento.get("ID_EVENTO"))
+        tipo_evento = texto(evento.get("TIPO_EVENTO"))
+        comentario = texto(evento.get("COMENTARIO"))
+
+        # El evento actual ya se muestra como "Último movimiento".
+        if id_evento_excluir and id_evento == id_evento_excluir:
+            continue
+
+        # Omite eventos técnicos o administrativos.
+        if tipo_evento not in EVENTOS_HISTORIAL_EMAIL:
+            continue
+
+        # No incorpora eventos sin comentario.
+        if not comentario:
+            continue
+
+        eventos_relevantes.append(evento)
+
+    eventos_relevantes.sort(
         key=lambda fila: parsear_fecha_appsheet(
             fila.get("FECHA_EVENTO")
         )
     )
 
+    total_eventos_relevantes = len(eventos_relevantes)
+
+    # Conserva solo los últimos eventos relevantes.
+    eventos_mostrados = eventos_relevantes[
+        -MAX_EVENTOS_HISTORIAL_EMAIL:
+    ]
+
+    cantidad_omitidos = (
+        total_eventos_relevantes - len(eventos_mostrados)
+    )
+
     lineas_texto: list[str] = []
     bloques_html: list[str] = []
 
-    for evento in eventos:
-        comentario = texto(evento.get("COMENTARIO"))
-        if not comentario:
-            continue
+    if cantidad_omitidos > 0:
+        lineas_texto.append(
+            f"Se muestran los últimos "
+            f"{len(eventos_mostrados)} de "
+            f"{total_eventos_relevantes} eventos relevantes. "
+            f"El historial completo está disponible en AppSheet."
+        )
 
-        fecha = texto(evento.get("FECHA_EVENTO"))
-        usuario = texto(evento.get("USUARIO")) or "Sistema"
+        bloques_html.append(
+            f"""
+            <div style="
+                margin:0 0 14px 0;
+                padding:10px 12px;
+                border-radius:6px;
+                background:#f3f4f6;
+                color:#4b5563;
+                font-size:13px;
+            ">
+                Se muestran los últimos
+                <strong>{len(eventos_mostrados)}</strong>
+                de
+                <strong>{total_eventos_relevantes}</strong>
+                eventos relevantes.
+                El historial completo está disponible en AppSheet.
+            </div>
+            """
+        )
+
+    for evento in eventos_mostrados:
+        fecha = formatear_fecha_historial(
+            evento.get("FECHA_EVENTO")
+        )
+        usuario = (
+            texto(evento.get("USUARIO"))
+            or "Sistema"
+        )
         tipo_evento = (
             texto(evento.get("TIPO_EVENTO"))
             or "Actualización"
         )
+        comentario = texto(evento.get("COMENTARIO"))
         estado_nuevo = texto(evento.get("ESTADO_NUEVO"))
 
-        encabezado_estado = tipo_evento
+        movimiento = tipo_evento
         if estado_nuevo:
-            encabezado_estado += f" — {estado_nuevo}"
+            movimiento += f" — {estado_nuevo}"
 
+        # Versión compacta en texto plano.
         lineas_texto.append(
-            f"{fecha}\n"
+            f"{fecha} — {movimiento}\n"
             f"{usuario}\n"
-            f"{encabezado_estado}\n"
             f"{comentario}"
         )
 
+        # Versión compacta en HTML.
         bloques_html.append(
             """
             <div style="
-                margin:0 0 16px 0;
-                padding:10px 12px;
+                margin:0 0 10px 0;
+                padding:9px 11px;
                 border-left:3px solid #6b7280;
                 background:#f9fafb;
             ">
-                <div style="font-weight:700;">{fecha}</div>
-                <div>{usuario}</div>
-                <div style="margin-top:3px;">
-                    <strong>{movimiento}</strong>
+                <div style="
+                    font-size:13px;
+                    font-weight:700;
+                    color:#111827;
+                ">
+                    {fecha} — {movimiento}
                 </div>
-                <div style="margin-top:7px; white-space:pre-wrap;">
+
+                <div style="
+                    margin-top:2px;
+                    font-size:12px;
+                    color:#6b7280;
+                ">
+                    {usuario}
+                </div>
+
+                <div style="
+                    margin-top:5px;
+                    font-size:14px;
+                    white-space:pre-wrap;
+                ">
                     {comentario}
                 </div>
             </div>
             """.format(
                 fecha=html.escape(fecha),
+                movimiento=html.escape(movimiento),
                 usuario=html.escape(usuario),
-                movimiento=html.escape(encabezado_estado),
                 comentario=html.escape(comentario),
             )
         )
 
-    if not lineas_texto:
+    if not eventos_mostrados:
         return (
-            "Todavía no existen comentarios registrados.",
-            "<p>Todavía no existen comentarios registrados.</p>",
+            "No existen comentarios anteriores relevantes.",
+            (
+                "<p style='color:#6b7280;'>"
+                "No existen comentarios anteriores relevantes."
+                "</p>"
+            ),
         )
 
-    return "\n\n".join(lineas_texto), "".join(bloques_html)
-
+    return (
+        "\n\n".join(lineas_texto),
+        "".join(bloques_html),
+    )
 
 def construir_email_notificacion(
     *,
@@ -4080,7 +4197,10 @@ def procesar_notificacion_individual(
     try:
         link_appsheet = construir_link_appsheet(id_documento)
         historial_texto, historial_html = (
-            construir_historial_comentarios(id_documento)
+          construir_historial_comentarios(
+            id_documento=id_documento,
+            id_evento_excluir=id_evento,
+            )
         )
 
         asunto, cuerpo_texto, cuerpo_html = (
@@ -4390,7 +4510,12 @@ def diagnostico_notificacion():
 
         link_appsheet = construir_link_appsheet(id_documento)
         historial_texto, historial_html = (
-            construir_historial_comentarios(id_documento)
+            construir_historial_comentarios(
+                id_documento=id_documento,
+                id_evento_excluir=texto(
+                    evento.get("ID_EVENTO")
+                ),
+            )
         )
 
         movimiento = (
