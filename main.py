@@ -1134,29 +1134,36 @@ def crear_evento_envio_revision(
     fecha: str,
     comentario: str,
     nombre_archivo: str,
-) -> None:
+) -> dict[str, Any]:
+    """
+    Registra el evento que identifica de forma inequívoca el envío a revisión.
+
+    La fila se devuelve para que las notificaciones utilicen exactamente el
+    mismo ID_EVENTO como clave de idempotencia.
+    """
     detalle = f"Se creó {nombre_archivo} y se entregó al siguiente responsable."
     if comentario:
         detalle += f" Comentario: {comentario}"
 
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": id_aprobacion_actual,
+        "TIPO_EVENTO": "Enviado a revisión",
+        "ESTADO_ANTERIOR": "Borrador",
+        "ESTADO_NUEVO": "En revisión",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": detalle,
+    }
+
     appsheet_action(
         TABLA_EVENTOS,
         "Add",
-        [
-            {
-                "ID_EVENTO": nuevo_id(),
-                "ID_DOCUMENTO": id_documento,
-                "ID_VERSION": id_version,
-                "ID_APROBACION_ACTUAL": id_aprobacion_actual,
-                "TIPO_EVENTO": "Enviado a revisión",
-                "ESTADO_ANTERIOR": "Borrador",
-                "ESTADO_NUEVO": "En revisión",
-                "USUARIO": usuario,
-                "FECHA_EVENTO": fecha,
-                "COMENTARIO": detalle,
-            }
-        ],
+        [evento],
     )
+    return evento
 
 
 @app.route("/crear-documento", methods=["POST"])
@@ -1367,8 +1374,29 @@ def enviar_revision():
         documento = buscar_documento(id_documento)
         estado_documento = texto(documento.get("ESTADO"))
 
-        # Respuesta idempotente ante reintentos del Bot.
+        # Respuesta idempotente ante reintentos del Bot. Además, intenta
+        # completar notificaciones pendientes o con error sin repetir las ya
+        # enviadas, gracias a CLAVE_IDEMPOTENCIA.
         if estado_documento == "En revisión":
+            notificaciones_reintento: list[dict[str, Any]] = []
+            advertencias_reintento: list[str] = []
+
+            try:
+                (
+                    notificaciones_reintento,
+                    advertencias_reintento,
+                ) = reanudar_notificaciones_envio_revision(
+                    documento=documento,
+                    datos_solicitud=data,
+                )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias_reintento.append(
+                    "El documento ya estaba en revisión, pero no fue posible "
+                    "reanudar sus notificaciones: "
+                    f"{exc_notificacion}"
+                )
+
             return jsonify(
                 {
                     "ok": True,
@@ -1379,6 +1407,8 @@ def enviar_revision():
                     "google_doc_url": texto(documento.get("GOOGLE_DOC_URL")),
                     "estado": estado_documento,
                     "mensaje": "El documento ya fue enviado a revisión.",
+                    "notificaciones": notificaciones_reintento,
+                    "advertencias": advertencias_reintento,
                 }
             )
 
@@ -1587,8 +1617,11 @@ def enviar_revision():
         )
 
         advertencias: list[str] = []
+        notificaciones: list[dict[str, Any]] = []
+        evento_revision: dict[str, Any] | None = None
+
         try:
-            crear_evento_envio_revision(
+            evento_revision = crear_evento_envio_revision(
                 id_documento=id_documento,
                 id_version=id_version_nueva,
                 id_aprobacion_actual=siguiente[
@@ -1605,6 +1638,39 @@ def enviar_revision():
                 "La transición terminó, pero no se pudo crear el evento: "
                 f"{exc_evento}"
             )
+
+        # La transición documental ya terminó. Desde este punto, cualquier
+        # error de notificación se registra como advertencia y nunca revierte
+        # el cambio de estado ni los permisos de Drive.
+        if evento_revision is not None:
+            try:
+                documento_actualizado = buscar_documento(id_documento)
+                notificaciones = ejecutar_notificaciones_envio_revision(
+                    documento=documento_actualizado,
+                    evento=evento_revision,
+                    cadena=cadena_actual,
+                    aprobador_anterior=aprobacion_actual,
+                    aprobador_actual=siguiente,
+                )
+
+                fallidas = [
+                    resultado
+                    for resultado in notificaciones
+                    if not resultado.get("ok")
+                ]
+                if fallidas:
+                    advertencias.append(
+                        "La transición terminó, pero "
+                        f"{len(fallidas)} notificación(es) quedaron "
+                        "omitidas o con error. Revisa "
+                        "Documento_Notificaciones."
+                    )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias.append(
+                    "La transición terminó, pero no se pudieron procesar "
+                    f"las notificaciones internas: {exc_notificacion}"
+                )
 
         return jsonify(
             {
@@ -1624,12 +1690,13 @@ def enviar_revision():
                 ],
                 "encargado_actual": siguiente.get("NOMBRE", ""),
                 "encargado_email": siguiente_email,
+                "notificaciones": notificaciones,
                 "advertencias": advertencias,
             }
         )
 
     except PermissionError as exc:
-        if id_documento and not documento_cerrado:
+        if id_documento:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 403
 
@@ -3358,7 +3425,7 @@ def enviar_email_con_pdf(
 
 
 # -----------------------------------------------------------------------------
-# Notificaciones internas por email - Fase 2
+# Notificaciones internas por email - Fases 2 y 3
 # -----------------------------------------------------------------------------
 
 TIPOS_NOTIFICACION_VALIDOS = {
@@ -3556,7 +3623,7 @@ def deduplicar_cadena_por_email(
         email = obtener_email_notificacion(fila)
         if not email:
             app.logger.warning(
-                "Se omitió un responsable sin Aprovador_v: %s",
+                "Se omitió un responsable sin Aprobador_v: %s",
                 fila.get("ID_APROBACION_ACTUAL"),
             )
             continue
@@ -3653,7 +3720,7 @@ def construir_historial_comentarios(
     eventos = buscar_eventos_documento(id_documento)
 
     mapa_nombres = construir_mapa_nombres_usuarios(
-    id_documento=id_documento,
+        id_documento=id_documento,
     )
 
     eventos_relevantes: list[dict[str, Any]] = []
@@ -4432,7 +4499,24 @@ def notificar_destinatarios_internos(
             continue
 
         email = obtener_email_notificacion(aprobador)
-        if not email or email in correos_procesados:
+        if not email:
+            resultados.append(
+                {
+                    "ok": False,
+                    "omitida": True,
+                    "destinatario": "",
+                    "tipo_notificacion": texto(
+                        especificacion.get("tipo_notificacion")
+                    ),
+                    "mensaje": (
+                        "El responsable no tiene Aprobador_v para enviar "
+                        "la notificación."
+                    ),
+                }
+            )
+            continue
+
+        if email in correos_procesados:
             continue
 
         correos_procesados.add(email)
@@ -4457,6 +4541,247 @@ def notificar_destinatarios_internos(
         )
 
     return resultados
+
+
+def buscar_evento_envio_revision_actual(
+    *,
+    id_documento: str,
+    id_version: str,
+    id_aprobacion_actual: str,
+) -> dict[str, Any] | None:
+    """
+    Recupera el evento exacto que originó la revisión vigente.
+
+    Se usa en reintentos del Bot para completar únicamente las
+    notificaciones pendientes o con error.
+    """
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Enviado a revisión"
+        and texto(evento.get("ID_VERSION")) == id_version
+        and texto(evento.get("ID_APROBACION_ACTUAL"))
+        == id_aprobacion_actual
+    ]
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def construir_especificaciones_envio_revision(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_anterior: dict[str, Any],
+    aprobador_actual: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Define la prioridad de destinatarios para un envío a revisión.
+
+    El orden es deliberado: Acción requerida, Confirmación e Informativa.
+    Si dos filas comparten Aprobador_v, la notificación de mayor prioridad
+    gana porque notificar_destinatarios_internos deduplica en ese orden.
+    """
+    comentario_evento = (
+        texto(evento.get("COMENTARIO"))
+        or "El documento fue enviado a revisión."
+    )
+    link_documento = normalizar_url_appsheet(
+        documento.get("GOOGLE_DOC_URL")
+    )
+
+    especificaciones: list[dict[str, Any]] = [
+        {
+            "aprobador": aprobador_actual,
+            "tipo_notificacion": "Acción requerida",
+            "movimiento": "Documento asignado para revisión",
+            "comentario_principal": comentario_evento,
+            "link_documento": link_documento,
+        },
+        {
+            "aprobador": aprobador_anterior,
+            "tipo_notificacion": "Confirmación",
+            "movimiento": "Documento enviado a revisión",
+            "comentario_principal": comentario_evento,
+            "link_documento": "",
+        },
+    ]
+
+    for integrante in cadena:
+        especificaciones.append(
+            {
+                "aprobador": integrante,
+                "tipo_notificacion": "Informativa",
+                "movimiento": "El documento avanzó a revisión",
+                "comentario_principal": comentario_evento,
+                "link_documento": "",
+            }
+        )
+
+    return especificaciones
+
+
+def ejecutar_notificaciones_envio_revision(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_anterior: dict[str, Any],
+    aprobador_actual: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Envía y registra las notificaciones internas del primer avance."""
+    especificaciones = construir_especificaciones_envio_revision(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_anterior=aprobador_anterior,
+        aprobador_actual=aprobador_actual,
+    )
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=especificaciones,
+    )
+
+
+def reanudar_notificaciones_envio_revision(
+    *,
+    documento: dict[str, Any],
+    datos_solicitud: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Completa notificaciones de un envío a revisión ya ejecutado.
+
+    No repite correos enviados. Si el evento faltó por una falla parcial, lo
+    reconstruye desde la versión vigente y continúa de forma idempotente.
+    """
+    advertencias: list[str] = []
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_version = texto(documento.get("ID_VERSION_ACTUAL"))
+    id_aprobacion_actual = texto(
+        documento.get("ID_APROBACION_ACTUAL")
+    )
+    numero_version = entero(
+        documento.get("VERSION_ACTUAL"),
+        "VERSION_ACTUAL",
+    )
+
+    if not id_version or not id_aprobacion_actual:
+        advertencias.append(
+            "No fue posible identificar la versión o el encargado actual "
+            "para reanudar las notificaciones."
+        )
+        return [], advertencias
+
+    version = buscar_version_por_id(id_version)
+    if texto(version.get("MOTIVO_CREACION")) != "Envío a revisión":
+        advertencias.append(
+            "El documento está En revisión, pero la versión vigente no "
+            "corresponde al envío inicial a revisión. No se ejecutaron "
+            "notificaciones desde /enviar-revision."
+        )
+        return [], advertencias
+
+    aprobador_actual = buscar_aprobacion_actual(
+        id_aprobacion_actual
+    )
+    cadena = buscar_cadena_actual_documento(
+        id_documento=id_documento,
+        numero_version=numero_version,
+    )
+    orden_actual = entero(
+        aprobador_actual.get("ORDEN"),
+        "ORDEN",
+    )
+
+    anteriores = [
+        fila
+        for fila in cadena
+        if entero(fila.get("ORDEN"), "ORDEN") < orden_actual
+    ]
+    enviados = [
+        fila
+        for fila in anteriores
+        if texto(fila.get("RESULTADO")) == "Enviado"
+    ]
+    candidatos_anterior = enviados or anteriores
+    if not candidatos_anterior:
+        advertencias.append(
+            "No se encontró al responsable anterior para reconstruir las "
+            "notificaciones del envío a revisión."
+        )
+        return [], advertencias
+
+    aprobador_anterior = max(
+        candidatos_anterior,
+        key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"),
+    )
+
+    evento = buscar_evento_envio_revision_actual(
+        id_documento=id_documento,
+        id_version=id_version,
+        id_aprobacion_actual=id_aprobacion_actual,
+    )
+
+    if evento is None:
+        evento = crear_evento_envio_revision(
+            id_documento=id_documento,
+            id_version=id_version,
+            id_aprobacion_actual=id_aprobacion_actual,
+            usuario=(
+                texto(documento.get("ULTIMO_ENVIADO_POR"))
+                or texto(datos_solicitud.get("usuario"))
+                or texto(aprobador_anterior.get("APROBADOR"))
+            ),
+            fecha=(
+                texto(documento.get("FECHA_ULTIMO_ENVIO"))
+                or texto(version.get("FECHA_CREACION"))
+                or ahora_iso()
+            ),
+            comentario=(
+                texto(version.get("COMENTARIO_CAMBIO"))
+                or texto(datos_solicitud.get("comentario"))
+            ),
+            nombre_archivo=(
+                texto(version.get("NOMBRE_ARCHIVO"))
+                or texto(documento.get("TITULO"))
+                or id_documento
+            ),
+        )
+        advertencias.append(
+            "El evento de envío a revisión faltaba y fue reconstruido "
+            "antes de reanudar las notificaciones."
+        )
+
+    resultados = ejecutar_notificaciones_envio_revision(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_anterior=aprobador_anterior,
+        aprobador_actual=aprobador_actual,
+    )
+
+    fallidas = [
+        resultado
+        for resultado in resultados
+        if not resultado.get("ok")
+    ]
+    if fallidas:
+        advertencias.append(
+            f"{len(fallidas)} notificación(es) siguen omitidas o con "
+            "error. Revisa Documento_Notificaciones."
+        )
+
+    return resultados, advertencias
 
 
 def construir_evento_diagnostico(
