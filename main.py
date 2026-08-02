@@ -3464,6 +3464,75 @@ def obtener_cadena_notificacion(
         ),
     )
 
+def construir_mapa_nombres_usuarios(
+    id_documento: str,
+) -> dict[str, str]:
+    """
+    Construye un mapa para transformar los correos guardados en
+    Documento_Eventos[USUARIO] en nombres de personas.
+
+    Revisa tanto:
+    - APROBADOR: correo operativo utilizado por el flujo y Drive.
+    - Aprobador_v: correo utilizado para las notificaciones.
+    """
+    cadena = obtener_cadena_notificacion(
+        id_documento=id_documento,
+    )
+
+    mapa: dict[str, str] = {}
+
+    for fila in cadena:
+        nombre = texto(fila.get("NOMBRE")).strip()
+
+        if not nombre:
+            continue
+
+        for columna_email in ("APROBADOR", "Aprobador_v"):
+            email = texto(
+                fila.get(columna_email)
+            ).strip().lower()
+
+            if email:
+                mapa[email] = nombre
+
+    # Cuando el correo emisor ejecuta una acción y no pertenece a la cadena,
+    # se muestra el nombre de la aplicación en vez del email.
+    if GMAIL_SENDER_EMAIL:
+        mapa.setdefault(
+            GMAIL_SENDER_EMAIL.strip().lower(),
+            NOMBRE_APLICACION,
+        )
+
+    return mapa
+
+def obtener_nombre_usuario_evento(
+    usuario_evento: Any,
+    mapa_nombres: dict[str, str],
+) -> str:
+    """
+    Devuelve el nombre asociado al usuario que ejecutó el evento.
+
+    Si USUARIO ya contiene un nombre, lo conserva.
+    Si contiene un email, busca su nombre en la cadena.
+    """
+    usuario = texto(usuario_evento).strip()
+
+    if not usuario:
+        return "Sistema"
+
+    usuario_normalizado = usuario.lower()
+
+    nombre = mapa_nombres.get(usuario_normalizado)
+    if nombre:
+        return nombre
+
+    # Si el valor no es un email, probablemente ya corresponde a un nombre.
+    if "@" not in usuario:
+        return usuario
+
+    # No mostramos el correo en el email cuando no se encuentra el nombre.
+    return "Usuario no identificado"
+
 def obtener_email_notificacion(
     aprobador: dict[str, Any],
 ) -> str:
@@ -3583,6 +3652,10 @@ def construir_historial_comentarios(
     """
     eventos = buscar_eventos_documento(id_documento)
 
+    mapa_nombres = construir_mapa_nombres_usuarios(
+    id_documento=id_documento,
+    )
+
     eventos_relevantes: list[dict[str, Any]] = []
 
     for evento in eventos:
@@ -3656,9 +3729,9 @@ def construir_historial_comentarios(
         fecha = formatear_fecha_historial(
             evento.get("FECHA_EVENTO")
         )
-        usuario = (
-            texto(evento.get("USUARIO"))
-            or "Sistema"
+        usuario = obtener_nombre_usuario_evento(
+            usuario_evento=evento.get("USUARIO"),
+            mapa_nombres=mapa_nombres,
         )
         tipo_evento = (
             texto(evento.get("TIPO_EVENTO"))
