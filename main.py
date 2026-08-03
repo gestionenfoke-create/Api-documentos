@@ -3913,7 +3913,7 @@ def construir_email_notificacion(
         "Cierre": "Proceso documental",
     }[tipo_notificacion]
 
-    asunto = f"[{prefijo}] {titulo} — {id_documento}"
+    asunto = f"[{prefijo}] {titulo}"
 
     comentario_texto = (
         comentario_principal
