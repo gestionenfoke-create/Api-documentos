@@ -1999,7 +1999,7 @@ def crear_evento_revision_aprobada(
     comentario: str,
     orden_actual: int,
     orden_siguiente: int | None,
-) -> None:
+) -> dict[str, Any]:
     if orden_siguiente is None:
         estado_nuevo = "Listo para firma"
         detalle = (
@@ -2015,24 +2015,21 @@ def crear_evento_revision_aprobada(
     if comentario:
         detalle += f" Comentario: {comentario}"
 
-    appsheet_action(
-        TABLA_EVENTOS,
-        "Add",
-        [
-            {
-                "ID_EVENTO": nuevo_id(),
-                "ID_DOCUMENTO": id_documento,
-                "ID_VERSION": id_version,
-                "ID_APROBACION_ACTUAL": id_aprobacion_actual,
-                "TIPO_EVENTO": "Revisión aprobada",
-                "ESTADO_ANTERIOR": f"En revisión - Orden {orden_actual}",
-                "ESTADO_NUEVO": estado_nuevo,
-                "USUARIO": usuario,
-                "FECHA_EVENTO": fecha,
-                "COMENTARIO": detalle,
-            }
-        ],
-    )
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": id_aprobacion_actual,
+        "TIPO_EVENTO": "Revisión aprobada",
+        "ESTADO_ANTERIOR": f"En revisión - Orden {orden_actual}",
+        "ESTADO_NUEVO": estado_nuevo,
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": detalle,
+    }
+
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
 
 
 def crear_evento_preparado_firma(
@@ -2090,6 +2087,25 @@ def aprobar_revision():
         estado_documento = texto(documento.get("ESTADO"))
 
         if estado_documento == "Listo para firma":
+            notificaciones_reintento: list[dict[str, Any]] = []
+            advertencias_reintento: list[str] = []
+            try:
+                (
+                    notificaciones_reintento,
+                    advertencias_reintento,
+                ) = reanudar_notificaciones_aprobacion_revision(
+                    documento=documento,
+                    id_aprobacion_aprueba=id_aprobacion_solicitud,
+                    datos_solicitud=data,
+                )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias_reintento.append(
+                    "El documento ya estaba Listo para firma, pero no se "
+                    "pudieron reanudar sus notificaciones: "
+                    f"{exc_notificacion}"
+                )
+
             return jsonify(
                 {
                     "ok": True,
@@ -2111,6 +2127,8 @@ def aprobar_revision():
                     "pdf_url": texto(
                         documento.get("PDF_PARA_FIRMA_URL")
                     ),
+                    "notificaciones": notificaciones_reintento,
+                    "advertencias": advertencias_reintento,
                 }
             )
 
@@ -2125,6 +2143,27 @@ def aprobar_revision():
                 and texto(aprobacion_solicitada.get("RESULTADO"))
                 == "Aprobado"
             ):
+                notificaciones_reintento: list[dict[str, Any]] = []
+                advertencias_reintento: list[str] = []
+                try:
+                    (
+                        notificaciones_reintento,
+                        advertencias_reintento,
+                    ) = reanudar_notificaciones_aprobacion_revision(
+                        documento=documento,
+                        id_aprobacion_aprueba=(
+                            id_aprobacion_solicitud
+                        ),
+                        datos_solicitud=data,
+                    )
+                except Exception as exc_notificacion:
+                    traceback.print_exc()
+                    advertencias_reintento.append(
+                        "La aprobación ya estaba procesada, pero no se "
+                        "pudieron reanudar sus notificaciones: "
+                        f"{exc_notificacion}"
+                    )
+
                 return jsonify(
                     {
                         "ok": True,
@@ -2140,6 +2179,8 @@ def aprobar_revision():
                         "google_doc_url": texto(
                             documento.get("GOOGLE_DOC_URL")
                         ),
+                        "notificaciones": notificaciones_reintento,
+                        "advertencias": advertencias_reintento,
                     }
                 )
 
@@ -2345,18 +2386,61 @@ def aprobar_revision():
                 fecha=fecha,
             )
 
-            crear_evento_revision_aprobada(
-                id_documento=id_documento,
-                id_version=id_version_nueva,
-                id_aprobacion_actual=siguiente[
-                    "ID_APROBACION_ACTUAL"
-                ],
-                usuario=usuario,
-                fecha=fecha,
-                comentario=comentario,
-                orden_actual=orden_actual,
-                orden_siguiente=siguiente_orden,
-            )
+            advertencias: list[str] = []
+            notificaciones: list[dict[str, Any]] = []
+            evento_aprobacion: dict[str, Any] | None = None
+
+            try:
+                evento_aprobacion = crear_evento_revision_aprobada(
+                    id_documento=id_documento,
+                    id_version=id_version_nueva,
+                    id_aprobacion_actual=siguiente[
+                        "ID_APROBACION_ACTUAL"
+                    ],
+                    usuario=usuario,
+                    fecha=fecha,
+                    comentario=comentario,
+                    orden_actual=orden_actual,
+                    orden_siguiente=siguiente_orden,
+                )
+            except Exception as exc_evento:
+                traceback.print_exc()
+                advertencias.append(
+                    "La aprobación terminó, pero no se pudo crear el "
+                    f"evento: {exc_evento}"
+                )
+
+            if evento_aprobacion is not None:
+                try:
+                    documento_actualizado = buscar_documento(id_documento)
+                    notificaciones = (
+                        ejecutar_notificaciones_aprobacion_revision(
+                            documento=documento_actualizado,
+                            evento=evento_aprobacion,
+                            cadena=cadena_actual,
+                            aprobador_aprueba=aprobacion_actual,
+                            aprobador_actual=siguiente,
+                            ultimo_aprobador=False,
+                        )
+                    )
+                    fallidas = [
+                        resultado
+                        for resultado in notificaciones
+                        if not resultado.get("ok")
+                    ]
+                    if fallidas:
+                        advertencias.append(
+                            "La aprobación terminó, pero "
+                            f"{len(fallidas)} notificación(es) quedaron "
+                            "omitidas o con error. Revisa "
+                            "Documento_Notificaciones."
+                        )
+                except Exception as exc_notificacion:
+                    traceback.print_exc()
+                    advertencias.append(
+                        "La aprobación terminó, pero falló el proceso de "
+                        f"notificaciones: {exc_notificacion}"
+                    )
 
             return jsonify(
                 {
@@ -2377,6 +2461,8 @@ def aprobar_revision():
                     ],
                     "encargado_actual": siguiente.get("NOMBRE", ""),
                     "encargado_email": siguiente_email,
+                    "notificaciones": notificaciones,
+                    "advertencias": advertencias,
                 }
             )
 
@@ -2491,25 +2577,77 @@ def aprobar_revision():
             fecha=fecha,
         )
 
-        crear_evento_revision_aprobada(
-            id_documento=id_documento,
-            id_version=id_version_nueva,
-            id_aprobacion_actual=id_aprobacion_actual,
-            usuario=usuario,
-            fecha=fecha,
-            comentario=comentario,
-            orden_actual=orden_actual,
-            orden_siguiente=None,
-        )
-        crear_evento_preparado_firma(
-            id_documento=id_documento,
-            id_version=id_version_nueva,
-            id_aprobacion_actual=id_aprobacion_actual,
-            usuario=usuario,
-            fecha=fecha,
-            nombre_archivo=copia["name"],
-            nombre_pdf=pdf["name"],
-        )
+        advertencias: list[str] = []
+        notificaciones: list[dict[str, Any]] = []
+        evento_aprobacion: dict[str, Any] | None = None
+
+        try:
+            evento_aprobacion = crear_evento_revision_aprobada(
+                id_documento=id_documento,
+                id_version=id_version_nueva,
+                id_aprobacion_actual=id_aprobacion_actual,
+                usuario=usuario,
+                fecha=fecha,
+                comentario=comentario,
+                orden_actual=orden_actual,
+                orden_siguiente=None,
+            )
+        except Exception as exc_evento:
+            traceback.print_exc()
+            advertencias.append(
+                "La aprobación final terminó, pero no se pudo crear el "
+                f"evento: {exc_evento}"
+            )
+
+        try:
+            crear_evento_preparado_firma(
+                id_documento=id_documento,
+                id_version=id_version_nueva,
+                id_aprobacion_actual=id_aprobacion_actual,
+                usuario=usuario,
+                fecha=fecha,
+                nombre_archivo=copia["name"],
+                nombre_pdf=pdf["name"],
+            )
+        except Exception as exc_evento_firma:
+            traceback.print_exc()
+            advertencias.append(
+                "El documento quedó Listo para firma, pero no se pudo crear "
+                "el evento técnico Preparado para firma: "
+                f"{exc_evento_firma}"
+            )
+
+        if evento_aprobacion is not None:
+            try:
+                documento_actualizado = buscar_documento(id_documento)
+                notificaciones = (
+                    ejecutar_notificaciones_aprobacion_revision(
+                        documento=documento_actualizado,
+                        evento=evento_aprobacion,
+                        cadena=cadena_actual,
+                        aprobador_aprueba=aprobacion_actual,
+                        aprobador_actual=None,
+                        ultimo_aprobador=True,
+                    )
+                )
+                fallidas = [
+                    resultado
+                    for resultado in notificaciones
+                    if not resultado.get("ok")
+                ]
+                if fallidas:
+                    advertencias.append(
+                        "La aprobación final terminó, pero "
+                        f"{len(fallidas)} notificación(es) quedaron "
+                        "omitidas o con error. Revisa "
+                        "Documento_Notificaciones."
+                    )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias.append(
+                    "La aprobación final terminó, pero falló el proceso de "
+                    f"notificaciones: {exc_notificacion}"
+                )
 
         return jsonify(
             {
@@ -2527,6 +2665,8 @@ def aprobar_revision():
                 "pdf_id": pdf["id"],
                 "pdf_url": pdf["url"],
                 "pdf_nombre": pdf["name"],
+                "notificaciones": notificaciones,
+                "advertencias": advertencias,
             }
         )
 
@@ -4783,6 +4923,284 @@ def reanudar_notificaciones_envio_revision(
 
     return resultados, advertencias
 
+
+
+def buscar_evento_revision_aprobada_actual(
+    *,
+    id_documento: str,
+    id_version: str,
+    id_aprobacion_evento: str,
+) -> dict[str, Any] | None:
+    """Recupera el evento exacto de la aprobación ya procesada."""
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Revisión aprobada"
+        and texto(evento.get("ID_VERSION")) == id_version
+        and texto(evento.get("ID_APROBACION_ACTUAL"))
+        == id_aprobacion_evento
+    ]
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def construir_especificaciones_aprobacion_revision(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_aprueba: dict[str, Any],
+    aprobador_actual: dict[str, Any] | None,
+    ultimo_aprobador: bool,
+) -> list[dict[str, Any]]:
+    """
+    Define los destinatarios de una aprobación.
+
+    Aprobación intermedia:
+    - siguiente responsable: Acción requerida;
+    - quien aprobó: Confirmación;
+    - resto de la cadena: Informativa.
+
+    Aprobación final:
+    - quien aprobó: Confirmación;
+    - resto de la cadena: Informativa.
+
+    No se asigna Acción requerida al quedar Listo para firma porque el
+    documento ya no mantiene un ID_APROBACION_ACTUAL interno.
+    """
+    comentario_evento = (
+        texto(evento.get("COMENTARIO"))
+        or "La revisión fue aprobada."
+    )
+
+    especificaciones: list[dict[str, Any]] = []
+
+    if not ultimo_aprobador and aprobador_actual is not None:
+        especificaciones.append(
+            {
+                "aprobador": aprobador_actual,
+                "tipo_notificacion": "Acción requerida",
+                "movimiento": "Documento asignado para continuar la revisión",
+                "comentario_principal": comentario_evento,
+                "link_documento": normalizar_url_appsheet(
+                    documento.get("GOOGLE_DOC_URL")
+                ),
+            }
+        )
+
+    especificaciones.append(
+        {
+            "aprobador": aprobador_aprueba,
+            "tipo_notificacion": "Confirmación",
+            "movimiento": (
+                "Revisión final aprobada"
+                if ultimo_aprobador
+                else "Revisión aprobada y enviada al siguiente responsable"
+            ),
+            "comentario_principal": comentario_evento,
+            "link_documento": "",
+        }
+    )
+
+    for integrante in cadena:
+        especificaciones.append(
+            {
+                "aprobador": integrante,
+                "tipo_notificacion": "Informativa",
+                "movimiento": (
+                    "Documento listo para firma"
+                    if ultimo_aprobador
+                    else "El documento avanzó al siguiente responsable"
+                ),
+                "comentario_principal": comentario_evento,
+                "link_documento": "",
+            }
+        )
+
+    return especificaciones
+
+
+def ejecutar_notificaciones_aprobacion_revision(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_aprueba: dict[str, Any],
+    aprobador_actual: dict[str, Any] | None,
+    ultimo_aprobador: bool,
+) -> list[dict[str, Any]]:
+    especificaciones = construir_especificaciones_aprobacion_revision(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_aprueba=aprobador_aprueba,
+        aprobador_actual=aprobador_actual,
+        ultimo_aprobador=ultimo_aprobador,
+    )
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=especificaciones,
+    )
+
+
+def reanudar_notificaciones_aprobacion_revision(
+    *,
+    documento: dict[str, Any],
+    id_aprobacion_aprueba: str,
+    datos_solicitud: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Completa notificaciones de una aprobación ya procesada."""
+    advertencias: list[str] = []
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_version = texto(documento.get("ID_VERSION_ACTUAL"))
+    numero_version = entero(
+        documento.get("VERSION_ACTUAL"),
+        "VERSION_ACTUAL",
+    )
+    ultimo_aprobador = texto(documento.get("ESTADO")) == "Listo para firma"
+
+    cadena = buscar_cadena_documento_version(
+        id_documento=id_documento,
+        numero_version=numero_version,
+    )
+    if not cadena:
+        advertencias.append(
+            "No se encontró la cadena de aprobación para reanudar las "
+            "notificaciones."
+        )
+        return [], advertencias
+
+    aprobador_actual: dict[str, Any] | None = None
+    if not ultimo_aprobador:
+        id_aprobacion_actual = texto(
+            documento.get("ID_APROBACION_ACTUAL")
+        )
+        if not id_aprobacion_actual:
+            advertencias.append(
+                "El documento sigue En revisión, pero no tiene encargado "
+                "actual para reanudar las notificaciones."
+            )
+            return [], advertencias
+        aprobador_actual = buscar_aprobacion_actual(
+            id_aprobacion_actual
+        )
+
+    aprobador_aprueba: dict[str, Any] | None = None
+    if id_aprobacion_aprueba:
+        aprobador_aprueba = buscar_aprobacion_actual(
+            id_aprobacion_aprueba
+        )
+    else:
+        aprobados = [
+            fila
+            for fila in cadena
+            if texto(fila.get("RESULTADO")) == "Aprobado"
+        ]
+        if aprobador_actual is not None:
+            orden_actual = entero(
+                aprobador_actual.get("ORDEN"),
+                "ORDEN",
+            )
+            aprobados_anteriores = [
+                fila
+                for fila in aprobados
+                if entero(fila.get("ORDEN"), "ORDEN") < orden_actual
+            ]
+            aprobados = aprobados_anteriores or aprobados
+
+        if aprobados:
+            aprobador_aprueba = max(
+                aprobados,
+                key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"),
+            )
+
+    if aprobador_aprueba is None:
+        advertencias.append(
+            "No se pudo identificar al responsable que aprobó la revisión."
+        )
+        return [], advertencias
+
+    orden_aprueba = entero(
+        aprobador_aprueba.get("ORDEN"),
+        "ORDEN",
+    )
+    orden_siguiente = (
+        None
+        if ultimo_aprobador or aprobador_actual is None
+        else entero(aprobador_actual.get("ORDEN"), "ORDEN")
+    )
+    id_aprobacion_evento = (
+        texto(aprobador_aprueba.get("ID_APROBACION_ACTUAL"))
+        if ultimo_aprobador
+        else texto(aprobador_actual.get("ID_APROBACION_ACTUAL"))
+    )
+
+    evento = buscar_evento_revision_aprobada_actual(
+        id_documento=id_documento,
+        id_version=id_version,
+        id_aprobacion_evento=id_aprobacion_evento,
+    )
+
+    if evento is None:
+        version = buscar_version_por_id(id_version)
+        evento = crear_evento_revision_aprobada(
+            id_documento=id_documento,
+            id_version=id_version,
+            id_aprobacion_actual=id_aprobacion_evento,
+            usuario=(
+                texto(documento.get("ULTIMO_ENVIADO_POR"))
+                or texto(datos_solicitud.get("usuario"))
+                or texto(aprobador_aprueba.get("APROBADOR"))
+            ),
+            fecha=(
+                texto(documento.get("FECHA_ULTIMO_ENVIO"))
+                or texto(version.get("FECHA_CREACION"))
+                or ahora_iso()
+            ),
+            comentario=(
+                texto(aprobador_aprueba.get("COMENTARIO"))
+                or texto(version.get("COMENTARIO_CAMBIO"))
+                or texto(datos_solicitud.get("comentario"))
+            ),
+            orden_actual=orden_aprueba,
+            orden_siguiente=orden_siguiente,
+        )
+        advertencias.append(
+            "El evento de aprobación faltaba y fue reconstruido antes de "
+            "reanudar las notificaciones."
+        )
+
+    resultados = ejecutar_notificaciones_aprobacion_revision(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_aprueba=aprobador_aprueba,
+        aprobador_actual=aprobador_actual,
+        ultimo_aprobador=ultimo_aprobador,
+    )
+
+    fallidas = [
+        resultado
+        for resultado in resultados
+        if not resultado.get("ok")
+    ]
+    if fallidas:
+        advertencias.append(
+            f"{len(fallidas)} notificación(es) siguen omitidas o con "
+            "error. Revisa Documento_Notificaciones."
+        )
+
+    return resultados, advertencias
 
 def construir_evento_diagnostico(
     documento: dict[str, Any],
