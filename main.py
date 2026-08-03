@@ -2924,52 +2924,53 @@ def crear_eventos_rechazo_revision(
     numero_version_nueva: int,
     nombre_archivo: str,
     estado_nuevo: str,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Crea la bitácora del rechazo y devuelve su evento principal."""
     advertencias: list[str] = []
 
-    eventos = [
-        {
-            "ID_EVENTO": nuevo_id(),
-            "ID_DOCUMENTO": id_documento,
-            "ID_VERSION": id_version_rechazada,
-            "ID_APROBACION_ACTUAL": id_aprobacion_rechaza,
-            "TIPO_EVENTO": "Revisión rechazada",
-            "ESTADO_ANTERIOR": f"En revisión - Orden {orden_rechaza}",
-            "ESTADO_NUEVO": (
-                f"{estado_nuevo} - Orden {orden_destino}"
-            ),
-            "USUARIO": usuario,
-            "FECHA_EVENTO": fecha,
-            "COMENTARIO": comentario,
-        },
-        {
-            "ID_EVENTO": nuevo_id(),
-            "ID_DOCUMENTO": id_documento,
-            "ID_VERSION": id_version_nueva,
-            "ID_APROBACION_ACTUAL": id_aprobacion_destino,
-            "TIPO_EVENTO": "Nueva versión creada",
-            "ESTADO_ANTERIOR": "Revisión rechazada",
-            "ESTADO_NUEVO": estado_nuevo,
-            "USUARIO": usuario,
-            "FECHA_EVENTO": fecha,
-            "COMENTARIO": (
-                f"Se creó la versión {numero_version_nueva}: "
-                f"{nombre_archivo}. El flujo retrocedió desde el orden "
-                f"{orden_rechaza} al orden {orden_destino}."
-            ),
-        },
-    ]
+    evento_rechazo: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version_rechazada,
+        "ID_APROBACION_ACTUAL": id_aprobacion_rechaza,
+        "TIPO_EVENTO": "Revisión rechazada",
+        "ESTADO_ANTERIOR": f"En revisión - Orden {orden_rechaza}",
+        "ESTADO_NUEVO": f"{estado_nuevo} - Orden {orden_destino}",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": comentario,
+    }
+    evento_version: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version_nueva,
+        "ID_APROBACION_ACTUAL": id_aprobacion_destino,
+        "TIPO_EVENTO": "Nueva versión creada",
+        "ESTADO_ANTERIOR": "Revisión rechazada",
+        "ESTADO_NUEVO": estado_nuevo,
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            f"Se creó la versión {numero_version_nueva}: "
+            f"{nombre_archivo}. El flujo retrocedió desde el orden "
+            f"{orden_rechaza} al orden {orden_destino}."
+        ),
+    }
 
     try:
-        appsheet_action(TABLA_EVENTOS, "Add", eventos)
+        appsheet_action(
+            TABLA_EVENTOS,
+            "Add",
+            [evento_rechazo, evento_version],
+        )
+        return advertencias, evento_rechazo
     except Exception as exc:
         traceback.print_exc()
         advertencias.append(
             "La transición terminó, pero no se pudieron crear los eventos: "
             f"{exc}"
         )
-
-    return advertencias
+        return advertencias, None
 
 
 @app.route("/rechazar-revision", methods=["POST"])
@@ -3027,8 +3028,29 @@ def rechazar_revision():
             "VERSION_ACTUAL",
         )
 
-        # Reintento posterior a una transición ya completada.
+        # Reintento posterior a una transición ya completada. También intenta
+        # completar notificaciones pendientes o con error.
         if ya_rechazada and version_documento > numero_version_anterior:
+            notificaciones_reintento: list[dict[str, Any]] = []
+            advertencias_reintento: list[str] = []
+            try:
+                documento = buscar_documento(id_documento)
+                (
+                    notificaciones_reintento,
+                    advertencias_reintento,
+                ) = reanudar_notificaciones_rechazo_revision(
+                    documento=documento,
+                    id_aprobacion_rechaza=id_aprobacion_solicitud,
+                    datos_solicitud=data,
+                )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias_reintento.append(
+                    "El rechazo ya estaba procesado, pero no se pudieron "
+                    "reanudar sus notificaciones: "
+                    f"{exc_notificacion}"
+                )
+
             return jsonify(
                 {
                     "ok": True,
@@ -3049,6 +3071,8 @@ def rechazar_revision():
                     "google_doc_url": normalizar_url_appsheet(
                         documento.get("GOOGLE_DOC_URL")
                     ),
+                    "notificaciones": notificaciones_reintento,
+                    "advertencias": advertencias_reintento,
                 }
             )
 
@@ -3353,7 +3377,7 @@ def rechazar_revision():
             fecha=fecha,
         )
 
-        advertencias = crear_eventos_rechazo_revision(
+        advertencias, evento_rechazo = crear_eventos_rechazo_revision(
             id_documento=id_documento,
             id_version_rechazada=id_version_rechazada,
             id_version_nueva=id_version_nueva,
@@ -3370,6 +3394,41 @@ def rechazar_revision():
             nombre_archivo=copia["name"],
             estado_nuevo=estado_documento_nuevo,
         )
+
+        notificaciones: list[dict[str, Any]] = []
+        if evento_rechazo is not None:
+            try:
+                documento_actualizado = buscar_documento(id_documento)
+                cadena_nueva = buscar_cadena_documento_version(
+                    id_documento=id_documento,
+                    numero_version=numero_version_nueva,
+                )
+                aprobador_destino_actualizado = buscar_aprobacion_actual(
+                    texto(documento_actualizado.get("ID_APROBACION_ACTUAL"))
+                )
+                notificaciones = ejecutar_notificaciones_rechazo_revision(
+                    documento=documento_actualizado,
+                    evento=evento_rechazo,
+                    cadena=cadena_nueva,
+                    aprobador_rechaza=aprobacion_actual,
+                    aprobador_destino=aprobador_destino_actualizado,
+                )
+                fallidas = [
+                    resultado
+                    for resultado in notificaciones
+                    if not resultado.get("ok")
+                ]
+                if fallidas:
+                    advertencias.append(
+                        f"{len(fallidas)} notificación(es) quedaron omitidas "
+                        "o con error. Revisa Documento_Notificaciones."
+                    )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias.append(
+                    "El rechazo terminó correctamente, pero falló el proceso "
+                    f"de notificaciones internas: {exc_notificacion}"
+                )
 
         return jsonify(
             {
@@ -3389,6 +3448,7 @@ def rechazar_revision():
                 ],
                 "encargado_actual": destino_nuevo.get("NOMBRE", ""),
                 "encargado_email": email_destino,
+                "notificaciones": notificaciones,
                 "advertencias": advertencias,
             }
         )
@@ -3884,17 +3944,20 @@ def construir_historial_comentarios(
 
         eventos_relevantes.append(evento)
 
+    # Ordena desde el evento más reciente al más antiguo.
     eventos_relevantes.sort(
-        key=lambda fila: parsear_fecha_appsheet(
-            fila.get("FECHA_EVENTO")
-        )
+        key=lambda fila: (
+            parsear_fecha_appsheet(fila.get("FECHA_EVENTO")),
+            texto(fila.get("ID_EVENTO")),
+        ),
+        reverse=True,
     )
 
     total_eventos_relevantes = len(eventos_relevantes)
 
-    # Conserva solo los últimos eventos relevantes.
+    # Conserva únicamente los eventos relevantes más recientes.
     eventos_mostrados = eventos_relevantes[
-        -MAX_EVENTOS_HISTORIAL_EMAIL:
+        :MAX_EVENTOS_HISTORIAL_EMAIL
     ]
 
     cantidad_omitidos = (
@@ -5202,6 +5265,556 @@ def reanudar_notificaciones_aprobacion_revision(
 
     return resultados, advertencias
 
+
+
+def buscar_integrante_cadena_por_usuario(
+    cadena: list[dict[str, Any]],
+    usuario: str,
+) -> dict[str, Any] | None:
+    """Busca un integrante usando su correo operativo o de notificación."""
+    correo = texto(usuario).strip().lower()
+    if not correo:
+        return None
+
+    for integrante in cadena:
+        correos = {
+            texto(integrante.get("APROBADOR")).strip().lower(),
+            texto(integrante.get("Aprobador_v")).strip().lower(),
+        }
+        correos.discard("")
+        if correo in correos:
+            return integrante
+
+    return None
+
+
+def buscar_evento_rechazo_revision_actual(
+    *,
+    id_documento: str,
+    id_aprobacion_rechaza: str,
+) -> dict[str, Any] | None:
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Revisión rechazada"
+        and texto(evento.get("ID_APROBACION_ACTUAL"))
+        == id_aprobacion_rechaza
+    ]
+    if not candidatos:
+        return None
+
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def crear_evento_rechazo_revision_reconstruido(
+    *,
+    documento: dict[str, Any],
+    aprobador_rechaza: dict[str, Any],
+    comentario: str,
+    usuario: str,
+) -> dict[str, Any]:
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": texto(documento.get("ID_DOCUMENTO")),
+        "ID_VERSION": texto(
+            aprobador_rechaza.get("ID_VERSION_TRABAJADA")
+        ),
+        "ID_APROBACION_ACTUAL": texto(
+            aprobador_rechaza.get("ID_APROBACION_ACTUAL")
+        ),
+        "TIPO_EVENTO": "Revisión rechazada",
+        "ESTADO_ANTERIOR": (
+            "En revisión - Orden "
+            + texto(aprobador_rechaza.get("ORDEN"))
+        ),
+        "ESTADO_NUEVO": texto(documento.get("ESTADO")),
+        "USUARIO": (
+            texto(usuario)
+            or texto(aprobador_rechaza.get("APROBADOR"))
+        ),
+        "FECHA_EVENTO": (
+            texto(aprobador_rechaza.get("FECHA_RESPUESTA"))
+            or texto(documento.get("FECHA_ULTIMO_ENVIO"))
+            or ahora_iso()
+        ),
+        "COMENTARIO": (
+            texto(comentario)
+            or texto(aprobador_rechaza.get("COMENTARIO"))
+            or "La revisión fue rechazada."
+        ),
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
+
+
+def construir_especificaciones_rechazo_revision(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_rechaza: dict[str, Any],
+    aprobador_destino: dict[str, Any],
+) -> list[dict[str, Any]]:
+    comentario_evento = (
+        texto(evento.get("COMENTARIO"))
+        or "La revisión fue rechazada y el documento volvió al responsable anterior."
+    )
+
+    especificaciones: list[dict[str, Any]] = [
+        {
+            "aprobador": aprobador_destino,
+            "tipo_notificacion": "Acción requerida",
+            "movimiento": "Documento devuelto para corrección",
+            "comentario_principal": comentario_evento,
+            "link_documento": normalizar_url_appsheet(
+                documento.get("GOOGLE_DOC_URL")
+            ),
+        },
+        {
+            "aprobador": aprobador_rechaza,
+            "tipo_notificacion": "Confirmación",
+            "movimiento": "Rechazo registrado y documento devuelto",
+            "comentario_principal": comentario_evento,
+            "link_documento": "",
+        },
+    ]
+
+    for integrante in cadena:
+        especificaciones.append(
+            {
+                "aprobador": integrante,
+                "tipo_notificacion": "Informativa",
+                "movimiento": "Documento devuelto por observaciones",
+                "comentario_principal": comentario_evento,
+                "link_documento": "",
+            }
+        )
+
+    return especificaciones
+
+
+def ejecutar_notificaciones_rechazo_revision(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_rechaza: dict[str, Any],
+    aprobador_destino: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=construir_especificaciones_rechazo_revision(
+            documento=documento,
+            evento=evento,
+            cadena=cadena,
+            aprobador_rechaza=aprobador_rechaza,
+            aprobador_destino=aprobador_destino,
+        ),
+    )
+
+
+def reanudar_notificaciones_rechazo_revision(
+    *,
+    documento: dict[str, Any],
+    id_aprobacion_rechaza: str,
+    datos_solicitud: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    advertencias: list[str] = []
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_aprobacion_destino = texto(
+        documento.get("ID_APROBACION_ACTUAL")
+    )
+    numero_version = entero(
+        documento.get("VERSION_ACTUAL"),
+        "VERSION_ACTUAL",
+    )
+
+    if not id_aprobacion_rechaza or not id_aprobacion_destino:
+        return [], [
+            "No fue posible identificar al responsable que rechazó o al "
+            "responsable que recibió el documento."
+        ]
+
+    aprobador_rechaza = buscar_aprobacion_actual(
+        id_aprobacion_rechaza
+    )
+    aprobador_destino = buscar_aprobacion_actual(
+        id_aprobacion_destino
+    )
+    cadena = buscar_cadena_documento_version(
+        id_documento=id_documento,
+        numero_version=numero_version,
+    )
+
+    evento = buscar_evento_rechazo_revision_actual(
+        id_documento=id_documento,
+        id_aprobacion_rechaza=id_aprobacion_rechaza,
+    )
+    if evento is None:
+        evento = crear_evento_rechazo_revision_reconstruido(
+            documento=documento,
+            aprobador_rechaza=aprobador_rechaza,
+            comentario=texto(datos_solicitud.get("comentario")),
+            usuario=texto(datos_solicitud.get("usuario")),
+        )
+        advertencias.append(
+            "El evento de rechazo faltaba y fue reconstruido antes de "
+            "reanudar las notificaciones."
+        )
+
+    resultados = ejecutar_notificaciones_rechazo_revision(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_rechaza=aprobador_rechaza,
+        aprobador_destino=aprobador_destino,
+    )
+    fallidas = [r for r in resultados if not r.get("ok")]
+    if fallidas:
+        advertencias.append(
+            f"{len(fallidas)} notificación(es) siguen omitidas o con error. "
+            "Revisa Documento_Notificaciones."
+        )
+    return resultados, advertencias
+
+
+def buscar_evento_reinicio_firma_actual(
+    *,
+    id_documento: str,
+    id_version_observada: str,
+) -> dict[str, Any] | None:
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Proceso reiniciado"
+        and (
+            not id_version_observada
+            or texto(evento.get("ID_VERSION")) == id_version_observada
+        )
+    ]
+    if not candidatos:
+        return None
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def crear_evento_reinicio_firma_reconstruido(
+    *,
+    documento: dict[str, Any],
+    id_version_observada: str,
+    usuario: str,
+    comentario: str,
+) -> dict[str, Any]:
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": texto(documento.get("ID_DOCUMENTO")),
+        "ID_VERSION": id_version_observada,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "Proceso reiniciado",
+        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_NUEVO": "Borrador",
+        "USUARIO": texto(usuario),
+        "FECHA_EVENTO": (
+            texto(documento.get("FECHA_ULTIMO_ENVIO")) or ahora_iso()
+        ),
+        "COMENTARIO": (
+            "El documento recibió observaciones durante la firma. Motivo: "
+            + (texto(comentario) or "Sin detalle adicional.")
+        ),
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
+
+
+def construir_especificaciones_reinicio_firma(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_destino: dict[str, Any],
+    aprobador_confirma: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    comentario_evento = (
+        texto(evento.get("COMENTARIO"))
+        or "El documento recibió observaciones durante la firma."
+    )
+    especificaciones: list[dict[str, Any]] = [
+        {
+            "aprobador": aprobador_destino,
+            "tipo_notificacion": "Acción requerida",
+            "movimiento": "Proceso reiniciado por observaciones de firma",
+            "comentario_principal": comentario_evento,
+            "link_documento": normalizar_url_appsheet(
+                documento.get("GOOGLE_DOC_URL")
+            ),
+        }
+    ]
+
+    if aprobador_confirma is not None:
+        especificaciones.append(
+            {
+                "aprobador": aprobador_confirma,
+                "tipo_notificacion": "Confirmación",
+                "movimiento": "Observaciones de firma registradas",
+                "comentario_principal": comentario_evento,
+                "link_documento": "",
+            }
+        )
+
+    for integrante in cadena:
+        especificaciones.append(
+            {
+                "aprobador": integrante,
+                "tipo_notificacion": "Informativa",
+                "movimiento": "El proceso volvió a borrador",
+                "comentario_principal": comentario_evento,
+                "link_documento": "",
+            }
+        )
+
+    return especificaciones
+
+
+def ejecutar_notificaciones_reinicio_firma(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+    aprobador_destino: dict[str, Any],
+    aprobador_confirma: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=construir_especificaciones_reinicio_firma(
+            documento=documento,
+            evento=evento,
+            cadena=cadena,
+            aprobador_destino=aprobador_destino,
+            aprobador_confirma=aprobador_confirma,
+        ),
+    )
+
+
+def reanudar_notificaciones_reinicio_firma(
+    *,
+    documento: dict[str, Any],
+    id_version_observada: str,
+    datos_solicitud: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    advertencias: list[str] = []
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    numero_version = entero(
+        documento.get("VERSION_ACTUAL"),
+        "VERSION_ACTUAL",
+    )
+    id_aprobacion_destino = texto(
+        documento.get("ID_APROBACION_ACTUAL")
+    )
+    if not id_aprobacion_destino:
+        return [], [
+            "No fue posible identificar al responsable del nuevo borrador."
+        ]
+
+    cadena = buscar_cadena_documento_version(
+        id_documento=id_documento,
+        numero_version=numero_version,
+    )
+    aprobador_destino = buscar_aprobacion_actual(
+        id_aprobacion_destino
+    )
+    usuario = (
+        texto(datos_solicitud.get("usuario"))
+        or texto(documento.get("ULTIMO_ENVIADO_POR"))
+    )
+    aprobador_confirma = buscar_integrante_cadena_por_usuario(
+        cadena,
+        usuario,
+    )
+
+    evento = buscar_evento_reinicio_firma_actual(
+        id_documento=id_documento,
+        id_version_observada=id_version_observada,
+    )
+    if evento is None:
+        evento = crear_evento_reinicio_firma_reconstruido(
+            documento=documento,
+            id_version_observada=id_version_observada,
+            usuario=usuario,
+            comentario=texto(datos_solicitud.get("comentario")),
+        )
+        advertencias.append(
+            "El evento de reinicio faltaba y fue reconstruido antes de "
+            "reanudar las notificaciones."
+        )
+
+    resultados = ejecutar_notificaciones_reinicio_firma(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_destino=aprobador_destino,
+        aprobador_confirma=aprobador_confirma,
+    )
+    fallidas = [r for r in resultados if not r.get("ok")]
+    if fallidas:
+        advertencias.append(
+            f"{len(fallidas)} notificación(es) siguen omitidas o con error. "
+            "Revisa Documento_Notificaciones."
+        )
+    return resultados, advertencias
+
+
+def buscar_evento_cierre_proceso(
+    *,
+    id_documento: str,
+    id_version: str,
+) -> dict[str, Any] | None:
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Proceso terminado"
+        and (
+            not id_version
+            or texto(evento.get("ID_VERSION")) == id_version
+        )
+    ]
+    if not candidatos:
+        return None
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def crear_evento_cierre_reconstruido(
+    *,
+    documento: dict[str, Any],
+    usuario: str,
+) -> dict[str, Any]:
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": texto(documento.get("ID_DOCUMENTO")),
+        "ID_VERSION": texto(documento.get("ID_VERSION_ACTUAL")),
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "Proceso terminado",
+        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_NUEVO": "Proceso terminado",
+        "USUARIO": (
+            texto(usuario)
+            or texto(documento.get("CARGADO_POR"))
+        ),
+        "FECHA_EVENTO": (
+            texto(documento.get("FECHA_CIERRE")) or ahora_iso()
+        ),
+        "COMENTARIO": (
+            "El documento quedó cerrado con su PDF firmado definitivo."
+        ),
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
+
+
+def construir_especificaciones_cierre_proceso(
+    *,
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    comentario_evento = (
+        texto(evento.get("COMENTARIO"))
+        or "El proceso documental terminó correctamente."
+    )
+    return [
+        {
+            "aprobador": integrante,
+            "tipo_notificacion": "Cierre",
+            "movimiento": "Proceso documental finalizado",
+            "comentario_principal": comentario_evento,
+            "link_documento": "",
+        }
+        for integrante in cadena
+    ]
+
+
+def ejecutar_notificaciones_cierre_proceso(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    cadena: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=construir_especificaciones_cierre_proceso(
+            evento=evento,
+            cadena=cadena,
+        ),
+    )
+
+
+def reanudar_notificaciones_cierre_proceso(
+    *,
+    documento: dict[str, Any],
+    datos_solicitud: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    advertencias: list[str] = []
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_version = texto(documento.get("ID_VERSION_ACTUAL"))
+    numero_version = entero(
+        documento.get("VERSION_ACTUAL"),
+        "VERSION_ACTUAL",
+    )
+    cadena = buscar_cadena_documento_version(
+        id_documento=id_documento,
+        numero_version=numero_version,
+    )
+    if not cadena:
+        return [], [
+            "No se encontró la cadena interna para enviar el cierre."
+        ]
+
+    evento = buscar_evento_cierre_proceso(
+        id_documento=id_documento,
+        id_version=id_version,
+    )
+    if evento is None:
+        evento = crear_evento_cierre_reconstruido(
+            documento=documento,
+            usuario=texto(datos_solicitud.get("usuario")),
+        )
+        advertencias.append(
+            "El evento de cierre faltaba y fue reconstruido antes de "
+            "reanudar las notificaciones."
+        )
+
+    resultados = ejecutar_notificaciones_cierre_proceso(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+    )
+    fallidas = [r for r in resultados if not r.get("ok")]
+    if fallidas:
+        advertencias.append(
+            f"{len(fallidas)} notificación(es) siguen omitidas o con error. "
+            "Revisa Documento_Notificaciones."
+        )
+    return resultados, advertencias
+
+
 def construir_evento_diagnostico(
     documento: dict[str, Any],
 ) -> dict[str, Any]:
@@ -6123,45 +6736,47 @@ def crear_eventos_cierre_firma(
     nombre_origen: str,
     nombre_final: str,
     comentario: str,
-) -> None:
+) -> dict[str, Any]:
+    """Crea los eventos de cierre y devuelve el evento Proceso terminado."""
     detalle_carga = (
         f"Se cargó {nombre_origen} y se archivó como {nombre_final}."
     )
     if comentario:
         detalle_carga += f" Comentario: {comentario}"
 
+    evento_carga: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "PDF firmado cargado",
+        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_NUEVO": "En firma",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": detalle_carga,
+    }
+    evento_cierre: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "Proceso terminado",
+        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_NUEVO": "Proceso terminado",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            "El documento quedó cerrado con su PDF firmado definitivo."
+        ),
+    }
+
     appsheet_action(
         TABLA_EVENTOS,
         "Add",
-        [
-            {
-                "ID_EVENTO": nuevo_id(),
-                "ID_DOCUMENTO": id_documento,
-                "ID_VERSION": id_version,
-                "ID_APROBACION_ACTUAL": "",
-                "TIPO_EVENTO": "PDF firmado cargado",
-                "ESTADO_ANTERIOR": "En firma",
-                "ESTADO_NUEVO": "En firma",
-                "USUARIO": usuario,
-                "FECHA_EVENTO": fecha,
-                "COMENTARIO": detalle_carga,
-            },
-            {
-                "ID_EVENTO": nuevo_id(),
-                "ID_DOCUMENTO": id_documento,
-                "ID_VERSION": id_version,
-                "ID_APROBACION_ACTUAL": "",
-                "TIPO_EVENTO": "Proceso terminado",
-                "ESTADO_ANTERIOR": "En firma",
-                "ESTADO_NUEVO": "Proceso terminado",
-                "USUARIO": usuario,
-                "FECHA_EVENTO": fecha,
-                "COMENTARIO": (
-                    "El documento quedó cerrado con su PDF firmado definitivo."
-                ),
-            },
-        ],
+        [evento_carga, evento_cierre],
     )
+    return evento_cierre
 
 
 @app.route("/registrar-firma", methods=["POST"])
@@ -6189,6 +6804,24 @@ def registrar_firma():
         pdf_final_existente = texto(documento.get("PDF_FIRMADO_ID"))
 
         if estado == "Proceso terminado" and pdf_final_existente:
+            notificaciones_reintento: list[dict[str, Any]] = []
+            advertencias_reintento: list[str] = []
+            try:
+                (
+                    notificaciones_reintento,
+                    advertencias_reintento,
+                ) = reanudar_notificaciones_cierre_proceso(
+                    documento=documento,
+                    datos_solicitud=data,
+                )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias_reintento.append(
+                    "El proceso ya estaba cerrado, pero no se pudieron "
+                    "reanudar sus notificaciones: "
+                    f"{exc_notificacion}"
+                )
+
             return jsonify(
                 {
                     "ok": True,
@@ -6200,6 +6833,8 @@ def registrar_firma():
                     "pdf_firmado_url": texto(
                         documento.get("PDF_FIRMADO_URL")
                     ),
+                    "notificaciones": notificaciones_reintento,
+                    "advertencias": advertencias_reintento,
                 }
             )
 
@@ -6327,8 +6962,9 @@ def registrar_firma():
         documento_cerrado = True
 
         advertencias: list[str] = []
+        evento_cierre: dict[str, Any] | None = None
         try:
-            crear_eventos_cierre_firma(
+            evento_cierre = crear_eventos_cierre_firma(
                 id_documento=id_documento,
                 id_version=id_version_final,
                 usuario=usuario,
@@ -6344,6 +6980,36 @@ def registrar_firma():
                 f"eventos: {exc_evento}"
             )
 
+        notificaciones: list[dict[str, Any]] = []
+        if evento_cierre is not None:
+            try:
+                documento_actualizado = buscar_documento(id_documento)
+                cadena = buscar_cadena_documento_version(
+                    id_documento=id_documento,
+                    numero_version=numero_version,
+                )
+                notificaciones = ejecutar_notificaciones_cierre_proceso(
+                    documento=documento_actualizado,
+                    evento=evento_cierre,
+                    cadena=cadena,
+                )
+                fallidas = [
+                    resultado
+                    for resultado in notificaciones
+                    if not resultado.get("ok")
+                ]
+                if fallidas:
+                    advertencias.append(
+                        f"{len(fallidas)} notificación(es) de cierre quedaron "
+                        "omitidas o con error. Revisa Documento_Notificaciones."
+                    )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias.append(
+                    "El documento se cerró correctamente, pero falló el "
+                    f"proceso de notificaciones internas: {exc_notificacion}"
+                )
+
         return jsonify(
             {
                 "ok": True,
@@ -6355,6 +7021,7 @@ def registrar_firma():
                 "pdf_firmado_id": pdf_final["id"],
                 "pdf_firmado_url": pdf_final["url"],
                 "pdf_firmado_nombre": pdf_final["name"],
+                "notificaciones": notificaciones,
                 "advertencias": advertencias,
             }
         )
@@ -6463,52 +7130,55 @@ def crear_eventos_reinicio_firma(
     comentario: str,
     numero_version_nueva: int,
     nombre_archivo: str,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Crea la bitácora del reinicio y devuelve el evento principal."""
     advertencias: list[str] = []
-    eventos = [
-        {
-            "ID_EVENTO": nuevo_id(),
-            "ID_DOCUMENTO": id_documento,
-            "ID_VERSION": id_version_observada,
-            "ID_APROBACION_ACTUAL": "",
-            "TIPO_EVENTO": "Proceso reiniciado",
-            "ESTADO_ANTERIOR": "En firma",
-            "ESTADO_NUEVO": "Borrador",
-            "USUARIO": usuario,
-            "FECHA_EVENTO": fecha,
-            "COMENTARIO": (
-                "El documento recibió observaciones durante la firma. "
-                f"Motivo: {comentario}"
-            ),
-        },
-        {
-            "ID_EVENTO": nuevo_id(),
-            "ID_DOCUMENTO": id_documento,
-            "ID_VERSION": id_version_nueva,
-            "ID_APROBACION_ACTUAL": id_aprobacion_nueva,
-            "TIPO_EVENTO": "Nueva versión creada",
-            "ESTADO_ANTERIOR": "Observado en firma",
-            "ESTADO_NUEVO": "Borrador",
-            "USUARIO": usuario,
-            "FECHA_EVENTO": fecha,
-            "COMENTARIO": (
-                f"Se creó la versión {numero_version_nueva}: "
-                f"{nombre_archivo}. La cadena de aprobación se reinició "
-                "desde el primer responsable."
-            ),
-        },
-    ]
+    evento_reinicio: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version_observada,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "Proceso reiniciado",
+        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_NUEVO": "Borrador",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            "El documento recibió observaciones durante la firma. "
+            f"Motivo: {comentario}"
+        ),
+    }
+    evento_version: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version_nueva,
+        "ID_APROBACION_ACTUAL": id_aprobacion_nueva,
+        "TIPO_EVENTO": "Nueva versión creada",
+        "ESTADO_ANTERIOR": "Observado en firma",
+        "ESTADO_NUEVO": "Borrador",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            f"Se creó la versión {numero_version_nueva}: "
+            f"{nombre_archivo}. La cadena de aprobación se reinició "
+            "desde el primer responsable."
+        ),
+    }
 
     try:
-        appsheet_action(TABLA_EVENTOS, "Add", eventos)
+        appsheet_action(
+            TABLA_EVENTOS,
+            "Add",
+            [evento_reinicio, evento_version],
+        )
+        return advertencias, evento_reinicio
     except Exception as exc:
         traceback.print_exc()
         advertencias.append(
             "La transición terminó, pero no se pudieron crear los eventos: "
             f"{exc}"
         )
-
-    return advertencias
+        return advertencias, None
 
 
 @app.route("/rechazar-firma", methods=["POST"])
@@ -6558,21 +7228,45 @@ def rechazar_firma():
         estado_documento = texto(documento.get("ESTADO"))
 
         # Reintento del mismo webhook después de una transición ya terminada.
+        # También intenta completar notificaciones pendientes o con error.
         if (
             estado_version_origen == "Observada"
             and numero_version_documento > numero_version_anterior
             and estado_documento in {"Borrador", "En revisión"}
         ):
+            notificaciones_reintento: list[dict[str, Any]] = []
+            advertencias_reintento: list[str] = []
+            try:
+                documento = buscar_documento(id_documento)
+                (
+                    notificaciones_reintento,
+                    advertencias_reintento,
+                ) = reanudar_notificaciones_reinicio_firma(
+                    documento=documento,
+                    id_version_observada=id_version_origen,
+                    datos_solicitud=data,
+                )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias_reintento.append(
+                    "El reinicio ya estaba procesado, pero no se pudieron "
+                    "reanudar sus notificaciones: "
+                    f"{exc_notificacion}"
+                )
+
             return jsonify(
                 {
                     "ok": True,
                     "ya_procesado": True,
                     "id_documento": id_documento,
-                    "estado": estado_documento,
+                    "estado": texto(documento.get("ESTADO")),
                     "estado_firma": texto(
                         documento.get("ESTADO_FIRMA")
                     ),
-                    "numero_version": numero_version_documento,
+                    "numero_version": entero(
+                        documento.get("VERSION_ACTUAL"),
+                        "VERSION_ACTUAL",
+                    ),
                     "numero_revision": entero(
                         documento.get("REVISION_ACTUAL") or 0,
                         "REVISION_ACTUAL",
@@ -6586,6 +7280,8 @@ def rechazar_firma():
                     "google_doc_url": normalizar_url_appsheet(
                         documento.get("GOOGLE_DOC_URL")
                     ),
+                    "notificaciones": notificaciones_reintento,
+                    "advertencias": advertencias_reintento,
                 }
             )
 
@@ -6793,7 +7489,7 @@ def rechazar_firma():
             fecha=fecha,
         )
 
-        advertencias = crear_eventos_reinicio_firma(
+        advertencias, evento_reinicio = crear_eventos_reinicio_firma(
             id_documento=id_documento,
             id_version_observada=id_version_origen,
             id_version_nueva=id_version_nueva,
@@ -6806,6 +7502,45 @@ def rechazar_firma():
             numero_version_nueva=numero_version_nueva,
             nombre_archivo=copia["name"],
         )
+
+        notificaciones: list[dict[str, Any]] = []
+        if evento_reinicio is not None:
+            try:
+                documento_actualizado = buscar_documento(id_documento)
+                cadena_nueva = buscar_cadena_documento_version(
+                    id_documento=id_documento,
+                    numero_version=numero_version_nueva,
+                )
+                aprobador_destino = buscar_aprobacion_actual(
+                    texto(documento_actualizado.get("ID_APROBACION_ACTUAL"))
+                )
+                aprobador_confirma = buscar_integrante_cadena_por_usuario(
+                    cadena_nueva,
+                    usuario,
+                )
+                notificaciones = ejecutar_notificaciones_reinicio_firma(
+                    documento=documento_actualizado,
+                    evento=evento_reinicio,
+                    cadena=cadena_nueva,
+                    aprobador_destino=aprobador_destino,
+                    aprobador_confirma=aprobador_confirma,
+                )
+                fallidas = [
+                    resultado
+                    for resultado in notificaciones
+                    if not resultado.get("ok")
+                ]
+                if fallidas:
+                    advertencias.append(
+                        f"{len(fallidas)} notificación(es) quedaron omitidas "
+                        "o con error. Revisa Documento_Notificaciones."
+                    )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias.append(
+                    "El proceso se reinició correctamente, pero falló el "
+                    f"envío de notificaciones internas: {exc_notificacion}"
+                )
 
         return jsonify(
             {
@@ -6826,6 +7561,7 @@ def rechazar_firma():
                 ],
                 "encargado_actual": primer_nuevo.get("NOMBRE", ""),
                 "encargado_email": email_primero,
+                "notificaciones": notificaciones,
                 "advertencias": advertencias,
             }
         )
