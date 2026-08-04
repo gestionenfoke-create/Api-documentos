@@ -3577,6 +3577,349 @@ def descargar_pdf_drive(
     return contenido, nombre
 
 
+def construir_email_firma_externo(
+    *,
+    documento: dict[str, Any],
+    plantilla: dict[str, Any],
+    usuario: str,
+    mensaje_adicional: str,
+    fecha_envio: str,
+) -> tuple[str, str, str]:
+    """Construye el asunto y los cuerpos texto/HTML del correo externo."""
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    titulo = texto(documento.get("TITULO")) or f"Documento {id_documento}"
+    tipo_documento = texto(documento.get("TIPO_DOCUMENTO")) or "-"
+    proyecto = (
+        texto(documento.get("NOMBRE_PROYECTO"))
+        or texto(documento.get("PROYECTO"))
+        or texto(documento.get("ID_PROYECTO"))
+    )
+
+    mapa_nombres = construir_mapa_nombres_usuarios(
+        id_documento=id_documento,
+    )
+    enviado_por_nombre = obtener_nombre_usuario_evento(
+        usuario_evento=usuario,
+        mapa_nombres=mapa_nombres,
+    )
+    if enviado_por_nombre == "Usuario no identificado":
+        enviado_por_nombre = usuario
+
+    variables = {
+        "TITULO": titulo,
+        "TIPO_DOCUMENTO": tipo_documento,
+        "ID_PROYECTO": proyecto,
+        "PROYECTO": proyecto,
+        "ENVIADO_POR": usuario,
+        "ENVIADO_POR_NOMBRE": enviado_por_nombre,
+        "FECHA_ENVIO": fecha_envio,
+    }
+
+    asunto_base = texto(plantilla.get("ASUNTO_EMAIL_FIRMA"))
+    if not asunto_base:
+        asunto_base = "Solicitud de firma — {{TITULO}}"
+
+    asunto = reemplazar_variables_email(
+        asunto_base,
+        variables,
+    ).strip()
+
+    cuerpo_base = texto(plantilla.get("CUERPO_EMAIL_FIRMA"))
+    mensaje_plantilla = reemplazar_variables_email(
+        cuerpo_base,
+        variables,
+    ).strip()
+
+    # Las plantillas antiguas suelen repetir exactamente las instrucciones
+    # estándar. En ese caso no se muestran nuevamente dentro del nuevo diseño.
+    mensaje_normalizado = mensaje_plantilla.lower()
+    es_mensaje_generico = (
+        "adjuntamos el documento" in mensaje_normalizado
+        and "una vez firmado" in mensaje_normalizado
+        and "respondiendo a este correo" in mensaje_normalizado
+    )
+    if es_mensaje_generico:
+        mensaje_plantilla = ""
+
+    resumen_texto = [
+        f"Documento: {titulo}",
+        f"Tipo de documento: {tipo_documento}",
+    ]
+    if proyecto:
+        resumen_texto.insert(1, f"Proyecto: {proyecto}")
+    if enviado_por_nombre:
+        resumen_texto.append(f"Enviado por: {enviado_por_nombre}")
+
+    secciones_texto = [
+        "SOLICITUD DE FIRMA",
+        "",
+        "Estimado/a:",
+        "",
+        f'Adjuntamos el documento "{titulo}" para su revisión y firma.',
+        "",
+        "RESUMEN DEL DOCUMENTO",
+        *resumen_texto,
+    ]
+
+    if mensaje_plantilla:
+        secciones_texto.extend(
+            [
+                "",
+                "MENSAJE",
+                mensaje_plantilla,
+            ]
+        )
+
+    if mensaje_adicional:
+        secciones_texto.extend(
+            [
+                "",
+                "INDICACIONES ADICIONALES",
+                mensaje_adicional,
+            ]
+        )
+
+    secciones_texto.extend(
+        [
+            "",
+            "¿QUÉ DEBE HACER?",
+            "1. Revisar el archivo PDF adjunto.",
+            "2. Firmar el documento.",
+            "3. Responder este mismo correo adjuntando el PDF firmado.",
+            "",
+            f"Este correo fue generado por {NOMBRE_APLICACION}.",
+        ]
+    )
+    cuerpo_texto = "\n".join(secciones_texto)
+
+    def escapar(valor: Any) -> str:
+        return html.escape(texto(valor))
+
+    def con_saltos(valor: Any) -> str:
+        return escapar(valor).replace("\n", "<br>")
+
+    filas_resumen = [
+        ("Documento", titulo),
+    ]
+    if proyecto:
+        filas_resumen.append(("Proyecto", proyecto))
+    filas_resumen.extend(
+        [
+            ("Tipo de documento", tipo_documento),
+            ("Enviado por", enviado_por_nombre),
+        ]
+    )
+
+    filas_html = "".join(
+        f"""
+        <tr>
+          <td style="
+              padding:12px 16px;
+              width:34%;
+              border-top:1px solid #e5e7eb;
+              color:#6b7280;
+              font-size:14px;
+              vertical-align:top;
+          ">{escapar(etiqueta)}</td>
+          <td style="
+              padding:12px 16px;
+              border-top:1px solid #e5e7eb;
+              color:#111827;
+              font-size:14px;
+              font-weight:600;
+              vertical-align:top;
+          ">{escapar(valor)}</td>
+        </tr>
+        """
+        for etiqueta, valor in filas_resumen
+        if texto(valor)
+    )
+
+    bloque_mensaje = ""
+    if mensaje_plantilla:
+        bloque_mensaje = f"""
+        <div style="
+            margin:22px 0 0 0;
+            padding:16px 18px;
+            background:#f9fafb;
+            border-left:4px solid #6b7280;
+            border-radius:6px;
+        ">
+          <div style="
+              margin-bottom:7px;
+              color:#374151;
+              font-size:13px;
+              font-weight:700;
+              text-transform:uppercase;
+              letter-spacing:.3px;
+          ">Mensaje</div>
+          <div style="
+              color:#374151;
+              font-size:14px;
+              line-height:1.65;
+          ">{con_saltos(mensaje_plantilla)}</div>
+        </div>
+        """
+
+    bloque_adicional = ""
+    if mensaje_adicional:
+        bloque_adicional = f"""
+        <div style="
+            margin:18px 0 0 0;
+            padding:16px 18px;
+            background:#fff7ed;
+            border:1px solid #fed7aa;
+            border-radius:8px;
+        ">
+          <div style="
+              margin-bottom:7px;
+              color:#9a3412;
+              font-size:13px;
+              font-weight:700;
+              text-transform:uppercase;
+              letter-spacing:.3px;
+          ">Indicaciones adicionales</div>
+          <div style="
+              color:#7c2d12;
+              font-size:14px;
+              line-height:1.65;
+          ">{con_saltos(mensaje_adicional)}</div>
+        </div>
+        """
+
+    cuerpo_html = f"""
+    <!doctype html>
+    <html lang="es">
+      <body style="
+          margin:0;
+          padding:0;
+          background:#f3f4f6;
+          font-family:Arial,Helvetica,sans-serif;
+          color:#111827;
+      ">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+               style="width:100%; background:#f3f4f6;">
+          <tr>
+            <td align="center" style="padding:24px 12px;">
+              <table role="presentation" width="680" cellspacing="0" cellpadding="0"
+                     style="
+                         width:100%;
+                         max-width:680px;
+                         background:#ffffff;
+                         border:1px solid #e5e7eb;
+                         border-radius:10px;
+                         overflow:hidden;
+                     ">
+                <tr>
+                  <td style="padding:24px 28px; background:#111827; color:#ffffff;">
+                    <div style="font-size:13px; color:#d1d5db;">
+                      {escapar(NOMBRE_APLICACION)}
+                    </div>
+                    <div style="margin-top:5px; font-size:25px; font-weight:700;">
+                      Solicitud de firma
+                    </div>
+                    <div style="margin-top:8px; font-size:14px; color:#d1d5db; line-height:1.5;">
+                      Documento adjunto para revisión y firma
+                    </div>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:28px;">
+                    <p style="margin:0; font-size:15px; line-height:1.65;">
+                      Estimado/a:
+                    </p>
+                    <p style="margin:16px 0 0 0; font-size:15px; line-height:1.65; color:#374151;">
+                      Adjuntamos el documento
+                      <strong>{escapar(titulo)}</strong>
+                      para su revisión y firma.
+                    </p>
+                    <p style="margin:10px 0 0 0; font-size:15px; line-height:1.65; color:#374151;">
+                      El archivo PDF se encuentra adjunto a este mensaje.
+                    </p>
+
+                    <div style="
+                        margin-top:24px;
+                        border:1px solid #e5e7eb;
+                        border-radius:8px;
+                        overflow:hidden;
+                    ">
+                      <div style="
+                          padding:12px 16px;
+                          background:#f9fafb;
+                          color:#111827;
+                          font-size:14px;
+                          font-weight:700;
+                      ">Resumen del documento</div>
+                      <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+                             style="width:100%; border-collapse:collapse;">
+                        {filas_html}
+                      </table>
+                    </div>
+
+                    {bloque_mensaje}
+                    {bloque_adicional}
+
+                    <div style="
+                        margin-top:22px;
+                        padding:17px 18px;
+                        background:#eef2ff;
+                        border:1px solid #c7d2fe;
+                        border-radius:8px;
+                    ">
+                      <div style="
+                          margin-bottom:10px;
+                          color:#3730a3;
+                          font-size:14px;
+                          font-weight:700;
+                      ">¿Qué debe hacer?</div>
+                      <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                        <tr>
+                          <td style="padding:4px 8px 4px 0; width:24px; color:#4338ca; font-weight:700; vertical-align:top;">1.</td>
+                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Revisar el archivo PDF adjunto.</td>
+                        </tr>
+                        <tr>
+                          <td style="padding:4px 8px 4px 0; width:24px; color:#4338ca; font-weight:700; vertical-align:top;">2.</td>
+                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Firmar el documento.</td>
+                        </tr>
+                        <tr>
+                          <td style="padding:4px 8px 4px 0; width:24px; color:#4338ca; font-weight:700; vertical-align:top;">3.</td>
+                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Responder este mismo correo adjuntando el PDF firmado.</td>
+                        </tr>
+                      </table>
+                    </div>
+
+                    <p style="margin:26px 0 0 0; font-size:15px; color:#374151;">
+                      Saludos.
+                    </p>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="
+                      padding:16px 28px;
+                      background:#f9fafb;
+                      border-top:1px solid #e5e7eb;
+                      color:#6b7280;
+                      font-size:12px;
+                      line-height:1.55;
+                  ">
+                    Este correo fue generado automáticamente por
+                    <strong>{escapar(NOMBRE_APLICACION)}</strong>.<br>
+                    Puede responder directamente a este mensaje con el documento firmado.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+    """
+
+    return asunto, cuerpo_texto, cuerpo_html
+
+
 def enviar_email_con_pdf(
     gmail_service: Any,
     destinatarios: list[str],
@@ -3585,6 +3928,7 @@ def enviar_email_con_pdf(
     pdf_bytes: bytes,
     pdf_nombre: str,
     reply_to: str = "",
+    cuerpo_html: str = "",
 ) -> dict[str, str]:
     mensaje = EmailMessage()
     mensaje["To"] = ", ".join(destinatarios)
@@ -3595,6 +3939,9 @@ def enviar_email_con_pdf(
         mensaje["Reply-To"] = reply_to
 
     mensaje.set_content(cuerpo)
+    if cuerpo_html:
+        mensaje.add_alternative(cuerpo_html, subtype="html")
+
     mensaje.add_attachment(
         pdf_bytes,
         maintype="application",
@@ -3621,8 +3968,6 @@ def enviar_email_con_pdf(
         "message_id": message_id,
         "thread_id": texto(respuesta.get("threadId")),
     }
-
-
 
 # -----------------------------------------------------------------------------
 # Notificaciones internas por email - Fases 2 y 3
@@ -4116,7 +4461,8 @@ def construir_email_notificacion(
         "Cierre": "Proceso documental",
     }[tipo_notificacion]
 
-    asunto = f"[{prefijo}] {titulo}"
+    # El asunto debe ser idéntico para todas las notificaciones del documento.
+    asunto = f"Seguimiento documental — {titulo}"
 
     comentario_texto = (
         comentario_principal
@@ -4388,6 +4734,68 @@ def crear_notificacion_pendiente(
     return fila, True
 
 
+def construir_rfc_message_id_notificacion(
+    id_notificacion: str,
+) -> str:
+    """Genera un Message-ID RFC estable para una notificación."""
+    identificador = re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "-",
+        texto(id_notificacion),
+    ).strip("-")
+    if not identificador:
+        raise ValueError("ID_NOTIFICACION vacío para construir Message-ID")
+
+    dominio = "gmail.com"
+    if "@" in GMAIL_SENDER_EMAIL:
+        dominio = GMAIL_SENDER_EMAIL.rsplit("@", 1)[1].lower()
+
+    return f"<notificacion-{identificador}@{dominio}>"
+
+
+def buscar_ultima_notificacion_hilo(
+    *,
+    id_documento: str,
+    destinatario_email: str,
+    asunto: str,
+    id_notificacion_excluir: str,
+) -> dict[str, Any] | None:
+    """
+    Busca el último mensaje enviado del mismo documento, destinatario y asunto.
+
+    Solo considera asuntos del nuevo formato. Esto evita intentar enlazar los
+    correos históricos que fueron enviados antes de incorporar Message-ID.
+    """
+    selector = (
+        f"FILTER({TABLA_NOTIFICACIONES}, "
+        f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)})"
+    )
+    filas = appsheet_find(TABLA_NOTIFICACIONES, selector)
+
+    email_objetivo = texto(destinatario_email).lower()
+    candidatas = [
+        fila
+        for fila in filas
+        if texto(fila.get("ID_NOTIFICACION")) != id_notificacion_excluir
+        and texto(fila.get("DESTINATARIO_EMAIL")).lower() == email_objetivo
+        and texto(fila.get("ESTADO_ENVIO")) == "Enviada"
+        and texto(fila.get("ASUNTO")) == asunto
+        and texto(fila.get("GMAIL_THREAD_ID"))
+    ]
+
+    if not candidatas:
+        return None
+
+    candidatas.sort(
+        key=lambda fila: (
+            parsear_fecha_appsheet(fila.get("FECHA_ENVIO")),
+            texto(fila.get("ID_NOTIFICACION")),
+        ),
+        reverse=True,
+    )
+    return candidatas[0]
+
+
 def enviar_email_notificacion(
     *,
     gmail_service: Any,
@@ -4395,6 +4803,9 @@ def enviar_email_notificacion(
     asunto: str,
     cuerpo_texto: str,
     cuerpo_html: str,
+    rfc_message_id: str,
+    thread_id: str = "",
+    in_reply_to: str = "",
 ) -> dict[str, str]:
     email = texto(destinatario).lower()
     if not _EMAIL_RE.fullmatch(email):
@@ -4406,6 +4817,15 @@ def enviar_email_notificacion(
     mensaje["To"] = email
     mensaje["From"] = GMAIL_SENDER_EMAIL
     mensaje["Subject"] = asunto
+    mensaje["Message-ID"] = rfc_message_id
+
+    # Gmail exige threadId, In-Reply-To, References y asunto coincidente para
+    # incorporar el mensaje a una conversación existente.
+    usar_hilo = bool(thread_id and in_reply_to)
+    if usar_hilo:
+        mensaje["In-Reply-To"] = in_reply_to
+        mensaje["References"] = in_reply_to
+
     mensaje.set_content(cuerpo_texto)
     mensaje.add_alternative(cuerpo_html, subtype="html")
 
@@ -4413,12 +4833,16 @@ def enviar_email_notificacion(
         mensaje.as_bytes()
     ).decode("ascii")
 
+    body_gmail: dict[str, str] = {"raw": raw}
+    if usar_hilo:
+        body_gmail["threadId"] = thread_id
+
     respuesta = (
         gmail_service.users()
         .messages()
         .send(
             userId="me",
-            body={"raw": raw},
+            body=body_gmail,
         )
         .execute()
     )
@@ -4432,8 +4856,8 @@ def enviar_email_notificacion(
     return {
         "message_id": message_id,
         "thread_id": texto(respuesta.get("threadId")),
+        "rfc_message_id": rfc_message_id,
     }
-
 
 def marcar_notificacion_enviada(
     *,
@@ -4613,6 +5037,30 @@ def procesar_notificacion_individual(
                 ),
             }
 
+        rfc_message_id = construir_rfc_message_id_notificacion(
+            id_notificacion
+        )
+        notificacion_anterior = buscar_ultima_notificacion_hilo(
+            id_documento=id_documento,
+            destinatario_email=email,
+            asunto=asunto,
+            id_notificacion_excluir=id_notificacion,
+        )
+
+        thread_id_anterior = ""
+        in_reply_to = ""
+        if notificacion_anterior:
+            thread_id_anterior = texto(
+                notificacion_anterior.get("GMAIL_THREAD_ID")
+            )
+            id_notificacion_anterior = texto(
+                notificacion_anterior.get("ID_NOTIFICACION")
+            )
+            if id_notificacion_anterior:
+                in_reply_to = construir_rfc_message_id_notificacion(
+                    id_notificacion_anterior
+                )
+
         gmail_service = obtener_gmail_service()
         respuesta_gmail = enviar_email_notificacion(
             gmail_service=gmail_service,
@@ -4620,6 +5068,9 @@ def procesar_notificacion_individual(
             asunto=asunto,
             cuerpo_texto=cuerpo_texto,
             cuerpo_html=cuerpo_html,
+            rfc_message_id=rfc_message_id,
+            thread_id=thread_id_anterior,
+            in_reply_to=in_reply_to,
         )
 
         marcar_notificacion_enviada(
@@ -6220,44 +6671,13 @@ def enviar_firma():
         plantilla = buscar_plantilla(id_plantilla)
 
         fecha_envio = ahora_iso()
-        variables = {
-            "TITULO": texto(documento.get("TITULO")),
-            "TIPO_DOCUMENTO": texto(
-                documento.get("TIPO_DOCUMENTO")
-            ),
-            "ID_PROYECTO": texto(documento.get("ID_PROYECTO")),
-            "ENVIADO_POR": usuario,
-            "FECHA_ENVIO": fecha_envio,
-        }
-
-        asunto_base = texto(plantilla.get("ASUNTO_EMAIL_FIRMA"))
-        cuerpo_base = texto(plantilla.get("CUERPO_EMAIL_FIRMA"))
-
-        if not asunto_base:
-            asunto_base = "Documento para firma: {{TITULO}}"
-        if not cuerpo_base:
-            cuerpo_base = (
-                "Estimado/a:\n\n"
-                "Adjuntamos el documento {{TITULO}} para su firma.\n\n"
-                "Una vez firmado, agradeceremos devolver el archivo PDF "
-                "respondiendo a este correo.\n\n"
-                "Saludos."
-            )
-
-        asunto = reemplazar_variables_email(
-            asunto_base,
-            variables,
-        ).strip()
-        cuerpo = reemplazar_variables_email(
-            cuerpo_base,
-            variables,
-        ).strip()
-
-        if mensaje_adicional:
-            cuerpo += (
-                "\n\nIndicaciones adicionales:\n"
-                + mensaje_adicional
-            )
+        asunto, cuerpo, cuerpo_html = construir_email_firma_externo(
+            documento=documento,
+            plantilla=plantilla,
+            usuario=usuario,
+            mensaje_adicional=mensaje_adicional,
+            fecha_envio=fecha_envio,
+        )
 
         marcar_envio_firma_en_proceso(
             id_documento=id_documento,
@@ -6279,6 +6699,7 @@ def enviar_firma():
             pdf_bytes=pdf_bytes,
             pdf_nombre=pdf_nombre,
             reply_to=usuario,
+            cuerpo_html=cuerpo_html,
         )
         correo_enviado = True
         message_id = respuesta_gmail["message_id"]
