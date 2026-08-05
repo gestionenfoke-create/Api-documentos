@@ -7,15 +7,17 @@ import os
 import re
 import traceback
 import uuid
+import time
 from datetime import datetime
 from email.message import EmailMessage
+from functools import wraps
 from typing import Any
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -23,6 +25,56 @@ from googleapiclient.http import MediaInMemoryUpload
 
 
 app = Flask(__name__)
+
+
+def medir_operacion(nombre: str):
+    """Registra en Cloud Run la duración de una operación externa o costosa."""
+
+    def decorador(func):
+        @wraps(func)
+        def envoltura(*args, **kwargs):
+            inicio = time.perf_counter()
+            estado = "ok"
+            try:
+                return func(*args, **kwargs)
+            except Exception:
+                estado = "error"
+                raise
+            finally:
+                duracion_ms = (time.perf_counter() - inicio) * 1000
+                app.logger.info(
+                    "TIEMPO operacion=%s estado=%s duracion_ms=%.1f",
+                    nombre,
+                    estado,
+                    duracion_ms,
+                )
+
+        return envoltura
+
+    return decorador
+
+
+@app.before_request
+def iniciar_medicion_solicitud() -> None:
+    g.inicio_solicitud = time.perf_counter()
+
+
+@app.after_request
+def finalizar_medicion_solicitud(response):
+    inicio = getattr(g, "inicio_solicitud", None)
+    if inicio is None:
+        return response
+
+    duracion_ms = (time.perf_counter() - inicio) * 1000
+    app.logger.info(
+        "TIEMPO endpoint=%s metodo=%s status=%s duracion_ms=%.1f",
+        request.path,
+        request.method,
+        response.status_code,
+        duracion_ms,
+    )
+    response.headers["Server-Timing"] = f"total;dur={duracion_ms:.1f}"
+    return response
 
 
 # -----------------------------------------------------------------------------
@@ -98,6 +150,11 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/gmail.send",
 ]
+
+DOCX_MIME_TYPE = (
+    "application/"
+    "vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
 
 GMAIL_SENDER_EMAIL = os.environ.get(
     "GMAIL_SENDER_EMAIL",
@@ -274,6 +331,7 @@ def validar_token() -> None:
 # -----------------------------------------------------------------------------
 
 
+@medir_operacion("google.oauth.refresh")
 def obtener_google_credentials() -> Credentials:
     credentials = Credentials(
         token=None,
@@ -306,6 +364,7 @@ def obtener_gmail_service():
     )
 
 
+@medir_operacion("drive.copiar_plantilla")
 def copiar_plantilla(
     drive_service: Any,
     template_id: str,
@@ -341,6 +400,7 @@ def copiar_plantilla(
     }
 
 
+@medir_operacion("drive.asegurar_permiso")
 def asegurar_permiso_rol(
     drive_service: Any,
     file_id: str,
@@ -429,6 +489,7 @@ def escapar_consulta_drive(valor: str) -> str:
     return valor.replace("\\", "\\\\").replace("'", "\\'")
 
 
+@medir_operacion("drive.buscar_archivo")
 def buscar_archivo_en_carpeta(
     drive_service: Any,
     folder_id: str,
@@ -553,11 +614,33 @@ def appsheet_action(
         "Rows": rows or [],
     }
 
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=90,
+    inicio_appsheet = time.perf_counter()
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=90,
+        )
+    except Exception:
+        app.logger.info(
+            "TIEMPO servicio=appsheet tabla=%s accion=%s filas=%s "
+            "estado=error duracion_ms=%.1f",
+            table_name,
+            action,
+            len(rows or []),
+            (time.perf_counter() - inicio_appsheet) * 1000,
+        )
+        raise
+
+    app.logger.info(
+        "TIEMPO servicio=appsheet tabla=%s accion=%s filas=%s "
+        "status=%s duracion_ms=%.1f",
+        table_name,
+        action,
+        len(rows or []),
+        response.status_code,
+        (time.perf_counter() - inicio_appsheet) * 1000,
     )
 
     if response.status_code != 200:
@@ -1717,6 +1800,7 @@ def enviar_revision():
 # -----------------------------------------------------------------------------
 
 
+@medir_operacion("drive.exportar_pdf_y_guardar")
 def exportar_pdf_o_reutilizar(
     drive_service: Any,
     google_doc_id: str,
@@ -3537,6 +3621,7 @@ def reemplazar_variables_email(
     return resultado
 
 
+@medir_operacion("drive.descargar_pdf")
 def descargar_pdf_drive(
     drive_service: Any,
     file_id: str,
@@ -3573,6 +3658,40 @@ def descargar_pdf_drive(
     nombre = texto(metadata.get("name")) or "documento_para_firma.pdf"
     if not nombre.lower().endswith(".pdf"):
         nombre += ".pdf"
+
+    return contenido, nombre
+
+
+@medir_operacion("drive.exportar_docx")
+def exportar_docx_drive(
+    drive_service: Any,
+    google_doc_id: str,
+    nombre_base: str,
+) -> tuple[bytes, str]:
+    """Exporta el Google Docs vigente a Microsoft Word sin guardarlo en Drive."""
+    if not google_doc_id:
+        raise ValueError("No se indicó GOOGLE_DOC_ID para exportar el DOCX")
+
+    contenido = (
+        drive_service.files()
+        .export(
+            fileId=google_doc_id,
+            mimeType=DOCX_MIME_TYPE,
+        )
+        .execute()
+    )
+
+    if not isinstance(contenido, bytes) or not contenido:
+        raise RuntimeError("Google Drive devolvió un DOCX vacío")
+
+    nombre_sin_extension = re.sub(
+        r"(?i)\.(pdf|docx)$",
+        "",
+        texto(nombre_base),
+    )
+    nombre = limpiar_nombre_archivo(
+        nombre_sin_extension or "documento_para_firma"
+    ) + ".docx"
 
     return contenido, nombre
 
@@ -3683,8 +3802,8 @@ def construir_email_firma_externo(
         [
             "",
             "¿QUÉ DEBE HACER?",
-            "1. Revisar el archivo PDF adjunto.",
-            "2. Firmar el documento.",
+            "1. Revisar los archivos PDF y Word adjuntos.",
+            "2. Firmar el documento utilizando el archivo PDF.",
             "3. Responder este mismo correo adjuntando el PDF firmado.",
             "",
             f"Este correo fue generado por {NOMBRE_APLICACION}.",
@@ -3835,7 +3954,7 @@ def construir_email_firma_externo(
                       para su revisión y firma.
                     </p>
                     <p style="margin:10px 0 0 0; font-size:15px; line-height:1.65; color:#374151;">
-                      El archivo PDF se encuentra adjunto a este mensaje.
+                      Se adjuntan el PDF para firma y una copia editable en formato Microsoft Word.
                     </p>
 
                     <div style="
@@ -3876,11 +3995,11 @@ def construir_email_firma_externo(
                       <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
                         <tr>
                           <td style="padding:4px 8px 4px 0; width:24px; color:#4338ca; font-weight:700; vertical-align:top;">1.</td>
-                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Revisar el archivo PDF adjunto.</td>
+                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Revisar los archivos PDF y Word adjuntos.</td>
                         </tr>
                         <tr>
                           <td style="padding:4px 8px 4px 0; width:24px; color:#4338ca; font-weight:700; vertical-align:top;">2.</td>
-                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Firmar el documento.</td>
+                          <td style="padding:4px 0; color:#374151; font-size:14px; line-height:1.5;">Firmar el documento utilizando el archivo PDF.</td>
                         </tr>
                         <tr>
                           <td style="padding:4px 8px 4px 0; width:24px; color:#4338ca; font-weight:700; vertical-align:top;">3.</td>
@@ -3920,6 +4039,7 @@ def construir_email_firma_externo(
     return asunto, cuerpo_texto, cuerpo_html
 
 
+@medir_operacion("gmail.enviar_firma_externa")
 def enviar_email_con_pdf(
     gmail_service: Any,
     destinatarios: list[str],
@@ -3927,6 +4047,8 @@ def enviar_email_con_pdf(
     cuerpo: str,
     pdf_bytes: bytes,
     pdf_nombre: str,
+    docx_bytes: bytes,
+    docx_nombre: str,
     reply_to: str = "",
     cuerpo_html: str = "",
 ) -> dict[str, str]:
@@ -3947,6 +4069,15 @@ def enviar_email_con_pdf(
         maintype="application",
         subtype="pdf",
         filename=pdf_nombre,
+    )
+    mensaje.add_attachment(
+        docx_bytes,
+        maintype="application",
+        subtype=(
+            "vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        filename=docx_nombre,
     )
 
     raw = base64.urlsafe_b64encode(mensaje.as_bytes()).decode("ascii")
@@ -4796,6 +4927,7 @@ def buscar_ultima_notificacion_hilo(
     return candidatas[0]
 
 
+@medir_operacion("gmail.enviar_notificacion_interna")
 def enviar_email_notificacion(
     *,
     gmail_service: Any,
@@ -6540,6 +6672,7 @@ def crear_evento_enviado_firma(
     fecha: str,
     destinatarios: list[str],
     pdf_nombre: str,
+    docx_nombre: str,
     message_id: str,
 ) -> None:
     appsheet_action(
@@ -6557,7 +6690,7 @@ def crear_evento_enviado_firma(
                 "USUARIO": usuario,
                 "FECHA_EVENTO": fecha,
                 "COMENTARIO": (
-                    f"Se envió {pdf_nombre} a "
+                    f"Se enviaron {pdf_nombre} y {docx_nombre} a "
                     f"{', '.join(destinatarios)}. "
                     f"Gmail message ID: {message_id}."
                 ),
@@ -6631,9 +6764,14 @@ def enviar_firma():
             )
 
         pdf_id = texto(documento.get("PDF_PARA_FIRMA_ID"))
+        google_doc_id = texto(documento.get("GOOGLE_DOC_ID"))
         id_version = texto(documento.get("ID_VERSION_ACTUAL"))
         if not pdf_id:
             raise ValueError("Documentos no tiene PDF_PARA_FIRMA_ID")
+        if not google_doc_id:
+            raise ValueError(
+                "Documentos no tiene GOOGLE_DOC_ID para exportar el DOCX"
+            )
         if not id_version:
             raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
 
@@ -6690,6 +6828,11 @@ def enviar_firma():
             drive_service=drive_service,
             file_id=pdf_id,
         )
+        docx_bytes, docx_nombre = exportar_docx_drive(
+            drive_service=drive_service,
+            google_doc_id=google_doc_id,
+            nombre_base=pdf_nombre,
+        )
 
         respuesta_gmail = enviar_email_con_pdf(
             gmail_service=gmail_service,
@@ -6698,6 +6841,8 @@ def enviar_firma():
             cuerpo=cuerpo,
             pdf_bytes=pdf_bytes,
             pdf_nombre=pdf_nombre,
+            docx_bytes=docx_bytes,
+            docx_nombre=docx_nombre,
             reply_to=usuario,
             cuerpo_html=cuerpo_html,
         )
@@ -6723,6 +6868,7 @@ def enviar_firma():
                 fecha=fecha_envio,
                 destinatarios=destinatarios,
                 pdf_nombre=pdf_nombre,
+                docx_nombre=docx_nombre,
                 message_id=message_id,
             )
         except Exception as exc_evento:
@@ -6743,6 +6889,8 @@ def enviar_firma():
                 "destinatarios": destinatarios,
                 "pdf_id": pdf_id,
                 "pdf_nombre": pdf_nombre,
+                "google_doc_id": google_doc_id,
+                "docx_nombre": docx_nombre,
                 "advertencias": advertencias,
             }
         )
