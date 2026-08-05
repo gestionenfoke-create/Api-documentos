@@ -4431,6 +4431,7 @@ def formatear_fecha_historial(valor: Any) -> str:
 def construir_historial_comentarios(
     id_documento: str,
     id_evento_excluir: str = "",
+    mapa_nombres: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """
     Construye una versión resumida del historial para los emails.
@@ -4444,9 +4445,10 @@ def construir_historial_comentarios(
     """
     eventos = buscar_eventos_documento(id_documento)
 
-    mapa_nombres = construir_mapa_nombres_usuarios(
-        id_documento=id_documento,
-    )
+    if mapa_nombres is None:
+        mapa_nombres = construir_mapa_nombres_usuarios(
+            id_documento=id_documento,
+        )
 
     eventos_relevantes: list[dict[str, Any]] = []
 
@@ -5307,7 +5309,7 @@ def procesar_notificacion_individual(
         }
 
 
-def notificar_destinatarios_internos(
+def notificar_destinatarios_internos_legacy(
     *,
     documento: dict[str, Any],
     evento: dict[str, Any],
@@ -5376,6 +5378,585 @@ def notificar_destinatarios_internos(
         )
 
     return resultados
+
+
+
+def construir_mapa_nombres_desde_aprobadores(
+    aprobadores: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Construye el mapa de nombres sin consultar nuevamente AppSheet."""
+    mapa: dict[str, str] = {}
+
+    for fila in aprobadores:
+        nombre = texto(fila.get("NOMBRE")).strip()
+        if not nombre:
+            continue
+
+        for columna_email in ("APROBADOR", "Aprobador_v"):
+            email = texto(fila.get(columna_email)).strip().lower()
+            if email:
+                mapa[email] = nombre
+
+    if GMAIL_SENDER_EMAIL:
+        mapa.setdefault(
+            GMAIL_SENDER_EMAIL.strip().lower(),
+            NOMBRE_APLICACION,
+        )
+
+    return mapa
+
+
+def buscar_notificaciones_documento(
+    id_documento: str,
+) -> list[dict[str, Any]]:
+    """Obtiene una sola vez todas las notificaciones del documento."""
+    selector = (
+        f"FILTER({TABLA_NOTIFICACIONES}, "
+        f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)})"
+    )
+    return appsheet_find(TABLA_NOTIFICACIONES, selector)
+
+
+def seleccionar_ultima_notificacion_hilo_en_memoria(
+    *,
+    filas: list[dict[str, Any]],
+    destinatario_email: str,
+    asunto: str,
+    id_notificacion_excluir: str,
+) -> dict[str, Any] | None:
+    """Busca el hilo anterior usando las filas ya cargadas en memoria."""
+    email_objetivo = texto(destinatario_email).lower()
+    candidatas = [
+        fila
+        for fila in filas
+        if texto(fila.get("ID_NOTIFICACION"))
+        != id_notificacion_excluir
+        and texto(fila.get("DESTINATARIO_EMAIL")).lower()
+        == email_objetivo
+        and texto(fila.get("ESTADO_ENVIO")) == "Enviada"
+        and texto(fila.get("ASUNTO")) == asunto
+        and texto(fila.get("GMAIL_THREAD_ID"))
+    ]
+
+    if not candidatas:
+        return None
+
+    candidatas.sort(
+        key=lambda fila: (
+            parsear_fecha_appsheet(fila.get("FECHA_ENVIO")),
+            texto(fila.get("ID_NOTIFICACION")),
+        ),
+        reverse=True,
+    )
+    return candidatas[0]
+
+
+def construir_fila_notificacion_pendiente(
+    *,
+    id_evento: str,
+    id_documento: str,
+    id_version: str,
+    aprobador: dict[str, Any],
+    tipo_notificacion: str,
+    asunto: str,
+    cuerpo: str,
+    link_documento: str,
+    link_appsheet: str,
+    clave_idempotencia: str,
+) -> dict[str, Any]:
+    """Prepara una fila para agregarla junto con las demás en un solo Add."""
+    return {
+        "ID_NOTIFICACION": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_EVENTO": id_evento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": texto(
+            aprobador.get("ID_APROBACION_ACTUAL")
+        ),
+        "DESTINATARIO_EMAIL": obtener_email_notificacion(aprobador),
+        "DESTINATARIO_NOMBRE": texto(aprobador.get("NOMBRE")),
+        "ORDEN_DESTINATARIO": aprobador.get("ORDEN", ""),
+        "ROL_DESTINATARIO": texto(aprobador.get("ROL_FLUJO")),
+        "TIPO_NOTIFICACION": tipo_notificacion,
+        "ASUNTO": asunto,
+        "CUERPO": cuerpo,
+        "LINK_DOCUMENTO": link_documento,
+        "LINK_APPSHEET": link_appsheet,
+        "ESTADO_ENVIO": "Pendiente",
+        "INTENTOS": 0,
+        "FECHA_CREACION": ahora_iso(),
+        "CLAVE_IDEMPOTENCIA": clave_idempotencia,
+    }
+
+
+def notificar_destinatarios_internos_optimizado(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    destinatarios: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Envía las notificaciones internas reduciendo llamadas a AppSheet.
+
+    Optimiza cuatro puntos sin alterar el flujo documental:
+    - historial y enlace AppSheet calculados una sola vez;
+    - una sola lectura de Documento_Notificaciones;
+    - un Add y un Edit por lote para las notificaciones;
+    - un solo servicio Gmail y un solo Edit final de Documentos.
+    """
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_evento = texto(evento.get("ID_EVENTO"))
+    id_version = (
+        texto(evento.get("ID_VERSION"))
+        or texto(documento.get("ID_VERSION_ACTUAL"))
+    )
+
+    resultados_por_indice: dict[int, dict[str, Any]] = {}
+    especificaciones_validas: list[dict[str, Any]] = []
+    correos_procesados: set[str] = set()
+    aprobadores_contexto: list[dict[str, Any]] = []
+
+    for indice, especificacion in enumerate(destinatarios):
+        aprobador = especificacion.get("aprobador")
+        if not isinstance(aprobador, dict):
+            resultados_por_indice[indice] = {
+                "ok": False,
+                "omitida": True,
+                "error": "Especificación sin aprobador válido.",
+            }
+            continue
+
+        aprobadores_contexto.append(aprobador)
+        email = obtener_email_notificacion(aprobador)
+        tipo_notificacion = texto(
+            especificacion.get("tipo_notificacion")
+        )
+
+        if not email:
+            resultados_por_indice[indice] = {
+                "ok": False,
+                "omitida": True,
+                "destinatario": "",
+                "tipo_notificacion": tipo_notificacion,
+                "mensaje": (
+                    "El responsable no tiene Aprobador_v para enviar "
+                    "la notificación."
+                ),
+            }
+            continue
+
+        if not _EMAIL_RE.fullmatch(email):
+            resultados_por_indice[indice] = {
+                "ok": False,
+                "omitida": True,
+                "destinatario": email,
+                "tipo_notificacion": tipo_notificacion,
+                "mensaje": "Correo interno inválido.",
+            }
+            continue
+
+        if email in correos_procesados:
+            continue
+
+        correos_procesados.add(email)
+        especificaciones_validas.append(
+            {
+                "indice": indice,
+                "especificacion": especificacion,
+                "aprobador": aprobador,
+                "email": email,
+                "tipo_notificacion": tipo_notificacion,
+            }
+        )
+
+    if not especificaciones_validas:
+        return [
+            resultados_por_indice[indice]
+            for indice in sorted(resultados_por_indice)
+        ]
+
+    try:
+        link_appsheet = construir_link_appsheet(id_documento)
+        mapa_nombres = construir_mapa_nombres_desde_aprobadores(
+            aprobadores_contexto
+        )
+        historial_texto, historial_html = construir_historial_comentarios(
+            id_documento=id_documento,
+            id_evento_excluir=id_evento,
+            mapa_nombres=mapa_nombres,
+        )
+        notificaciones_existentes = buscar_notificaciones_documento(
+            id_documento
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        for item in especificaciones_validas:
+            resultados_por_indice[item["indice"]] = {
+                "ok": False,
+                "omitida": False,
+                "destinatario": item["email"],
+                "tipo_notificacion": item["tipo_notificacion"],
+                "error": str(exc),
+            }
+        return [
+            resultados_por_indice[indice]
+            for indice in sorted(resultados_por_indice)
+        ]
+
+    notificaciones_por_clave: dict[str, list[dict[str, Any]]] = {}
+    for fila in notificaciones_existentes:
+        clave = texto(fila.get("CLAVE_IDEMPOTENCIA"))
+        if clave:
+            notificaciones_por_clave.setdefault(clave, []).append(fila)
+
+    nuevas_filas: list[dict[str, Any]] = []
+    preparadas: list[dict[str, Any]] = []
+
+    for item in especificaciones_validas:
+        indice = item["indice"]
+        especificacion = item["especificacion"]
+        aprobador = item["aprobador"]
+        email = item["email"]
+        tipo_notificacion = item["tipo_notificacion"]
+
+        link_documento = (
+            normalizar_url_appsheet(
+                especificacion.get("link_documento")
+            )
+            if tipo_notificacion == "Acción requerida"
+            else ""
+        )
+
+        try:
+            asunto, cuerpo_texto, cuerpo_html = construir_email_notificacion(
+                documento=documento,
+                destinatario=aprobador,
+                tipo_notificacion=tipo_notificacion,
+                movimiento=texto(especificacion.get("movimiento")),
+                comentario_principal=texto(
+                    especificacion.get("comentario_principal")
+                ),
+                historial_texto=historial_texto,
+                historial_html=historial_html,
+                link_documento=link_documento,
+                link_appsheet=link_appsheet,
+            )
+            clave = construir_clave_idempotencia(
+                id_evento=id_evento,
+                email=email,
+                tipo_notificacion=tipo_notificacion,
+            )
+        except Exception as exc:
+            resultados_por_indice[indice] = {
+                "ok": False,
+                "omitida": False,
+                "destinatario": email,
+                "tipo_notificacion": tipo_notificacion,
+                "error": str(exc),
+            }
+            continue
+
+        coincidencias = notificaciones_por_clave.get(clave, [])
+        if len(coincidencias) > 1:
+            resultados_por_indice[indice] = {
+                "ok": False,
+                "omitida": True,
+                "destinatario": email,
+                "tipo_notificacion": tipo_notificacion,
+                "error": (
+                    "Existen varias notificaciones con la misma "
+                    "CLAVE_IDEMPOTENCIA."
+                ),
+            }
+            continue
+
+        creada = not coincidencias
+        if creada:
+            notificacion = construir_fila_notificacion_pendiente(
+                id_evento=id_evento,
+                id_documento=id_documento,
+                id_version=id_version,
+                aprobador=aprobador,
+                tipo_notificacion=tipo_notificacion,
+                asunto=asunto,
+                cuerpo=cuerpo_texto,
+                link_documento=link_documento,
+                link_appsheet=link_appsheet,
+                clave_idempotencia=clave,
+            )
+            nuevas_filas.append(notificacion)
+            notificaciones_por_clave[clave] = [notificacion]
+        else:
+            notificacion = coincidencias[0]
+
+        estado_existente = texto(notificacion.get("ESTADO_ENVIO"))
+        id_notificacion = texto(
+            notificacion.get("ID_NOTIFICACION")
+        )
+        try:
+            intentos = entero(
+                notificacion.get("INTENTOS") or 0,
+                "INTENTOS",
+            )
+        except ValueError:
+            intentos = 0
+
+        if not creada and estado_existente == "Enviada":
+            resultados_por_indice[indice] = {
+                "ok": True,
+                "omitida": True,
+                "duplicada": True,
+                "id_notificacion": id_notificacion,
+                "destinatario": email,
+                "mensaje": "La notificación ya había sido enviada.",
+            }
+            continue
+
+        if (
+            not creada
+            and estado_existente
+            not in ESTADOS_NOTIFICACION_REINTENTABLES
+        ):
+            resultados_por_indice[indice] = {
+                "ok": False,
+                "omitida": True,
+                "id_notificacion": id_notificacion,
+                "destinatario": email,
+                "mensaje": (
+                    "La notificación existente no permite reintento. "
+                    f"Estado: {estado_existente!r}"
+                ),
+            }
+            continue
+
+        preparadas.append(
+            {
+                **item,
+                "notificacion": notificacion,
+                "creada": creada,
+                "id_notificacion": id_notificacion,
+                "intentos": intentos,
+                "asunto": asunto,
+                "cuerpo_texto": cuerpo_texto,
+                "cuerpo_html": cuerpo_html,
+            }
+        )
+
+    if nuevas_filas:
+        try:
+            appsheet_action(
+                TABLA_NOTIFICACIONES,
+                "Add",
+                nuevas_filas,
+            )
+            notificaciones_existentes.extend(nuevas_filas)
+        except Exception as exc:
+            traceback.print_exc()
+            ids_nuevos = {
+                texto(fila.get("ID_NOTIFICACION"))
+                for fila in nuevas_filas
+            }
+            preparadas_restantes: list[dict[str, Any]] = []
+            for item in preparadas:
+                if item["id_notificacion"] in ids_nuevos:
+                    resultados_por_indice[item["indice"]] = {
+                        "ok": False,
+                        "omitida": False,
+                        "destinatario": item["email"],
+                        "tipo_notificacion": item[
+                            "tipo_notificacion"
+                        ],
+                        "error": (
+                            "No fue posible crear la notificación en "
+                            f"AppSheet: {exc}"
+                        ),
+                    }
+                else:
+                    preparadas_restantes.append(item)
+            preparadas = preparadas_restantes
+
+    if not preparadas:
+        return [
+            resultados_por_indice[indice]
+            for indice in sorted(resultados_por_indice)
+        ]
+
+    filas_estado: list[dict[str, Any]] = []
+    ultimo_envio_exitoso: dict[str, str] | None = None
+
+    try:
+        gmail_service = obtener_gmail_service()
+    except Exception as exc:
+        traceback.print_exc()
+        gmail_service = None
+        for item in preparadas:
+            filas_estado.append(
+                {
+                    "ID_NOTIFICACION": item["id_notificacion"],
+                    "ESTADO_ENVIO": "Error",
+                    "INTENTOS": item["intentos"] + 1,
+                    "ERROR_ENVIO": texto(str(exc))[:1500],
+                }
+            )
+            resultados_por_indice[item["indice"]] = {
+                "ok": False,
+                "omitida": False,
+                "destinatario": item["email"],
+                "tipo_notificacion": item["tipo_notificacion"],
+                "error": str(exc),
+            }
+
+    if gmail_service is not None:
+        for item in preparadas:
+            id_notificacion = item["id_notificacion"]
+            email = item["email"]
+            tipo_notificacion = item["tipo_notificacion"]
+            intentos = item["intentos"]
+
+            notificacion_anterior = (
+                seleccionar_ultima_notificacion_hilo_en_memoria(
+                    filas=notificaciones_existentes,
+                    destinatario_email=email,
+                    asunto=item["asunto"],
+                    id_notificacion_excluir=id_notificacion,
+                )
+            )
+
+            thread_id_anterior = ""
+            in_reply_to = ""
+            if notificacion_anterior:
+                thread_id_anterior = texto(
+                    notificacion_anterior.get("GMAIL_THREAD_ID")
+                )
+                id_notificacion_anterior = texto(
+                    notificacion_anterior.get("ID_NOTIFICACION")
+                )
+                if id_notificacion_anterior:
+                    in_reply_to = (
+                        construir_rfc_message_id_notificacion(
+                            id_notificacion_anterior
+                        )
+                    )
+
+            try:
+                respuesta_gmail = enviar_email_notificacion(
+                    gmail_service=gmail_service,
+                    destinatario=email,
+                    asunto=item["asunto"],
+                    cuerpo_texto=item["cuerpo_texto"],
+                    cuerpo_html=item["cuerpo_html"],
+                    rfc_message_id=(
+                        construir_rfc_message_id_notificacion(
+                            id_notificacion
+                        )
+                    ),
+                    thread_id=thread_id_anterior,
+                    in_reply_to=in_reply_to,
+                )
+                fecha_envio = ahora_iso()
+                fila_estado = {
+                    "ID_NOTIFICACION": id_notificacion,
+                    "ESTADO_ENVIO": "Enviada",
+                    "INTENTOS": intentos + 1,
+                    "FECHA_ENVIO": fecha_envio,
+                    "ERROR_ENVIO": "",
+                    "GMAIL_MESSAGE_ID": respuesta_gmail[
+                        "message_id"
+                    ],
+                    "GMAIL_THREAD_ID": respuesta_gmail[
+                        "thread_id"
+                    ],
+                }
+                filas_estado.append(fila_estado)
+                item["notificacion"].update(fila_estado)
+
+                ultimo_envio_exitoso = {
+                    "message_id": respuesta_gmail["message_id"],
+                    "thread_id": respuesta_gmail["thread_id"],
+                }
+                resultados_por_indice[item["indice"]] = {
+                    "ok": True,
+                    "omitida": False,
+                    "id_notificacion": id_notificacion,
+                    "destinatario": email,
+                    "tipo_notificacion": tipo_notificacion,
+                    "message_id": respuesta_gmail["message_id"],
+                    "thread_id": respuesta_gmail["thread_id"],
+                }
+            except Exception as exc:
+                traceback.print_exc()
+                filas_estado.append(
+                    {
+                        "ID_NOTIFICACION": id_notificacion,
+                        "ESTADO_ENVIO": "Error",
+                        "INTENTOS": intentos + 1,
+                        "ERROR_ENVIO": texto(str(exc))[:1500],
+                    }
+                )
+                resultados_por_indice[item["indice"]] = {
+                    "ok": False,
+                    "omitida": False,
+                    "destinatario": email,
+                    "tipo_notificacion": tipo_notificacion,
+                    "error": str(exc),
+                }
+
+    if filas_estado:
+        try:
+            appsheet_action(
+                TABLA_NOTIFICACIONES,
+                "Edit",
+                filas_estado,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            for resultado in resultados_por_indice.values():
+                if resultado.get("id_notificacion"):
+                    resultado["advertencia_registro"] = (
+                        "El correo fue procesado, pero no se pudo actualizar "
+                        "Documento_Notificaciones: " + str(exc)
+                    )
+
+    if ultimo_envio_exitoso:
+        try:
+            actualizar_resumen_notificacion_documento(
+                id_documento=id_documento,
+                message_id=ultimo_envio_exitoso["message_id"],
+                thread_id=ultimo_envio_exitoso["thread_id"],
+            )
+        except Exception:
+            traceback.print_exc()
+
+    return [
+        resultados_por_indice[indice]
+        for indice in sorted(resultados_por_indice)
+    ]
+
+
+def notificar_destinatarios_internos(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+    destinatarios: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Selecciona la implementación optimizada o la anterior por variable."""
+    usar_lote = os.getenv(
+        "USE_BATCH_NOTIFICATIONS",
+        "true",
+    ).strip().lower() not in {"0", "false", "no", "off"}
+
+    if not usar_lote:
+        return notificar_destinatarios_internos_legacy(
+            documento=documento,
+            evento=evento,
+            destinatarios=destinatarios,
+        )
+
+    return notificar_destinatarios_internos_optimizado(
+        documento=documento,
+        evento=evento,
+        destinatarios=destinatarios,
+    )
 
 
 def buscar_evento_envio_revision_actual(
