@@ -27,6 +27,43 @@ from googleapiclient.http import MediaInMemoryUpload
 app = Flask(__name__)
 
 
+def registrar_tiempo(**campos: Any) -> None:
+    """Escribe una medición estructurada en stdout para Cloud Logging.
+
+    Se usa print(..., flush=True) para no depender del nivel INFO configurado
+    por Flask o Gunicorn. Cloud Run interpreta el JSON como jsonPayload.
+    """
+    payload: dict[str, Any] = {
+        "severity": "INFO",
+        "message": "TIEMPO",
+        "marca": "TIEMPO",
+        "fecha_chile": ahora_iso() if "ahora_iso" in globals() else "",
+        **campos,
+    }
+
+    try:
+        payload.setdefault("solicitud_id", getattr(g, "solicitud_id", ""))
+        payload.setdefault("endpoint", request.path)
+        payload.setdefault("metodo", request.method)
+
+        trace_header = request.headers.get("X-Cloud-Trace-Context", "")
+        trace_id = trace_header.split("/", 1)[0].strip()
+        project_id = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCP_PROJECT")
+            or ""
+        ).strip()
+        if trace_id and project_id:
+            payload["logging.googleapis.com/trace"] = (
+                f"projects/{project_id}/traces/{trace_id}"
+            )
+    except RuntimeError:
+        # Permite reutilizar el helper fuera de un contexto Flask.
+        pass
+
+    print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+
+
 def medir_operacion(nombre: str):
     """Registra en Cloud Run la duración de una operación externa o costosa."""
 
@@ -41,12 +78,14 @@ def medir_operacion(nombre: str):
                 estado = "error"
                 raise
             finally:
-                duracion_ms = (time.perf_counter() - inicio) * 1000
-                app.logger.info(
-                    "TIEMPO operacion=%s estado=%s duracion_ms=%.1f",
-                    nombre,
-                    estado,
-                    duracion_ms,
+                registrar_tiempo(
+                    categoria="operacion",
+                    operacion=nombre,
+                    estado=estado,
+                    duracion_ms=round(
+                        (time.perf_counter() - inicio) * 1000,
+                        1,
+                    ),
                 )
 
         return envoltura
@@ -57,6 +96,7 @@ def medir_operacion(nombre: str):
 @app.before_request
 def iniciar_medicion_solicitud() -> None:
     g.inicio_solicitud = time.perf_counter()
+    g.solicitud_id = uuid.uuid4().hex[:12]
 
 
 @app.after_request
@@ -66,14 +106,15 @@ def finalizar_medicion_solicitud(response):
         return response
 
     duracion_ms = (time.perf_counter() - inicio) * 1000
-    app.logger.info(
-        "TIEMPO endpoint=%s metodo=%s status=%s duracion_ms=%.1f",
-        request.path,
-        request.method,
-        response.status_code,
-        duracion_ms,
+    registrar_tiempo(
+        categoria="endpoint",
+        endpoint=request.path,
+        metodo=request.method,
+        status=response.status_code,
+        duracion_ms=round(duracion_ms, 1),
     )
     response.headers["Server-Timing"] = f"total;dur={duracion_ms:.1f}"
+    response.headers["X-Solicitud-ID"] = getattr(g, "solicitud_id", "")
     return response
 
 
@@ -623,24 +664,32 @@ def appsheet_action(
             timeout=90,
         )
     except Exception:
-        app.logger.info(
-            "TIEMPO servicio=appsheet tabla=%s accion=%s filas=%s "
-            "estado=error duracion_ms=%.1f",
-            table_name,
-            action,
-            len(rows or []),
-            (time.perf_counter() - inicio_appsheet) * 1000,
+        registrar_tiempo(
+            categoria="servicio",
+            servicio="appsheet",
+            tabla=table_name,
+            accion=action,
+            filas=len(rows or []),
+            estado="error",
+            duracion_ms=round(
+                (time.perf_counter() - inicio_appsheet) * 1000,
+                1,
+            ),
         )
         raise
 
-    app.logger.info(
-        "TIEMPO servicio=appsheet tabla=%s accion=%s filas=%s "
-        "status=%s duracion_ms=%.1f",
-        table_name,
-        action,
-        len(rows or []),
-        response.status_code,
-        (time.perf_counter() - inicio_appsheet) * 1000,
+    registrar_tiempo(
+        categoria="servicio",
+        servicio="appsheet",
+        tabla=table_name,
+        accion=action,
+        filas=len(rows or []),
+        status=response.status_code,
+        estado="ok" if response.status_code == 200 else "error",
+        duracion_ms=round(
+            (time.perf_counter() - inicio_appsheet) * 1000,
+            1,
+        ),
     )
 
     if response.status_code != 200:
