@@ -7596,19 +7596,42 @@ def extraer_drive_id(valor: str) -> str:
     return ""
 
 
-def nombre_archivo_desde_valor_appsheet(valor: str) -> str:
-    """Obtiene el nombre final desde un File relativo o una URL."""
-    valor = unquote(texto(valor)).replace("\\", "/")
-    if not valor:
+def normalizar_archivo_observacion_appsheet(valor: str) -> str:
+    """
+    Devuelve la ruta relativa real de un File de AppSheet.
+
+    En automatizaciones AppSheet puede expandir una columna File como una URL
+    gettablefileurl?...&fileName=Documentos_Files_/archivo.docx. En ese caso
+    conservamos únicamente el parámetro fileName, porque Documento_Versiones
+    también es una columna File y debe almacenar la ruta relativa del archivo.
+    """
+    valor_limpio = texto(valor).strip()
+    if not valor_limpio:
         return ""
 
-    if "://" in valor:
-        ruta = urlparse(valor).path
-    else:
-        ruta = valor.split("?", 1)[0].split("#", 1)[0]
+    valor_normalizado = valor_limpio.replace("\\", "/")
 
-    nombre = PurePosixPath(ruta).name.strip()
-    return nombre
+    if "://" in valor_normalizado:
+        parsed = urlparse(valor_normalizado)
+        consulta = parse_qs(parsed.query)
+        archivo = texto((consulta.get("fileName") or [""])[0])
+        if archivo:
+            return unquote(archivo).replace("\\", "/")
+
+        # Fallback para una URL directa que sí termina físicamente en archivo.
+        return unquote(parsed.path).replace("\\", "/")
+
+    return unquote(
+        valor_normalizado.split("?", 1)[0].split("#", 1)[0]
+    )
+
+
+def nombre_archivo_desde_valor_appsheet(valor: str) -> str:
+    """Obtiene el nombre final desde un File relativo o una URL AppSheet."""
+    ruta = normalizar_archivo_observacion_appsheet(valor)
+    if not ruta:
+        return ""
+    return PurePosixPath(ruta).name.strip()
 
 
 EXTENSIONES_ARCHIVO_OBSERVACION_FIRMA = {".pdf", ".doc", ".docx"}
@@ -7622,7 +7645,7 @@ def validar_archivo_observacion_firma(valor: str) -> tuple[str, str]:
     descarga ni transforma este archivo: solo conserva su referencia histórica
     en Documento_Versiones.
     """
-    ruta = texto(valor)
+    ruta = normalizar_archivo_observacion_appsheet(valor)
     if not ruta:
         return "", ""
 
