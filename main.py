@@ -7611,6 +7611,85 @@ def nombre_archivo_desde_valor_appsheet(valor: str) -> str:
     return nombre
 
 
+EXTENSIONES_ARCHIVO_OBSERVACION_FIRMA = {".pdf", ".doc", ".docx"}
+
+
+def validar_archivo_observacion_firma(valor: str) -> tuple[str, str]:
+    """
+    Valida el archivo opcional recibido como respaldo de observaciones de firma.
+
+    El valor corresponde al File/path que AppSheet ya guardó. Cloud Run no
+    descarga ni transforma este archivo: solo conserva su referencia histórica
+    en Documento_Versiones.
+    """
+    ruta = texto(valor)
+    if not ruta:
+        return "", ""
+
+    nombre = nombre_archivo_desde_valor_appsheet(ruta)
+    if not nombre:
+        raise ValueError(
+            "No se pudo determinar el nombre del archivo de observaciones"
+        )
+
+    extension = PurePosixPath(nombre.lower()).suffix
+    if extension not in EXTENSIONES_ARCHIVO_OBSERVACION_FIRMA:
+        permitidas = ", ".join(
+            sorted(EXTENSIONES_ARCHIVO_OBSERVACION_FIRMA)
+        )
+        raise ValueError(
+            "El archivo de observaciones debe ser PDF, DOC o DOCX. "
+            f"Extensiones permitidas: {permitidas}"
+        )
+
+    return ruta, nombre
+
+
+def marcar_version_observada_firma(
+    *,
+    id_version: str,
+    fecha: str,
+    usuario: str,
+    comentario: str,
+    archivo_observacion_firma: str = "",
+) -> tuple[str, str]:
+    """
+    Cierra la versión enviada a firma como Observada y, si existe, conserva
+    el archivo devuelto por el firmante externo como respaldo histórico.
+
+    Este archivo NO se usa para crear la nueva versión. El nuevo borrador se
+    sigue copiando exclusivamente desde GOOGLE_DOC_ID de la versión Para firma.
+    """
+    ruta_archivo, nombre_archivo = validar_archivo_observacion_firma(
+        archivo_observacion_firma
+    )
+
+    cambios: dict[str, Any] = {
+        "ID_VERSION": id_version,
+        "ESTADO_VERSION": "Observada",
+        "FECHA_CIERRE": fecha,
+        "COMENTARIO_OBSERVACION_FIRMA": comentario,
+    }
+
+    if ruta_archivo:
+        cambios.update(
+            {
+                "ARCHIVO_OBSERVACION_FIRMA": ruta_archivo,
+                "NOMBRE_ARCHIVO_OBSERVACION_FIRMA": nombre_archivo,
+                "FECHA_ARCHIVO_OBSERVACION_FIRMA": fecha,
+                "CARGADO_POR_OBSERVACION_FIRMA": usuario,
+            }
+        )
+
+    appsheet_action(
+        TABLA_VERSIONES,
+        "Edit",
+        [cambios],
+    )
+
+    return ruta_archivo, nombre_archivo
+
+
 def obtener_metadata_pdf_drive(
     drive_service: Any,
     file_id: str,
@@ -8306,6 +8385,9 @@ def actualizar_documento_reinicio_firma(
                 "DESTINATARIOS_FIRMA": "",
                 "MENSAJE_ADICIONAL_FIRMA": "",
                 "ENVIADO_FIRMA_POR": "",
+                # Campo transitorio usado por el formulario de rechazo. La
+                # referencia histórica ya quedó copiada a Documento_Versiones.
+                "ARCHIVO_OBSERVACION_FIRMA_TEMP": "",
                 "EMAIL_FIRMA_MESSAGE_ID": "",
                 "FECHA_CIERRE": "",
                 "ULTIMO_ENVIADO_POR": usuario,
@@ -8329,6 +8411,7 @@ def crear_eventos_reinicio_firma(
     comentario: str,
     numero_version_nueva: int,
     nombre_archivo: str,
+    nombre_archivo_observacion: str = "",
 ) -> tuple[list[str], dict[str, Any] | None]:
     """Crea la bitácora del reinicio y devuelve el evento principal."""
     advertencias: list[str] = []
@@ -8345,6 +8428,11 @@ def crear_eventos_reinicio_firma(
         "COMENTARIO": (
             "El documento recibió observaciones durante la firma. "
             f"Motivo: {comentario}"
+            + (
+                f" Archivo de respaldo recibido: {nombre_archivo_observacion}."
+                if nombre_archivo_observacion
+                else ""
+            )
         ),
     }
     evento_version: dict[str, Any] = {
@@ -8393,6 +8481,9 @@ def rechazar_firma():
         id_version_solicitud = texto(data.get("id_version_firma"))
         usuario = texto(data.get("usuario"))
         comentario = texto(data.get("comentario"))
+        archivo_observacion_firma = texto(
+            data.get("archivo_observacion_firma")
+        )
 
         if not id_documento:
             return {"error": "Falta id_documento"}, 400
@@ -8433,6 +8524,28 @@ def rechazar_firma():
             and numero_version_documento > numero_version_anterior
             and estado_documento in {"Borrador", "En revisión"}
         ):
+            # Si AppSheet reintenta el webhook con un archivo que no alcanzó a
+            # quedar registrado, completamos solamente el respaldo histórico.
+            if archivo_observacion_firma:
+                ruta_validada, nombre_validado = validar_archivo_observacion_firma(
+                    archivo_observacion_firma
+                )
+                ruta_guardada = texto(
+                    version_origen.get("ARCHIVO_OBSERVACION_FIRMA")
+                )
+                if ruta_validada and ruta_guardada != ruta_validada:
+                    marcar_version_observada_firma(
+                        id_version=id_version_origen,
+                        fecha=ahora_iso(),
+                        usuario=usuario or texto(documento.get("ENVIADO_FIRMA_POR")),
+                        comentario=comentario,
+                        archivo_observacion_firma=ruta_validada,
+                    )
+                    version_origen["ARCHIVO_OBSERVACION_FIRMA"] = ruta_validada
+                    version_origen[
+                        "NOMBRE_ARCHIVO_OBSERVACION_FIRMA"
+                    ] = nombre_validado
+
             notificaciones_reintento: list[dict[str, Any]] = []
             advertencias_reintento: list[str] = []
             try:
@@ -8478,6 +8591,14 @@ def rechazar_firma():
                     ),
                     "google_doc_url": normalizar_url_appsheet(
                         documento.get("GOOGLE_DOC_URL")
+                    ),
+                    "archivo_observacion_firma": texto(
+                        version_origen.get("ARCHIVO_OBSERVACION_FIRMA")
+                    ),
+                    "nombre_archivo_observacion_firma": texto(
+                        version_origen.get(
+                            "NOMBRE_ARCHIVO_OBSERVACION_FIRMA"
+                        )
                     ),
                     "notificaciones": notificaciones_reintento,
                     "advertencias": advertencias_reintento,
@@ -8672,10 +8793,15 @@ def rechazar_firma():
                 fecha_creacion=fecha,
             )
 
-        actualizar_estado_version(
+        (
+            archivo_observacion_guardado,
+            nombre_archivo_observacion,
+        ) = marcar_version_observada_firma(
             id_version=id_version_origen,
-            estado_version="Observada",
-            fecha_cierre=fecha,
+            fecha=fecha,
+            usuario=usuario,
+            comentario=comentario,
+            archivo_observacion_firma=archivo_observacion_firma,
         )
 
         actualizar_documento_reinicio_firma(
@@ -8700,6 +8826,7 @@ def rechazar_firma():
             comentario=comentario,
             numero_version_nueva=numero_version_nueva,
             nombre_archivo=copia["name"],
+            nombre_archivo_observacion=nombre_archivo_observacion,
         )
 
         notificaciones: list[dict[str, Any]] = []
@@ -8754,6 +8881,8 @@ def rechazar_firma():
                 "google_doc_id": copia["id"],
                 "google_doc_url": copia["url"],
                 "nombre_archivo": copia["name"],
+                "archivo_observacion_firma": archivo_observacion_guardado,
+                "nombre_archivo_observacion_firma": nombre_archivo_observacion,
                 "orden_actual": primer_nuevo["ORDEN"],
                 "id_aprobacion_actual": primer_nuevo[
                     "ID_APROBACION_ACTUAL"
