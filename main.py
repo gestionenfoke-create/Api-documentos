@@ -161,6 +161,11 @@ TABLA_NOTIFICACIONES = os.environ.get(
     "Documento_Notificaciones",
 )
 
+TABLA_REVISIONES_EXTERNAS = os.environ.get(
+    "TABLA_REVISIONES_EXTERNAS",
+    "Documento_Revisiones_Externas",
+)
+
 APPSHEET_DOCUMENT_VIEW_URL = os.environ.get(
     "APPSHEET_DOCUMENT_VIEW_URL",
     "",
@@ -737,6 +742,293 @@ def buscar_documento(id_documento: str) -> dict[str, Any]:
     return filas[0]
 
 
+
+# -----------------------------------------------------------------------------
+# Fase 1: tipo de firma y jerarquía documental
+# -----------------------------------------------------------------------------
+
+TIPOS_FIRMA_VALIDOS = {"Simple", "Notarial"}
+
+
+def normalizar_tipo_firma(valor: Any) -> str:
+    """Normaliza el tipo de firma configurado en plantilla/documento."""
+    valor_texto = texto(valor).strip()
+    if not valor_texto:
+        # Compatibilidad con documentos/plantillas existentes creados antes
+        # de incorporar TIPO_FIRMA.
+        return "Simple"
+
+    normalizado = valor_texto.casefold()
+    equivalencias = {
+        "simple": "Simple",
+        "notarial": "Notarial",
+    }
+    if normalizado not in equivalencias:
+        raise ValueError(
+            "TIPO_FIRMA debe ser Simple o Notarial. "
+            f"Valor recibido: {valor_texto!r}"
+        )
+    return equivalencias[normalizado]
+
+
+def buscar_todos_documentos() -> list[dict[str, Any]]:
+    """
+    Obtiene los documentos en una sola llamada a AppSheet para construir la
+    jerarquía en memoria. Evita una llamada API por cada hijo/nivel.
+    """
+    selector = f"FILTER({TABLA_DOCUMENTOS}, TRUE)"
+    return appsheet_find(TABLA_DOCUMENTOS, selector)
+
+
+def construir_indice_documentos(
+    documentos: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    indice: dict[str, dict[str, Any]] = {}
+    for fila in documentos:
+        id_documento = texto(fila.get("ID_DOCUMENTO"))
+        if not id_documento:
+            continue
+        if id_documento in indice:
+            raise ValueError(
+                f"ID_DOCUMENTO duplicado en {TABLA_DOCUMENTOS}: {id_documento}"
+            )
+        indice[id_documento] = fila
+    return indice
+
+
+def obtener_documento_raiz_desde_indice(
+    id_documento: str,
+    indice: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Sube por PADRE hasta encontrar la raíz. Devuelve también el camino desde
+    el documento solicitado hacia la raíz. Detecta referencias inexistentes y
+    ciclos A -> B -> C -> A.
+    """
+    actual = texto(id_documento)
+    if actual not in indice:
+        raise LookupError(
+            f"No se encontró ID_DOCUMENTO={actual} en {TABLA_DOCUMENTOS}"
+        )
+
+    camino: list[str] = []
+    visitados: set[str] = set()
+
+    while True:
+        if actual in visitados:
+            ciclo = " -> ".join(camino + [actual])
+            raise ValueError(
+                "Se detectó una relación circular en PADRE: " + ciclo
+            )
+
+        visitados.add(actual)
+        camino.append(actual)
+        fila = indice[actual]
+        padre = texto(fila.get("PADRE"))
+
+        if not padre:
+            return fila, camino
+
+        if padre == actual:
+            raise ValueError(
+                f"El documento {actual} no puede tenerse a sí mismo como PADRE"
+            )
+
+        if padre not in indice:
+            raise ValueError(
+                f"El documento {actual} referencia PADRE={padre}, "
+                "pero ese documento no existe"
+            )
+
+        actual = padre
+
+
+def construir_jerarquia_desde_raiz(
+    id_raiz: str,
+    indice: dict[str, dict[str, Any]],
+) -> list[tuple[dict[str, Any], int]]:
+    """Devuelve raíz + descendientes en orden jerárquico (padre antes que hijos)."""
+    hijos_por_padre: dict[str, list[dict[str, Any]]] = {}
+
+    for fila in indice.values():
+        id_fila = texto(fila.get("ID_DOCUMENTO"))
+        padre = texto(fila.get("PADRE"))
+        if not padre:
+            continue
+        # Inconsistencias ajenas al árbol solicitado no deben impedir validar
+        # un paquete correcto. Si afectan al documento solicitado, la subida
+        # hacia la raíz las detecta antes de llegar aquí.
+        if padre == id_fila or padre not in indice:
+            continue
+        hijos_por_padre.setdefault(padre, []).append(fila)
+
+    for lista_hijos in hijos_por_padre.values():
+        lista_hijos.sort(
+            key=lambda fila: (
+                texto(fila.get("TITULO")).casefold(),
+                texto(fila.get("ID_DOCUMENTO")),
+            )
+        )
+
+    resultado: list[tuple[dict[str, Any], int]] = []
+    visitados: set[str] = set()
+    pila_activa: set[str] = set()
+
+    def recorrer(id_actual: str, nivel: int) -> None:
+        if id_actual in pila_activa:
+            raise ValueError(
+                f"Se detectó una relación circular en la jerarquía desde {id_raiz}"
+            )
+        if id_actual in visitados:
+            return
+
+        pila_activa.add(id_actual)
+        visitados.add(id_actual)
+        fila_actual = indice[id_actual]
+        resultado.append((fila_actual, nivel))
+
+        for hijo in hijos_por_padre.get(id_actual, []):
+            recorrer(texto(hijo.get("ID_DOCUMENTO")), nivel + 1)
+
+        pila_activa.remove(id_actual)
+
+    recorrer(id_raiz, 0)
+    return resultado
+
+
+def evaluar_documento_para_paquete(
+    documento: dict[str, Any],
+    *,
+    nivel: int,
+    id_raiz: str,
+) -> dict[str, Any]:
+    """
+    Evalúa la preparación interna usando el flujo vigente de Fase 1.
+
+    Durante esta fase tanto Simple como Notarial siguen llegando a
+    "Listo para firma" al finalizar la cadena. En fases posteriores la regla
+    se ampliará a "Listo para revisión externa" para la ruta Notarial.
+    """
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    estado = texto(documento.get("ESTADO"))
+    id_version = texto(documento.get("ID_VERSION_ACTUAL"))
+    google_doc_id = texto(documento.get("GOOGLE_DOC_ID"))
+    pdf_id = texto(documento.get("PDF_PARA_FIRMA_ID"))
+    id_aprobacion_actual = texto(documento.get("ID_APROBACION_ACTUAL"))
+
+    motivos: list[str] = []
+
+    if estado != "Listo para firma":
+        motivos.append(
+            f"Estado {estado or '<vacío>'}; se requiere 'Listo para firma'"
+        )
+    if id_aprobacion_actual:
+        motivos.append("La cadena interna todavía tiene un aprobador actual")
+    if not id_version:
+        motivos.append("No tiene ID_VERSION_ACTUAL")
+    if not google_doc_id:
+        motivos.append("No tiene GOOGLE_DOC_ID")
+    if not pdf_id:
+        motivos.append("No tiene PDF_PARA_FIRMA_ID")
+
+    proyecto = texto(documento.get("ID_PROYECTO"))
+    padre = texto(documento.get("PADRE"))
+
+    return {
+        "id_documento": id_documento,
+        "titulo": texto(documento.get("TITULO")),
+        "nivel": nivel,
+        "es_raiz": id_documento == id_raiz,
+        "padre": padre,
+        "id_proyecto": proyecto,
+        "tipo_firma_documento": normalizar_tipo_firma(
+            documento.get("TIPO_FIRMA")
+        ),
+        "estado": estado,
+        "estado_firma": texto(documento.get("ESTADO_FIRMA")),
+        "numero_version": texto(documento.get("VERSION_ACTUAL")),
+        "numero_revision": texto(documento.get("REVISION_ACTUAL")),
+        "id_version_actual": id_version,
+        "google_doc_id": google_doc_id,
+        "pdf_para_firma_id": pdf_id,
+        "cadena_aprobacion_concluida": not bool(id_aprobacion_actual),
+        "listo_para_paquete": not motivos,
+        "motivos": motivos,
+    }
+
+
+def validar_paquete_documental_datos(id_documento: str) -> dict[str, Any]:
+    """Construye y valida el paquete controlado por el documento raíz."""
+    documentos = buscar_todos_documentos()
+    indice = construir_indice_documentos(documentos)
+    raiz, camino_a_raiz = obtener_documento_raiz_desde_indice(
+        id_documento,
+        indice,
+    )
+    id_raiz = texto(raiz.get("ID_DOCUMENTO"))
+    jerarquia = construir_jerarquia_desde_raiz(id_raiz, indice)
+
+    proyecto_raiz = texto(raiz.get("ID_PROYECTO"))
+    evaluados: list[dict[str, Any]] = []
+    errores_jerarquia: list[str] = []
+
+    for documento, nivel in jerarquia:
+        evaluado = evaluar_documento_para_paquete(
+            documento,
+            nivel=nivel,
+            id_raiz=id_raiz,
+        )
+
+        proyecto_hijo = evaluado["id_proyecto"]
+        if (
+            proyecto_raiz
+            and proyecto_hijo
+            and proyecto_hijo != proyecto_raiz
+        ):
+            mensaje = (
+                f"{evaluado['titulo'] or evaluado['id_documento']} pertenece "
+                f"al proyecto {proyecto_hijo}, distinto del proyecto raíz "
+                f"{proyecto_raiz}"
+            )
+            evaluado["motivos"].append(mensaje)
+            evaluado["listo_para_paquete"] = False
+            errores_jerarquia.append(mensaje)
+
+        evaluados.append(evaluado)
+
+    pendientes = [
+        fila for fila in evaluados if not fila["listo_para_paquete"]
+    ]
+    solicitado_es_raiz = texto(id_documento) == id_raiz
+    tipo_firma_paquete = normalizar_tipo_firma(raiz.get("TIPO_FIRMA"))
+
+    return {
+        "id_documento_solicitado": texto(id_documento),
+        "id_documento_raiz": id_raiz,
+        "titulo_raiz": texto(raiz.get("TITULO")),
+        "tipo_firma_paquete": tipo_firma_paquete,
+        "solicitado_es_raiz": solicitado_es_raiz,
+        "camino_a_raiz": camino_a_raiz,
+        "cantidad_documentos": len(evaluados),
+        "paquete_listo": not pendientes and not errores_jerarquia,
+        "puede_iniciar_envio_externo": (
+            solicitado_es_raiz and not pendientes and not errores_jerarquia
+        ),
+        "cantidad_pendientes": len(pendientes),
+        "documentos_pendientes": [
+            {
+                "id_documento": fila["id_documento"],
+                "titulo": fila["titulo"],
+                "estado": fila["estado"],
+                "motivos": fila["motivos"],
+            }
+            for fila in pendientes
+        ],
+        "errores_jerarquia": errores_jerarquia,
+        "documentos": evaluados,
+    }
+
+
 def buscar_plantilla(id_plantilla: str) -> dict[str, Any]:
     selector = (
         f"FILTER({TABLA_PLANTILLAS}, "
@@ -1042,6 +1334,7 @@ def actualizar_documento_inicial(
     google_doc_url: str,
     primer_actual: dict[str, Any],
     fecha_actualizacion: str,
+    tipo_firma: str,
 ) -> None:
     fila_documento = {
         "ID_DOCUMENTO": id_documento,
@@ -1056,6 +1349,9 @@ def actualizar_documento_inicial(
         "ENCARGADO_ACTUAL_NOMBRE": primer_actual.get("NOMBRE", ""),
         "ENCARGADO_ACTUAL_EMAIL": primer_actual.get("APROBADOR", ""),
         "ESTADO_FIRMA": "No iniciado",
+        # Snapshot: el documento conserva el TIPO_FIRMA que tenía la plantilla
+        # al momento de su creación, aunque la plantilla cambie más adelante.
+        "TIPO_FIRMA": tipo_firma,
         "FECHA_ULTIMA_ACTUALIZACION": fecha_actualizacion,
     }
 
@@ -1132,6 +1428,39 @@ def health():
         "api": "documentos",
         "server_time": ahora_iso(),
     }
+
+
+@app.route("/validar-paquete-documental", methods=["POST"])
+def validar_paquete_documental():
+    """
+    Fase 1: diagnóstico de jerarquía y preparación del paquete documental.
+
+    No modifica datos. Puede recibir id_documento o id_documento_raiz. Si se
+    envía un hijo, identifica la raíz y devuelve el paquete completo, pero
+    puede_iniciar_envio_externo será False porque solo la raíz administra la
+    salida externa.
+    """
+    try:
+        validar_configuracion()
+        validar_token()
+
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(
+            data.get("id_documento_raiz") or data.get("id_documento")
+        )
+        if not id_documento:
+            return {"error": "Falta id_documento o id_documento_raiz"}, 400
+
+        resultado = validar_paquete_documental_datos(id_documento)
+        return jsonify({"ok": True, **resultado})
+
+    except PermissionError as exc:
+        return {"error": str(exc)}, 403
+    except (ValueError, LookupError) as exc:
+        return {"error": str(exc)}, 400
+    except Exception as exc:
+        traceback.print_exc()
+        return {"error": str(exc)}, 500
 
 
 # -----------------------------------------------------------------------------
@@ -1301,6 +1630,9 @@ def crear_evento_envio_revision(
 @app.route("/crear-documento", methods=["POST"])
 def crear_documento():
     id_documento = ""
+    # Evita NameError en manejadores de error heredados si la creación falla
+    # antes de completar el documento.
+    documento_cerrado = False
 
     try:
         validar_configuracion()
@@ -1344,6 +1676,7 @@ def crear_documento():
 
         plantilla = buscar_plantilla(id_plantilla)
         cadena_plantilla = buscar_cadena_plantilla(id_plantilla)
+        tipo_firma = normalizar_tipo_firma(plantilla.get("TIPO_FIRMA"))
 
         template_id = texto(plantilla.get("GOOGLE_DOC_TEMPLATE_ID"))
         folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
@@ -1432,6 +1765,7 @@ def crear_documento():
             google_doc_url=copia["url"],
             primer_actual=primer_actual,
             fecha_actualizacion=fecha_creacion,
+            tipo_firma=tipo_firma,
         )
 
         # 4. Registra la bitácora inicial.
@@ -1466,6 +1800,8 @@ def crear_documento():
                 "google_doc_url": copia["url"],
                 "nombre_archivo": copia["name"],
                 "cantidad_responsables": len(filas_cadena_actual),
+                "tipo_firma": tipo_firma,
+                "padre": texto(documento.get("PADRE")),
             }
         )
 
