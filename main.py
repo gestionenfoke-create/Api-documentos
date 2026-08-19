@@ -4424,19 +4424,207 @@ def construir_email_firma_externo(
     return asunto, cuerpo_texto, cuerpo_html
 
 
+def construir_email_firma_paquete_externo(
+    *,
+    documento: dict[str, Any],
+    plantilla: dict[str, Any],
+    usuario: str,
+    mensaje_adicional: str,
+    fecha_envio: str,
+    documentos_paquete: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    """
+    Construye el correo de firma simple para uno o varios documentos.
+
+    Para un paquete de un solo documento conserva exactamente el correo
+    histórico. Cuando hay jerarquía, el documento raíz sigue siendo el
+    documento principal y se agrega una relación explícita de todos los
+    documentos incluidos en el mismo envío.
+    """
+    asunto, cuerpo_texto, cuerpo_html = construir_email_firma_externo(
+        documento=documento,
+        plantilla=plantilla,
+        usuario=usuario,
+        mensaje_adicional=mensaje_adicional,
+        fecha_envio=fecha_envio,
+    )
+
+    if len(documentos_paquete) <= 1:
+        return asunto, cuerpo_texto, cuerpo_html
+
+    cantidad = len(documentos_paquete)
+    titulo_raiz = (
+        texto(documento.get("TITULO"))
+        or f"Documento {texto(documento.get('ID_DOCUMENTO'))}"
+    )
+
+    lineas_documentos: list[str] = []
+    for indice, fila in enumerate(documentos_paquete, start=1):
+        titulo = texto(fila.get("titulo")) or texto(fila.get("id_documento"))
+        version = texto(fila.get("numero_version"))
+        revision = texto(fila.get("numero_revision"))
+        detalle = titulo
+        if version:
+            detalle += f" — V{version}"
+            if revision:
+                detalle += f" / Rev. {revision}"
+        lineas_documentos.append(f"{indice}. {detalle}")
+
+    listado_texto = "\n".join(lineas_documentos)
+    bloque_texto = (
+        "\n\nDOCUMENTOS INCLUIDOS EN EL PAQUETE\n"
+        f"{listado_texto}\n"
+    )
+
+    cuerpo_texto = cuerpo_texto.replace(
+        f'Adjuntamos el documento "{titulo_raiz}" para su revisión y firma.',
+        (
+            f'Adjuntamos el documento principal "{titulo_raiz}" junto con '
+            f"{cantidad - 1} documento(s) relacionado(s), para su revisión "
+            "y firma en un único envío."
+        ),
+    )
+    cuerpo_texto = cuerpo_texto.replace(
+        "\n\n¿QUÉ DEBE HACER?",
+        bloque_texto + "\n¿QUÉ DEBE HACER?",
+        1,
+    )
+    cuerpo_texto = cuerpo_texto.replace(
+        "2. Firmar el documento utilizando el archivo PDF.",
+        "2. Firmar los documentos PDF que correspondan.",
+    )
+    cuerpo_texto = cuerpo_texto.replace(
+        "3. Responder este mismo correo adjuntando el PDF firmado.",
+        "3. Responder este mismo correo adjuntando los PDF firmados que correspondan.",
+    )
+
+    filas_html = []
+    for indice, fila in enumerate(documentos_paquete, start=1):
+        titulo = html.escape(
+            texto(fila.get("titulo")) or texto(fila.get("id_documento"))
+        )
+        version = html.escape(texto(fila.get("numero_version")))
+        revision = html.escape(texto(fila.get("numero_revision")))
+        detalle_version = ""
+        if version:
+            detalle_version = f"V{version}"
+            if revision:
+                detalle_version += f" / Rev. {revision}"
+        detalle_html = (
+            f'<span style="color:#6b7280; font-size:12px;">'
+            f'{html.escape(detalle_version)}</span>'
+            if detalle_version
+            else ""
+        )
+        filas_html.append(
+            f"""
+            <tr>
+              <td style="
+                  padding:10px 12px;
+                  width:34px;
+                  border-top:1px solid #e5e7eb;
+                  color:#4338ca;
+                  font-weight:700;
+                  vertical-align:top;
+              ">{indice}.</td>
+              <td style="
+                  padding:10px 12px;
+                  border-top:1px solid #e5e7eb;
+                  color:#111827;
+                  font-size:14px;
+                  line-height:1.45;
+              ">
+                <strong>{titulo}</strong><br>
+                {detalle_html}
+              </td>
+            </tr>
+            """
+        )
+
+    bloque_html = f"""
+                    <div style="
+                        margin-top:22px;
+                        border:1px solid #e5e7eb;
+                        border-radius:8px;
+                        overflow:hidden;
+                    ">
+                      <div style="
+                          padding:12px 16px;
+                          background:#eef2ff;
+                          color:#3730a3;
+                          font-size:14px;
+                          font-weight:700;
+                      ">Documentos incluidos en el paquete ({cantidad})</div>
+                      <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+                             style="width:100%; border-collapse:collapse;">
+                        {''.join(filas_html)}
+                      </table>
+                    </div>
+    """
+
+    cuerpo_html = cuerpo_html.replace(
+        "Documento adjunto para revisión y firma",
+        "Paquete documental adjunto para revisión y firma",
+    )
+    cuerpo_html = cuerpo_html.replace(
+        "Se adjuntan el PDF para firma y una copia editable en formato Microsoft Word.",
+        (
+            f"Se adjuntan los archivos PDF y Microsoft Word correspondientes "
+            f"a {cantidad} documentos relacionados."
+        ),
+    )
+    cuerpo_html = cuerpo_html.replace(
+        ">Resumen del documento</div>",
+        ">Resumen del documento principal</div>",
+    )
+    marcador_acciones = """                    <div style="
+                        margin-top:22px;
+                        padding:17px 18px;"""
+    if marcador_acciones in cuerpo_html:
+        cuerpo_html = cuerpo_html.replace(
+            marcador_acciones,
+            bloque_html + "\n" + marcador_acciones,
+            1,
+        )
+
+    cuerpo_html = cuerpo_html.replace(
+        "Firmar el documento utilizando el archivo PDF.",
+        "Firmar los documentos PDF que correspondan.",
+    )
+    cuerpo_html = cuerpo_html.replace(
+        "Responder este mismo correo adjuntando el PDF firmado.",
+        "Responder este mismo correo adjuntando los PDF firmados que correspondan.",
+    )
+    cuerpo_html = cuerpo_html.replace(
+        "Puede responder directamente a este mensaje con el documento firmado.",
+        "Puede responder directamente a este mensaje con los documentos firmados.",
+    )
+
+    return asunto, cuerpo_texto, cuerpo_html
+
+
 @medir_operacion("gmail.enviar_firma_externa")
-def enviar_email_con_pdf(
+def enviar_email_con_adjuntos(
     gmail_service: Any,
     destinatarios: list[str],
     asunto: str,
     cuerpo: str,
-    pdf_bytes: bytes,
-    pdf_nombre: str,
-    docx_bytes: bytes,
-    docx_nombre: str,
+    adjuntos: list[dict[str, Any]],
     reply_to: str = "",
     cuerpo_html: str = "",
 ) -> dict[str, str]:
+    """
+    Envía un correo externo con una cantidad variable de adjuntos.
+
+    Cada adjunto debe contener:
+    - contenido: bytes
+    - nombre: nombre del archivo
+    - maintype: application
+    - subtype: pdf o el MIME subtype de DOCX
+    """
+    if not adjuntos:
+        raise ValueError("El correo de firma no tiene archivos adjuntos")
+
     mensaje = EmailMessage()
     mensaje["To"] = ", ".join(destinatarios)
     mensaje["From"] = GMAIL_SENDER_EMAIL
@@ -4449,21 +4637,37 @@ def enviar_email_con_pdf(
     if cuerpo_html:
         mensaje.add_alternative(cuerpo_html, subtype="html")
 
-    mensaje.add_attachment(
-        pdf_bytes,
-        maintype="application",
-        subtype="pdf",
-        filename=pdf_nombre,
-    )
-    mensaje.add_attachment(
-        docx_bytes,
-        maintype="application",
-        subtype=(
-            "vnd.openxmlformats-officedocument."
-            "wordprocessingml.document"
-        ),
-        filename=docx_nombre,
-    )
+    nombres_vistos: set[str] = set()
+    for adjunto in adjuntos:
+        contenido = adjunto.get("contenido")
+        nombre = texto(adjunto.get("nombre"))
+        maintype = texto(adjunto.get("maintype")) or "application"
+        subtype = texto(adjunto.get("subtype"))
+
+        if not isinstance(contenido, bytes) or not contenido:
+            raise ValueError(
+                f"El adjunto {nombre or '<sin nombre>'} no contiene bytes válidos"
+            )
+        if not nombre:
+            raise ValueError("Se recibió un adjunto sin nombre")
+        if not subtype:
+            raise ValueError(f"El adjunto {nombre} no tiene MIME subtype")
+
+        # Evita nombres repetidos dentro del mismo mensaje.
+        nombre_final = nombre
+        contador = 2
+        base, extension = os.path.splitext(nombre)
+        while nombre_final.casefold() in nombres_vistos:
+            nombre_final = f"{base}_{contador}{extension}"
+            contador += 1
+        nombres_vistos.add(nombre_final.casefold())
+
+        mensaje.add_attachment(
+            contenido,
+            maintype=maintype,
+            subtype=subtype,
+            filename=nombre_final,
+        )
 
     raw = base64.urlsafe_b64encode(mensaje.as_bytes()).decode("ascii")
     respuesta = (
@@ -4484,6 +4688,46 @@ def enviar_email_con_pdf(
         "message_id": message_id,
         "thread_id": texto(respuesta.get("threadId")),
     }
+
+
+def enviar_email_con_pdf(
+    gmail_service: Any,
+    destinatarios: list[str],
+    asunto: str,
+    cuerpo: str,
+    pdf_bytes: bytes,
+    pdf_nombre: str,
+    docx_bytes: bytes,
+    docx_nombre: str,
+    reply_to: str = "",
+    cuerpo_html: str = "",
+) -> dict[str, str]:
+    """Compatibilidad con el envío histórico de un único documento."""
+    return enviar_email_con_adjuntos(
+        gmail_service=gmail_service,
+        destinatarios=destinatarios,
+        asunto=asunto,
+        cuerpo=cuerpo,
+        adjuntos=[
+            {
+                "contenido": pdf_bytes,
+                "nombre": pdf_nombre,
+                "maintype": "application",
+                "subtype": "pdf",
+            },
+            {
+                "contenido": docx_bytes,
+                "nombre": docx_nombre,
+                "maintype": "application",
+                "subtype": (
+                    "vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            },
+        ],
+        reply_to=reply_to,
+        cuerpo_html=cuerpo_html,
+    )
 
 # -----------------------------------------------------------------------------
 # Notificaciones internas por email - Fases 2 y 3
@@ -7558,6 +7802,172 @@ def diagnostico_notificacion():
         return {"error": str(exc)}, 500
 
 
+
+@medir_operacion("firma.construir_adjuntos_paquete")
+def construir_adjuntos_paquete_firma(
+    *,
+    drive_service: Any,
+    documentos_paquete: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Descarga/exporta PDF + DOCX para cada integrante del paquete documental.
+
+    Devuelve:
+    - adjuntos: contenido binario listo para Gmail.
+    - detalle: fotografía de documentos/versiones/archivos efectivamente enviados.
+    """
+    if not documentos_paquete:
+        raise ValueError("El paquete documental no contiene documentos")
+
+    adjuntos: list[dict[str, Any]] = []
+    detalle: list[dict[str, Any]] = []
+
+    for fila in documentos_paquete:
+        id_documento = texto(fila.get("id_documento"))
+        titulo = texto(fila.get("titulo")) or id_documento
+        pdf_id = texto(fila.get("pdf_para_firma_id"))
+        google_doc_id = texto(fila.get("google_doc_id"))
+        id_version = texto(fila.get("id_version_actual"))
+
+        if not id_documento:
+            raise ValueError("Un integrante del paquete no tiene ID_DOCUMENTO")
+        if not pdf_id:
+            raise ValueError(
+                f"{titulo}: falta PDF_PARA_FIRMA_ID para construir el paquete"
+            )
+        if not google_doc_id:
+            raise ValueError(
+                f"{titulo}: falta GOOGLE_DOC_ID para exportar el Word"
+            )
+        if not id_version:
+            raise ValueError(
+                f"{titulo}: falta ID_VERSION_ACTUAL para auditar el envío"
+            )
+
+        pdf_bytes, pdf_nombre = descargar_pdf_drive(
+            drive_service=drive_service,
+            file_id=pdf_id,
+        )
+        docx_bytes, docx_nombre = exportar_docx_drive(
+            drive_service=drive_service,
+            google_doc_id=google_doc_id,
+            nombre_base=pdf_nombre,
+        )
+
+        adjuntos.extend(
+            [
+                {
+                    "contenido": pdf_bytes,
+                    "nombre": pdf_nombre,
+                    "maintype": "application",
+                    "subtype": "pdf",
+                },
+                {
+                    "contenido": docx_bytes,
+                    "nombre": docx_nombre,
+                    "maintype": "application",
+                    "subtype": (
+                        "vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
+                    ),
+                },
+            ]
+        )
+
+        detalle.append(
+            {
+                "id_documento": id_documento,
+                "titulo": titulo,
+                "nivel": fila.get("nivel", 0),
+                "es_raiz": bool(fila.get("es_raiz")),
+                "id_version": id_version,
+                "numero_version": texto(fila.get("numero_version")),
+                "numero_revision": texto(fila.get("numero_revision")),
+                "pdf_id": pdf_id,
+                "pdf_nombre": pdf_nombre,
+                "google_doc_id": google_doc_id,
+                "docx_nombre": docx_nombre,
+            }
+        )
+
+    return adjuntos, detalle
+
+
+def crear_eventos_enviado_firma_paquete(
+    *,
+    id_documento_raiz: str,
+    titulo_raiz: str,
+    usuario: str,
+    fecha: str,
+    destinatarios: list[str],
+    detalle_documentos: list[dict[str, Any]],
+    message_id: str,
+) -> None:
+    """
+    Registra la fotografía del paquete efectivamente enviado.
+
+    La raíz cambia conceptualmente a En firma. Los descendientes conservan
+    su estado Listo para firma, pero reciben un evento histórico que deja
+    trazabilidad de la versión incluida en el envío administrado por la raíz.
+    """
+    cantidad_documentos = len(detalle_documentos)
+    cantidad_adjuntos = cantidad_documentos * 2
+
+    resumen = "; ".join(
+        (
+            f"{fila['titulo']} "
+            f"(V{fila.get('numero_version') or '-'} / "
+            f"Rev. {fila.get('numero_revision') or '-'})"
+        )
+        for fila in detalle_documentos
+    )
+
+    eventos: list[dict[str, Any]] = []
+
+    for fila in detalle_documentos:
+        es_raiz = bool(fila.get("es_raiz"))
+        id_documento = texto(fila.get("id_documento"))
+        id_version = texto(fila.get("id_version"))
+
+        if es_raiz:
+            tipo_evento = "Enviado a firma"
+            estado_anterior = "Listo para firma"
+            estado_nuevo = "En firma"
+            comentario = (
+                f"Se envió a firma un paquete documental de "
+                f"{cantidad_documentos} documento(s) y {cantidad_adjuntos} "
+                f"archivo(s) a {', '.join(destinatarios)}. "
+                f"Contenido: {resumen}. Gmail message ID: {message_id}."
+            )
+        else:
+            tipo_evento = "Incluido en envío a firma"
+            estado_anterior = "Listo para firma"
+            estado_nuevo = "Listo para firma"
+            comentario = (
+                f"Esta versión fue incluida en el paquete de firma administrado "
+                f"por {titulo_raiz or id_documento_raiz}. "
+                f"Archivos enviados: {fila.get('pdf_nombre')} y "
+                f"{fila.get('docx_nombre')}. Gmail message ID: {message_id}."
+            )
+
+        eventos.append(
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_APROBACION_ACTUAL": "",
+                "TIPO_EVENTO": tipo_evento,
+                "ESTADO_ANTERIOR": estado_anterior,
+                "ESTADO_NUEVO": estado_nuevo,
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": comentario,
+            }
+        )
+
+    appsheet_action(TABLA_EVENTOS, "Add", eventos)
+
+
 def marcar_envio_firma_en_proceso(
     id_documento: str,
     fecha: str,
@@ -7667,6 +8077,17 @@ def crear_evento_enviado_firma(
 
 @app.route("/enviar-firma", methods=["POST"])
 def enviar_firma():
+    """
+    Fase 2: firma simple por paquete documental.
+
+    Reglas:
+    - solo el documento raíz puede iniciar el envío;
+    - el TIPO_FIRMA del paquete debe ser Simple;
+    - toda la jerarquía debe haber concluido su cadena interna;
+    - se adjuntan PDF + DOCX de cada documento;
+    - solo la raíz cambia a En firma;
+    - los hijos conservan Listo para firma, con evento histórico de inclusión.
+    """
     id_documento = ""
     correo_enviado = False
     message_id = ""
@@ -7694,6 +8115,8 @@ def enviar_firma():
             documento.get("EMAIL_FIRMA_MESSAGE_ID")
         )
 
+        # Idempotencia histórica: si el correo de la raíz ya fue enviado,
+        # no se vuelve a construir ni a enviar el paquete.
         if estado == "En firma" and message_id_existente:
             return jsonify(
                 {
@@ -7717,9 +8140,55 @@ def enviar_firma():
                 )
             }, 409
 
+        # La validación de Fase 1 pasa a ser una precondición obligatoria
+        # del envío real.
+        paquete = validar_paquete_documental_datos(id_documento)
+
+        if not paquete.get("solicitado_es_raiz"):
+            raise ValueError(
+                "Solo el documento raíz puede iniciar el envío externo. "
+                f"Documento raíz: {paquete.get('titulo_raiz') or paquete.get('id_documento_raiz')} "
+                f"({paquete.get('id_documento_raiz')})."
+            )
+
+        tipo_firma_paquete = texto(paquete.get("tipo_firma_paquete"))
+        if tipo_firma_paquete != "Simple":
+            raise ValueError(
+                "Este endpoint corresponde al flujo de Firma Simple. "
+                f"El paquete está configurado como TIPO_FIRMA={tipo_firma_paquete!r}. "
+                "La ruta Notarial se habilitará en la fase correspondiente."
+            )
+
+        if not paquete.get("paquete_listo"):
+            pendientes = paquete.get("documentos_pendientes") or []
+            detalles: list[str] = []
+            for fila in pendientes:
+                titulo_pendiente = (
+                    texto(fila.get("titulo"))
+                    or texto(fila.get("id_documento"))
+                    or "Documento"
+                )
+                motivos = fila.get("motivos") or []
+                detalles.append(
+                    f"{titulo_pendiente}: "
+                    + ("; ".join(str(x) for x in motivos) or "no está listo")
+                )
+
+            mensaje_pendientes = " | ".join(detalles)
+            raise ValueError(
+                "No se puede enviar el paquete a firma porque existen "
+                "documentos pendientes. "
+                + mensaje_pendientes
+            )
+
+        documentos_paquete = paquete.get("documentos") or []
+        if not documentos_paquete:
+            raise ValueError("La jerarquía no devolvió documentos para enviar")
+
+        # Se mantienen además las validaciones históricas de la raíz.
         if estado != "Listo para firma":
             raise ValueError(
-                "Solo se puede enviar a firma un documento en estado "
+                "Solo se puede enviar a firma un documento raíz en estado "
                 f"Listo para firma. Estado actual: {estado!r}"
             )
 
@@ -7729,15 +8198,7 @@ def enviar_firma():
                 f"Estado actual: {estado_firma!r}"
             )
 
-        pdf_id = texto(documento.get("PDF_PARA_FIRMA_ID"))
-        google_doc_id = texto(documento.get("GOOGLE_DOC_ID"))
         id_version = texto(documento.get("ID_VERSION_ACTUAL"))
-        if not pdf_id:
-            raise ValueError("Documentos no tiene PDF_PARA_FIRMA_ID")
-        if not google_doc_id:
-            raise ValueError(
-                "Documentos no tiene GOOGLE_DOC_ID para exportar el DOCX"
-            )
         if not id_version:
             raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
 
@@ -7775,12 +8236,13 @@ def enviar_firma():
         plantilla = buscar_plantilla(id_plantilla)
 
         fecha_envio = ahora_iso()
-        asunto, cuerpo, cuerpo_html = construir_email_firma_externo(
+        asunto, cuerpo, cuerpo_html = construir_email_firma_paquete_externo(
             documento=documento,
             plantilla=plantilla,
             usuario=usuario,
             mensaje_adicional=mensaje_adicional,
             fecha_envio=fecha_envio,
+            documentos_paquete=documentos_paquete,
         )
 
         marcar_envio_firma_en_proceso(
@@ -7790,25 +8252,18 @@ def enviar_firma():
 
         drive_service = obtener_drive_service()
         gmail_service = obtener_gmail_service()
-        pdf_bytes, pdf_nombre = descargar_pdf_drive(
+
+        adjuntos, detalle_documentos = construir_adjuntos_paquete_firma(
             drive_service=drive_service,
-            file_id=pdf_id,
-        )
-        docx_bytes, docx_nombre = exportar_docx_drive(
-            drive_service=drive_service,
-            google_doc_id=google_doc_id,
-            nombre_base=pdf_nombre,
+            documentos_paquete=documentos_paquete,
         )
 
-        respuesta_gmail = enviar_email_con_pdf(
+        respuesta_gmail = enviar_email_con_adjuntos(
             gmail_service=gmail_service,
             destinatarios=destinatarios,
             asunto=asunto,
             cuerpo=cuerpo,
-            pdf_bytes=pdf_bytes,
-            pdf_nombre=pdf_nombre,
-            docx_bytes=docx_bytes,
-            docx_nombre=docx_nombre,
+            adjuntos=adjuntos,
             reply_to=usuario,
             cuerpo_html=cuerpo_html,
         )
@@ -7827,21 +8282,20 @@ def enviar_firma():
 
         advertencias: list[str] = []
         try:
-            crear_evento_enviado_firma(
-                id_documento=id_documento,
-                id_version=id_version,
+            crear_eventos_enviado_firma_paquete(
+                id_documento_raiz=id_documento,
+                titulo_raiz=texto(paquete.get("titulo_raiz")),
                 usuario=usuario,
                 fecha=fecha_envio,
                 destinatarios=destinatarios,
-                pdf_nombre=pdf_nombre,
-                docx_nombre=docx_nombre,
+                detalle_documentos=detalle_documentos,
                 message_id=message_id,
             )
         except Exception as exc_evento:
             traceback.print_exc()
             advertencias.append(
-                "El correo se envió, pero no se pudo crear el evento: "
-                f"{exc_evento}"
+                "El correo se envió, pero no se pudo registrar completamente "
+                f"la trazabilidad del paquete: {exc_evento}"
             )
 
         return jsonify(
@@ -7849,14 +8303,15 @@ def enviar_firma():
                 "ok": True,
                 "ya_procesado": False,
                 "id_documento": id_documento,
+                "id_documento_raiz": texto(paquete.get("id_documento_raiz")),
                 "estado": "En firma",
                 "estado_firma": "Pendiente",
+                "tipo_firma": tipo_firma_paquete,
                 "message_id": message_id,
                 "destinatarios": destinatarios,
-                "pdf_id": pdf_id,
-                "pdf_nombre": pdf_nombre,
-                "google_doc_id": google_doc_id,
-                "docx_nombre": docx_nombre,
+                "cantidad_documentos": len(detalle_documentos),
+                "cantidad_adjuntos": len(adjuntos),
+                "documentos_paquete": detalle_documentos,
                 "advertencias": advertencias,
             }
         )
