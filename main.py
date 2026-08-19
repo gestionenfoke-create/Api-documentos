@@ -8871,11 +8871,106 @@ def crear_eventos_cierre_firma(
     return evento_cierre
 
 
+def obtener_paquete_firma_actual(
+    id_documento: str,
+) -> tuple[dict[str, Any], list[tuple[dict[str, Any], int]], list[str]]:
+    """
+    Resuelve raíz + jerarquía sin exigir que todos estén "Listo para firma".
+
+    Se usa después del envío externo, cuando la raíz ya está "En firma" pero
+    los descendientes continúan "Listo para firma".
+    """
+    documentos = buscar_todos_documentos()
+    indice = construir_indice_documentos(documentos)
+    raiz, camino_a_raiz = obtener_documento_raiz_desde_indice(
+        id_documento,
+        indice,
+    )
+    id_raiz = texto(raiz.get("ID_DOCUMENTO"))
+    jerarquia = construir_jerarquia_desde_raiz(id_raiz, indice)
+    return raiz, jerarquia, camino_a_raiz
+
+
+def crear_eventos_cierre_firma_paquete(
+    *,
+    id_documento: str,
+    id_version: str,
+    usuario: str,
+    fecha: str,
+    nombre_origen: str,
+    nombre_final: str,
+    comentario: str,
+    es_raiz: bool,
+    titulo_raiz: str,
+    cantidad_documentos: int,
+) -> dict[str, Any]:
+    """Registra el cierre individual dentro de un paquete de firma simple."""
+    estado_anterior = "En firma" if es_raiz else "Listo para firma"
+    detalle_carga = (
+        f"Se cargó {nombre_origen} y se archivó como {nombre_final}."
+    )
+    if not es_raiz:
+        detalle_carga += (
+            f" El documento formaba parte del paquete de firma administrado "
+            f"por {titulo_raiz}."
+        )
+    if comentario:
+        detalle_carga += f" Comentario: {comentario}"
+
+    evento_carga: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "PDF firmado cargado",
+        "ESTADO_ANTERIOR": estado_anterior,
+        "ESTADO_NUEVO": estado_anterior,
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": detalle_carga,
+    }
+    evento_cierre: dict[str, Any] = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "Proceso terminado",
+        "ESTADO_ANTERIOR": estado_anterior,
+        "ESTADO_NUEVO": "Proceso terminado",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            "El documento quedó cerrado con su PDF firmado definitivo como "
+            f"parte de un paquete de {cantidad_documentos} documento(s)."
+        ),
+    }
+
+    appsheet_action(
+        TABLA_EVENTOS,
+        "Add",
+        [evento_carga, evento_cierre],
+    )
+    return evento_cierre
+
+
 @app.route("/registrar-firma", methods=["POST"])
 def registrar_firma():
+    """
+    Fase 2B: cierre de firma simple por paquete documental.
+
+    Reglas:
+    - solo la raíz administra el cierre externo;
+    - el paquete debe ser de TIPO_FIRMA Simple;
+    - cada integrante debe tener su propio PDF_FIRMADO cargado;
+    - se crea una versión Firmado y se cierra cada documento de la jerarquía;
+    - los descendientes se procesan antes que la raíz para que un fallo no deje
+      la cabecera raíz cerrada mientras existan integrantes pendientes;
+    - un reintento omite documentos que ya quedaron correctamente cerrados.
+    """
     id_documento = ""
-    pdf_final_creado = False
-    documento_cerrado = False
+    raiz_id = ""
+    raiz_marcada_procesando = False
+    cantidad_pdf_creados = 0
 
     try:
         validar_configuracion()
@@ -8884,78 +8979,90 @@ def registrar_firma():
         data = request.get_json(silent=True) or {}
         id_documento = texto(data.get("id_documento"))
         usuario = texto(data.get("usuario"))
-        valor_pdf_firmado = texto(data.get("pdf_firmado"))
+        valor_pdf_firmado_raiz = texto(data.get("pdf_firmado"))
         comentario = texto(data.get("comentario"))
 
         if not id_documento:
             return {"error": "Falta id_documento"}, 400
 
-        documento = buscar_documento(id_documento)
-        estado = texto(documento.get("ESTADO"))
-        estado_firma = texto(documento.get("ESTADO_FIRMA"))
-        pdf_final_existente = texto(documento.get("PDF_FIRMADO_ID"))
+        raiz, jerarquia, camino_a_raiz = obtener_paquete_firma_actual(
+            id_documento
+        )
+        raiz_id = texto(raiz.get("ID_DOCUMENTO"))
+        titulo_raiz = texto(raiz.get("TITULO")) or raiz_id
 
-        if estado == "Proceso terminado" and pdf_final_existente:
-            notificaciones_reintento: list[dict[str, Any]] = []
-            advertencias_reintento: list[str] = []
-            try:
-                (
-                    notificaciones_reintento,
-                    advertencias_reintento,
-                ) = reanudar_notificaciones_cierre_proceso(
-                    documento=documento,
-                    datos_solicitud=data,
-                )
-            except Exception as exc_notificacion:
-                traceback.print_exc()
-                advertencias_reintento.append(
-                    "El proceso ya estaba cerrado, pero no se pudieron "
-                    "reanudar sus notificaciones: "
-                    f"{exc_notificacion}"
-                )
+        if id_documento != raiz_id:
+            raise ValueError(
+                "Solo el documento raíz puede registrar el cierre de un "
+                f"paquete de firma. Raíz detectada: {raiz_id}"
+            )
 
+        tipo_firma = normalizar_tipo_firma(raiz.get("TIPO_FIRMA"))
+        if tipo_firma != "Simple":
+            raise ValueError(
+                "El endpoint /registrar-firma de paquete solo corresponde a "
+                f"TIPO_FIRMA Simple. Tipo encontrado: {tipo_firma}"
+            )
+
+        estado_raiz = texto(raiz.get("ESTADO"))
+        estado_firma_raiz = texto(raiz.get("ESTADO_FIRMA"))
+
+        # Idempotencia completa: si todos los integrantes ya están cerrados,
+        # no se vuelve a copiar ningún PDF ni crear versiones.
+        cerrados = [
+            fila
+            for fila, _nivel in jerarquia
+            if texto(fila.get("ESTADO")) == "Proceso terminado"
+            and texto(fila.get("PDF_FIRMADO_ID"))
+        ]
+        if len(cerrados) == len(jerarquia):
             return jsonify(
                 {
                     "ok": True,
                     "ya_procesado": True,
-                    "id_documento": id_documento,
-                    "estado": estado,
-                    "estado_firma": estado_firma,
-                    "pdf_firmado_id": pdf_final_existente,
-                    "pdf_firmado_url": texto(
-                        documento.get("PDF_FIRMADO_URL")
-                    ),
-                    "notificaciones": notificaciones_reintento,
-                    "advertencias": advertencias_reintento,
+                    "id_documento": raiz_id,
+                    "estado": "Proceso terminado",
+                    "estado_firma": "Firmado",
+                    "cantidad_documentos": len(jerarquia),
+                    "cantidad_documentos_cerrados": len(cerrados),
+                    "camino_a_raiz": camino_a_raiz,
+                    "documentos": [
+                        {
+                            "id_documento": texto(fila.get("ID_DOCUMENTO")),
+                            "titulo": texto(fila.get("TITULO")),
+                            "estado": texto(fila.get("ESTADO")),
+                            "pdf_firmado_id": texto(
+                                fila.get("PDF_FIRMADO_ID")
+                            ),
+                            "pdf_firmado_url": normalizar_url_appsheet(
+                                fila.get("PDF_FIRMADO_URL")
+                            ),
+                        }
+                        for fila, _nivel in jerarquia
+                    ],
                 }
             )
 
-        if estado_firma == "Procesando":
+        if estado_firma_raiz == "Procesando":
             return {
                 "error": (
-                    "Ya existe un cierre de firma en proceso. Revisa el registro "
-                    "antes de volver a intentarlo."
+                    "Ya existe un cierre de firma en proceso para el paquete. "
+                    "Revisa el registro antes de volver a intentarlo."
                 )
             }, 409
 
-        if estado != "En firma":
+        if estado_raiz != "En firma":
             raise ValueError(
-                "Solo se puede registrar la firma cuando el documento está "
-                f"En firma. Estado actual: {estado!r}"
+                "La raíz debe estar En firma para registrar el paquete firmado. "
+                f"Estado actual: {estado_raiz!r}"
             )
-        if estado_firma not in {"Pendiente", "Error"}:
+        if estado_firma_raiz not in {"Pendiente", "Error"}:
             raise ValueError(
-                "El estado de firma no permite cerrar el documento. "
-                f"Estado actual: {estado_firma!r}"
+                "El estado de firma de la raíz no permite cerrar el paquete. "
+                f"Estado actual: {estado_firma_raiz!r}"
             )
 
-        valor_pdf_firmado = valor_pdf_firmado or texto(
-            documento.get("PDF_FIRMADO")
-        )
-        if not valor_pdf_firmado:
-            raise ValueError("Debe cargar un archivo en PDF_FIRMADO")
-
-        usuario_registrado = texto(documento.get("CARGADO_POR"))
+        usuario_registrado = texto(raiz.get("CARGADO_POR"))
         usuario = usuario or usuario_registrado
         if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
             raise ValueError("CARGADO_POR debe ser un correo válido")
@@ -8967,183 +9074,337 @@ def registrar_firma():
                 "El usuario del webhook no coincide con CARGADO_POR"
             )
 
-        id_version_origen = texto(documento.get("ID_VERSION_ACTUAL"))
-        if not id_version_origen:
-            raise ValueError("Documentos no tiene ID_VERSION_ACTUAL")
-        version_origen = buscar_version_por_id(id_version_origen)
-
-        numero_version = entero(
-            documento.get("VERSION_ACTUAL"),
-            "VERSION_ACTUAL",
-        )
-        numero_revision = entero(
-            documento.get("REVISION_ACTUAL") or 0,
-            "REVISION_ACTUAL",
-        )
-
-        id_plantilla = texto(documento.get("ID_PLANTILLA"))
-        plantilla = buscar_plantilla(id_plantilla)
-        folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
-        if not folder_id:
-            raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
-
-        fecha = ahora_iso()
-        marcar_registro_firma_en_proceso(id_documento, fecha)
-
         drive_service = obtener_drive_service()
-        pdf_subido = buscar_pdf_cargado_appsheet(
-            drive_service,
-            valor_pdf_firmado,
+        fecha = ahora_iso()
+
+        # Prevalidación completa ANTES de mutar datos. Esto evita cerrar una
+        # parte del paquete para luego descubrir que otro integrante no tiene
+        # PDF firmado, versión vigente o carpeta de destino.
+        preparados: list[dict[str, Any]] = []
+        faltantes: list[str] = []
+
+        for fila, nivel in jerarquia:
+            doc_id = texto(fila.get("ID_DOCUMENTO"))
+            titulo = texto(fila.get("TITULO")) or doc_id
+            es_raiz = doc_id == raiz_id
+            estado = texto(fila.get("ESTADO"))
+            pdf_final_existente = texto(fila.get("PDF_FIRMADO_ID"))
+
+            if estado == "Proceso terminado" and pdf_final_existente:
+                preparados.append(
+                    {
+                        "fila": fila,
+                        "nivel": nivel,
+                        "es_raiz": es_raiz,
+                        "ya_cerrado": True,
+                    }
+                )
+                continue
+
+            estado_esperado = "En firma" if es_raiz else "Listo para firma"
+            if estado != estado_esperado:
+                faltantes.append(
+                    f"{titulo}: estado {estado!r}; se requiere "
+                    f"{estado_esperado!r}"
+                )
+                continue
+
+            id_version_origen = texto(fila.get("ID_VERSION_ACTUAL"))
+            google_doc_id = texto(fila.get("GOOGLE_DOC_ID"))
+            if not id_version_origen:
+                faltantes.append(f"{titulo}: falta ID_VERSION_ACTUAL")
+                continue
+            if not google_doc_id:
+                faltantes.append(f"{titulo}: falta GOOGLE_DOC_ID")
+                continue
+
+            version_origen = buscar_version_por_id(id_version_origen)
+            if texto(version_origen.get("ETAPA")) != "Para firma":
+                faltantes.append(
+                    f"{titulo}: la versión vigente no está en etapa Para firma"
+                )
+                continue
+
+            valor_pdf = (
+                valor_pdf_firmado_raiz
+                if es_raiz and valor_pdf_firmado_raiz
+                else texto(fila.get("PDF_FIRMADO"))
+            )
+            if not valor_pdf:
+                faltantes.append(
+                    f"{titulo}: debe cargar un archivo en PDF_FIRMADO"
+                )
+                continue
+
+            id_plantilla = texto(fila.get("ID_PLANTILLA"))
+            plantilla = buscar_plantilla(id_plantilla)
+            folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
+            if not folder_id:
+                faltantes.append(
+                    f"{titulo}: la plantilla no tiene CARPETA_DESTINO_ID"
+                )
+                continue
+
+            pdf_subido = buscar_pdf_cargado_appsheet(
+                drive_service,
+                valor_pdf,
+            )
+
+            preparados.append(
+                {
+                    "fila": fila,
+                    "nivel": nivel,
+                    "es_raiz": es_raiz,
+                    "ya_cerrado": False,
+                    "id_version_origen": id_version_origen,
+                    "version_origen": version_origen,
+                    "folder_id": folder_id,
+                    "pdf_subido": pdf_subido,
+                }
+            )
+
+        if faltantes:
+            raise ValueError(
+                "No se puede cerrar el paquete de firma. "
+                + " | ".join(faltantes)
+            )
+
+        marcar_registro_firma_en_proceso(raiz_id, fecha)
+        raiz_marcada_procesando = True
+
+        # Descendientes primero, raíz al final.
+        preparados.sort(
+            key=lambda item: (
+                -int(item.get("nivel", 0)),
+                texto(item["fila"].get("TITULO")).casefold(),
+            )
         )
 
-        titulo = limpiar_nombre_archivo(texto(documento.get("TITULO")))
-        nombre_final = f"{titulo}_V{numero_version:02d}_FIRMADO.pdf"
-        pdf_final = copiar_pdf_firmado_o_reutilizar(
-            drive_service=drive_service,
-            source_file_id=texto(pdf_subido.get("id")),
-            folder_id=folder_id,
-            nombre_final=nombre_final,
-        )
-        pdf_final_creado = True
-
-        version_firmada_existente = buscar_version_firmada(
-            id_documento,
-            numero_version,
-        )
-        if version_firmada_existente:
-            id_version_final = texto(
-                version_firmada_existente.get("ID_VERSION")
-            )
-        else:
-            id_version_final = nuevo_id()
-            actualizar_estado_version(
-                id_version=id_version_origen,
-                estado_version="Cerrada",
-                fecha_cierre=fecha,
-            )
-            google_doc_id_origen = texto(
-                version_origen.get("GOOGLE_DOC_ID")
-            )
-            google_doc_url_origen = normalizar_url_appsheet(
-                version_origen.get("GOOGLE_DOC_URL")
-            )
-
-            crear_version_firmada(
-                id_version=id_version_final,
-                id_documento=id_documento,
-                id_version_origen=id_version_origen,
-                numero_version=numero_version,
-                numero_revision=numero_revision,
-                nombre_archivo=nombre_final,
-                google_doc_id=google_doc_id_origen,
-                google_doc_url=google_doc_url_origen,
-                pdf_id=pdf_final["id"],
-                pdf_url=pdf_final["url"],
-                comentario=comentario,
-                usuario=usuario,
-                fecha=fecha,
-            )
-
-        actualizar_documento_proceso_terminado(
-            id_documento=id_documento,
-            id_version_final=id_version_final,
-            pdf_final=pdf_final,
-            usuario=usuario,
-            fecha=fecha,
-        )
-        documento_cerrado = True
-
-        advertencias: list[str] = []
-        evento_cierre: dict[str, Any] | None = None
-        try:
-            evento_cierre = crear_eventos_cierre_firma(
-                id_documento=id_documento,
-                id_version=id_version_final,
-                usuario=usuario,
-                fecha=fecha,
-                nombre_origen=texto(pdf_subido.get("name")),
-                nombre_final=pdf_final["name"],
-                comentario=comentario,
-            )
-        except Exception as exc_evento:
-            traceback.print_exc()
-            advertencias.append(
-                "El documento se cerró, pero no se pudieron crear todos los "
-                f"eventos: {exc_evento}"
-            )
-
+        resultados: list[dict[str, Any]] = []
         notificaciones: list[dict[str, Any]] = []
-        if evento_cierre is not None:
-            try:
-                documento_actualizado = buscar_documento(id_documento)
-                cadena = buscar_cadena_documento_version(
-                    id_documento=id_documento,
-                    numero_version=numero_version,
+        advertencias: list[str] = []
+        cantidad_documentos = len(jerarquia)
+
+        for item in preparados:
+            fila = item["fila"]
+            doc_id = texto(fila.get("ID_DOCUMENTO"))
+            titulo = texto(fila.get("TITULO")) or doc_id
+            es_raiz = bool(item.get("es_raiz"))
+
+            if item.get("ya_cerrado"):
+                resultados.append(
+                    {
+                        "id_documento": doc_id,
+                        "titulo": titulo,
+                        "ya_procesado": True,
+                        "estado": "Proceso terminado",
+                        "pdf_firmado_id": texto(fila.get("PDF_FIRMADO_ID")),
+                        "pdf_firmado_url": normalizar_url_appsheet(
+                            fila.get("PDF_FIRMADO_URL")
+                        ),
+                    }
                 )
-                notificaciones = ejecutar_notificaciones_cierre_proceso(
-                    documento=documento_actualizado,
-                    evento=evento_cierre,
-                    cadena=cadena,
+                continue
+
+            id_version_origen = item["id_version_origen"]
+            version_origen = item["version_origen"]
+            pdf_subido = item["pdf_subido"]
+            folder_id = item["folder_id"]
+
+            numero_version = entero(
+                fila.get("VERSION_ACTUAL"),
+                "VERSION_ACTUAL",
+            )
+            numero_revision = entero(
+                fila.get("REVISION_ACTUAL") or 0,
+                "REVISION_ACTUAL",
+            )
+
+            version_firmada_existente = buscar_version_firmada(
+                doc_id,
+                numero_version,
+            )
+
+            if version_firmada_existente:
+                id_version_final = texto(
+                    version_firmada_existente.get("ID_VERSION")
                 )
-                fallidas = [
-                    resultado
-                    for resultado in notificaciones
-                    if not resultado.get("ok")
-                ]
-                if fallidas:
-                    advertencias.append(
-                        f"{len(fallidas)} notificación(es) de cierre quedaron "
-                        "omitidas o con error. Revisa Documento_Notificaciones."
+                pdf_final = {
+                    "id": texto(
+                        version_firmada_existente.get("PDF_VERSION_ID")
+                    ),
+                    "url": normalizar_url_appsheet(
+                        version_firmada_existente.get("PDF_VERSION_URL")
+                    ),
+                    "name": texto(
+                        version_firmada_existente.get("NOMBRE_ARCHIVO")
+                    ),
+                }
+                if not pdf_final["id"]:
+                    raise RuntimeError(
+                        f"{titulo}: la versión Firmado existente no tiene PDF"
                     )
-            except Exception as exc_notificacion:
+            else:
+                titulo_archivo = limpiar_nombre_archivo(titulo)
+                nombre_final = (
+                    f"{titulo_archivo}_V{numero_version:02d}_FIRMADO.pdf"
+                )
+                pdf_final = copiar_pdf_firmado_o_reutilizar(
+                    drive_service=drive_service,
+                    source_file_id=texto(pdf_subido.get("id")),
+                    folder_id=folder_id,
+                    nombre_final=nombre_final,
+                )
+                cantidad_pdf_creados += 1
+                id_version_final = nuevo_id()
+
+                actualizar_estado_version(
+                    id_version=id_version_origen,
+                    estado_version="Cerrada",
+                    fecha_cierre=fecha,
+                )
+                google_doc_id_origen = texto(
+                    version_origen.get("GOOGLE_DOC_ID")
+                )
+                google_doc_url_origen = normalizar_url_appsheet(
+                    version_origen.get("GOOGLE_DOC_URL")
+                )
+                crear_version_firmada(
+                    id_version=id_version_final,
+                    id_documento=doc_id,
+                    id_version_origen=id_version_origen,
+                    numero_version=numero_version,
+                    numero_revision=numero_revision,
+                    nombre_archivo=pdf_final["name"],
+                    google_doc_id=google_doc_id_origen,
+                    google_doc_url=google_doc_url_origen,
+                    pdf_id=pdf_final["id"],
+                    pdf_url=pdf_final["url"],
+                    comentario=comentario,
+                    usuario=usuario,
+                    fecha=fecha,
+                )
+
+            actualizar_documento_proceso_terminado(
+                id_documento=doc_id,
+                id_version_final=id_version_final,
+                pdf_final=pdf_final,
+                usuario=usuario,
+                fecha=fecha,
+            )
+
+            evento_cierre: dict[str, Any] | None = None
+            try:
+                evento_cierre = crear_eventos_cierre_firma_paquete(
+                    id_documento=doc_id,
+                    id_version=id_version_final,
+                    usuario=usuario,
+                    fecha=fecha,
+                    nombre_origen=texto(pdf_subido.get("name")),
+                    nombre_final=pdf_final["name"],
+                    comentario=comentario,
+                    es_raiz=es_raiz,
+                    titulo_raiz=titulo_raiz,
+                    cantidad_documentos=cantidad_documentos,
+                )
+            except Exception as exc_evento:
                 traceback.print_exc()
                 advertencias.append(
-                    "El documento se cerró correctamente, pero falló el "
-                    f"proceso de notificaciones internas: {exc_notificacion}"
+                    f"{titulo}: se cerró, pero no se pudieron crear todos "
+                    f"los eventos: {exc_evento}"
                 )
 
+            if evento_cierre is not None:
+                try:
+                    documento_actualizado = buscar_documento(doc_id)
+                    cadena = buscar_cadena_documento_version(
+                        id_documento=doc_id,
+                        numero_version=numero_version,
+                    )
+                    resultados_notificacion = (
+                        ejecutar_notificaciones_cierre_proceso(
+                            documento=documento_actualizado,
+                            evento=evento_cierre,
+                            cadena=cadena,
+                        )
+                    )
+                    for resultado in resultados_notificacion:
+                        notificaciones.append(
+                            {"id_documento": doc_id, **resultado}
+                        )
+                    fallidas = [
+                        resultado
+                        for resultado in resultados_notificacion
+                        if not resultado.get("ok")
+                    ]
+                    if fallidas:
+                        advertencias.append(
+                            f"{titulo}: {len(fallidas)} notificación(es) de "
+                            "cierre quedaron omitidas o con error."
+                        )
+                except Exception as exc_notificacion:
+                    traceback.print_exc()
+                    advertencias.append(
+                        f"{titulo}: el documento se cerró, pero falló el "
+                        f"proceso de notificaciones: {exc_notificacion}"
+                    )
+
+            resultados.append(
+                {
+                    "id_documento": doc_id,
+                    "titulo": titulo,
+                    "ya_procesado": False,
+                    "estado": "Proceso terminado",
+                    "id_version_final": id_version_final,
+                    "pdf_firmado_id": pdf_final["id"],
+                    "pdf_firmado_url": pdf_final["url"],
+                    "pdf_firmado_nombre": pdf_final["name"],
+                }
+            )
+
+        raiz_final = buscar_documento(raiz_id)
         return jsonify(
             {
                 "ok": True,
                 "ya_procesado": False,
-                "id_documento": id_documento,
-                "estado": "Proceso terminado",
-                "estado_firma": "Firmado",
-                "id_version_final": id_version_final,
-                "pdf_firmado_id": pdf_final["id"],
-                "pdf_firmado_url": pdf_final["url"],
-                "pdf_firmado_nombre": pdf_final["name"],
+                "id_documento": raiz_id,
+                "estado": texto(raiz_final.get("ESTADO")),
+                "estado_firma": texto(raiz_final.get("ESTADO_FIRMA")),
+                "cantidad_documentos": cantidad_documentos,
+                "cantidad_documentos_cerrados": len(resultados),
+                "cantidad_pdf_creados": cantidad_pdf_creados,
+                "documentos": resultados,
                 "notificaciones": notificaciones,
                 "advertencias": advertencias,
             }
         )
 
     except PermissionError as exc:
-        if id_documento:
+        if raiz_id and raiz_marcada_procesando:
             restaurar_documento_tras_error_registro_firma(
-                id_documento,
+                raiz_id,
                 str(exc),
             )
         return {"error": str(exc)}, 403
 
     except (ValueError, LookupError) as exc:
-        if id_documento:
+        if raiz_id and raiz_marcada_procesando:
             restaurar_documento_tras_error_registro_firma(
-                id_documento,
+                raiz_id,
                 str(exc),
             )
         return {"error": str(exc)}, 400
 
     except Exception as exc:
         traceback.print_exc()
-        if id_documento:
+        if raiz_id and raiz_marcada_procesando:
             restaurar_documento_tras_error_registro_firma(
-                id_documento,
+                raiz_id,
                 str(exc),
             )
         return {
             "error": str(exc),
-            "pdf_final_creado": pdf_final_creado,
+            "cantidad_pdf_creados": cantidad_pdf_creados,
         }, 500
 
 
