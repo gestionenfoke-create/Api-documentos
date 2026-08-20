@@ -898,6 +898,77 @@ def construir_jerarquia_desde_raiz(
     return resultado
 
 
+ROL_RESPONSABLE_FIRMAS = "responsable de firmas"
+ESTADO_GESTION_FIRMA = "Gestión de firma"
+
+
+def es_responsable_firmas(fila: dict[str, Any] | None) -> bool:
+    """Indica si una fila de la cadena corresponde al responsable operativo de firma."""
+    if not fila:
+        return False
+    return texto(fila.get("ROL_FLUJO")).strip().lower() == ROL_RESPONSABLE_FIRMAS
+
+
+def obtener_responsable_firmas_cadena(
+    cadena: list[dict[str, Any]],
+    *,
+    contexto: str = "cadena vigente",
+) -> dict[str, Any]:
+    """Exige exactamente un Responsable de firmas dentro de la cadena indicada."""
+    responsables = [fila for fila in cadena if es_responsable_firmas(fila)]
+    if not responsables:
+        raise ValueError(
+            f"{contexto}: no existe un integrante con ROL_FLUJO='Responsable de firmas'"
+        )
+    if len(responsables) > 1:
+        raise ValueError(
+            f"{contexto}: existen {len(responsables)} integrantes con "
+            "ROL_FLUJO='Responsable de firmas'; debe existir exactamente uno"
+        )
+    responsable = responsables[0]
+    if not texto(responsable.get("APROBADOR")):
+        raise ValueError("El Responsable de firmas no tiene APROBADOR/correo")
+    return responsable
+
+
+def obtener_primer_responsable_aprobacion(
+    cadena: list[dict[str, Any]],
+    *,
+    contexto: str = "cadena vigente",
+) -> dict[str, Any]:
+    """Devuelve el primer integrante que participa realmente de la aprobación interna."""
+    aprobadores = [fila for fila in cadena if not es_responsable_firmas(fila)]
+    if not aprobadores:
+        raise ValueError(
+            f"{contexto}: no existe ningún integrante de aprobación distinto del "
+            "Responsable de firmas"
+        )
+    return min(aprobadores, key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"))
+
+
+def validar_responsable_firmas_actual(documento: dict[str, Any]) -> tuple[bool, str]:
+    """Valida que el responsable actual de un Listo para firma sea el rol de firmas."""
+    id_actual = texto(documento.get("ID_APROBACION_ACTUAL"))
+    if not id_actual:
+        return False, "No tiene responsable actual de firma"
+    try:
+        fila = buscar_aprobacion_actual(id_actual)
+    except Exception as exc:
+        return False, f"No se pudo resolver el responsable actual de firma: {exc}"
+    if not es_responsable_firmas(fila):
+        return False, (
+            "El responsable actual no tiene ROL_FLUJO='Responsable de firmas'"
+        )
+    if texto(fila.get("ESTADO")) != ESTADO_GESTION_FIRMA:
+        return False, (
+            f"El Responsable de firmas está en estado {texto(fila.get('ESTADO'))!r}; "
+            f"se requiere {ESTADO_GESTION_FIRMA!r}"
+        )
+    if not es_verdadero(fila.get("CADENA_ACTIVA")):
+        return False, "La fila del Responsable de firmas no está activa"
+    return True, ""
+
+
 def evaluar_documento_para_paquete(
     documento: dict[str, Any],
     *,
@@ -924,8 +995,15 @@ def evaluar_documento_para_paquete(
         motivos.append(
             f"Estado {estado or '<vacío>'}; se requiere 'Listo para firma'"
         )
-    if id_aprobacion_actual:
-        motivos.append("La cadena interna todavía tiene un aprobador actual")
+    responsable_firma_valido = False
+    if estado == "Listo para firma":
+        responsable_firma_valido, motivo_responsable = validar_responsable_firmas_actual(
+            documento
+        )
+        if not responsable_firma_valido:
+            motivos.append(motivo_responsable)
+    elif id_aprobacion_actual:
+        motivos.append("La cadena interna todavía tiene un responsable de aprobación")
     if not id_version:
         motivos.append("No tiene ID_VERSION_ACTUAL")
     if not google_doc_id:
@@ -953,7 +1031,8 @@ def evaluar_documento_para_paquete(
         "id_version_actual": id_version,
         "google_doc_id": google_doc_id,
         "pdf_para_firma_id": pdf_id,
-        "cadena_aprobacion_concluida": not bool(id_aprobacion_actual),
+        "cadena_aprobacion_concluida": responsable_firma_valido,
+        "responsable_firmas_asignado": responsable_firma_valido,
         "listo_para_paquete": not motivos,
         "motivos": motivos,
     }
@@ -1251,9 +1330,18 @@ def construir_cadena_actual(
     fecha_inicio: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     filas_actuales: list[dict[str, Any]] = []
+    primer_base = obtener_primer_responsable_aprobacion(
+        cadena_plantilla,
+        contexto=f"Plantilla {id_plantilla}",
+    )
+    obtener_responsable_firmas_cadena(
+        cadena_plantilla,
+        contexto=f"Plantilla {id_plantilla}",
+    )
+    orden_primero = entero(primer_base.get("ORDEN"), "ORDEN")
     primer_actual: dict[str, Any] | None = None
 
-    for indice, fila_base in enumerate(cadena_plantilla):
+    for fila_base in cadena_plantilla:
         id_aprobacion_actual = nuevo_id()
         orden = entero(fila_base.get("ORDEN"), "ORDEN")
         aprobador = texto(fila_base.get("APROBADOR"))
@@ -1265,6 +1353,7 @@ def construir_cadena_actual(
                 f"El responsable de orden {orden} no tiene APROBADOR"
             )
 
+        es_primero = orden == orden_primero and not es_responsable_firmas(fila_base)
         fila_actual: dict[str, Any] = {
             "ID_APROBACION_ACTUAL": id_aprobacion_actual,
             "ID_APROBACION_PLANTILLA": texto(
@@ -1277,13 +1366,14 @@ def construir_cadena_actual(
             "APROBADOR": aprobador,
             "NOMBRE": nombre,
             "ROL_FLUJO": rol_flujo,
-            "ESTADO": "En elaboración" if indice == 0 else "Pendiente",
+            "ESTADO": "En elaboración" if es_primero else "Pendiente",
             "CADENA_ACTIVA": True,
         }
 
-        if indice == 0:
+        if es_primero:
             fila_actual.update(
                 {
+                    "ID_VERSION_TRABAJADA": id_version,
                     "FECHA_INICIO": fecha_inicio,
                     "PERMISSION_ID_DRIVE": permission_id_drive,
                 }
@@ -1584,6 +1674,7 @@ def actualizar_documento_envio_revision(
                 "FECHA_ULTIMO_ENVIO": fecha,
                 "FECHA_ULTIMA_ACTUALIZACION": fecha,
                 "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
             }
         ],
     )
@@ -1689,7 +1780,16 @@ def crear_documento():
         if not folder_id:
             raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
 
-        primer_base = cadena_plantilla[0]
+        # La plantilla debe tener exactamente un responsable operativo de firmas,
+        # pero ese rol no participa como etapa de aprobación.
+        obtener_responsable_firmas_cadena(
+            cadena_plantilla,
+            contexto=f"Plantilla {id_plantilla}",
+        )
+        primer_base = obtener_primer_responsable_aprobacion(
+            cadena_plantilla,
+            contexto=f"Plantilla {id_plantilla}",
+        )
         primer_email = texto(primer_base.get("APROBADOR"))
         primer_orden = entero(primer_base.get("ORDEN"), "ORDEN")
 
@@ -1955,6 +2055,7 @@ def enviar_revision():
             fila
             for fila in cadena_actual
             if entero(fila.get("ORDEN"), "ORDEN") > orden_actual
+            and not es_responsable_firmas(fila)
             and texto(fila.get("ESTADO")) in {"Pendiente", "En revisión"}
         ]
 
@@ -2347,19 +2448,23 @@ def actualizar_aprobadores_aprobacion_intermedia(
 def cerrar_cadena_para_firma(
     cadena_actual: list[dict[str, Any]],
     aprobacion_actual: dict[str, Any],
+    responsable_firmas: dict[str, Any],
+    id_version_para_firma: str,
     comentario: str,
     fecha: str,
 ) -> None:
+    """Cierra la aprobación interna y deja activo al Responsable de firmas."""
     filas: list[dict[str, Any]] = []
-    id_actual = texto(
-        aprobacion_actual.get("ID_APROBACION_ACTUAL")
+    id_actual = texto(aprobacion_actual.get("ID_APROBACION_ACTUAL"))
+    id_responsable_firmas = texto(
+        responsable_firmas.get("ID_APROBACION_ACTUAL")
     )
 
     for fila in cadena_actual:
         id_fila = texto(fila.get("ID_APROBACION_ACTUAL"))
         cambios: dict[str, Any] = {
             "ID_APROBACION_ACTUAL": id_fila,
-            "CADENA_ACTIVA": False,
+            "CADENA_ACTIVA": id_fila == id_responsable_firmas,
         }
 
         if id_fila == id_actual:
@@ -2371,14 +2476,21 @@ def cerrar_cadena_para_firma(
                     "FECHA_RESPUESTA": fecha,
                 }
             )
+        elif id_fila == id_responsable_firmas:
+            cambios.update(
+                {
+                    "ESTADO": ESTADO_GESTION_FIRMA,
+                    "RESULTADO": "",
+                    "COMENTARIO": "",
+                    "ID_VERSION_TRABAJADA": id_version_para_firma,
+                    "FECHA_INICIO": fecha,
+                    "FECHA_RESPUESTA": "",
+                }
+            )
 
         filas.append(cambios)
 
-    appsheet_action(
-        TABLA_APROBADORES_ACTUAL,
-        "Edit",
-        filas,
-    )
+    appsheet_action(TABLA_APROBADORES_ACTUAL, "Edit", filas)
 
 
 def actualizar_documento_aprobacion_intermedia(
@@ -2428,6 +2540,7 @@ def actualizar_documento_listo_para_firma(
     id_version: str,
     copia: dict[str, str],
     pdf: dict[str, str],
+    responsable_firmas: dict[str, Any],
     usuario: str,
     fecha: str,
 ) -> None:
@@ -2443,10 +2556,12 @@ def actualizar_documento_listo_para_firma(
                 "ID_VERSION_ACTUAL": id_version,
                 "GOOGLE_DOC_ID": copia["id"],
                 "GOOGLE_DOC_URL": copia["url"],
-                "ORDEN_ACTUAL": "",
-                "ID_APROBACION_ACTUAL": "",
-                "ENCARGADO_ACTUAL_NOMBRE": "",
-                "ENCARGADO_ACTUAL_EMAIL": "",
+                "ORDEN_ACTUAL": responsable_firmas["ORDEN"],
+                "ID_APROBACION_ACTUAL": responsable_firmas[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "ENCARGADO_ACTUAL_NOMBRE": responsable_firmas.get("NOMBRE", ""),
+                "ENCARGADO_ACTUAL_EMAIL": responsable_firmas.get("APROBADOR", ""),
                 "PDF_PARA_FIRMA_ID": pdf["id"],
                 "PDF_PARA_FIRMA_URL": pdf["url"],
                 "ESTADO_FIRMA": "No iniciado",
@@ -2733,6 +2848,7 @@ def aprobar_revision():
             fila
             for fila in cadena_actual
             if entero(fila.get("ORDEN"), "ORDEN") > orden_actual
+            and not es_responsable_firmas(fila)
             and texto(fila.get("ESTADO")) == "Pendiente"
         ]
         siguiente = siguientes[0] if siguientes else None
@@ -2937,6 +3053,13 @@ def aprobar_revision():
                 }
             )
 
+        # Último aprobador: la aprobación interna termina, pero el documento
+        # conserva un responsable operativo durante toda la gestión de firma.
+        responsable_firmas = obtener_responsable_firmas_cadena(
+            cadena_actual,
+            contexto=f"Documento {id_documento} versión {numero_version}",
+        )
+
         # Último aprobador: prepara el Google Docs y el PDF para firma.
         nombre_archivo = limpiar_nombre_archivo(
             f"{titulo}_V{numero_version:02d}_PARA_FIRMA"
@@ -3016,8 +3139,13 @@ def aprobar_revision():
                 google_doc_url=copia["url"],
                 pdf_version_id=pdf["id"],
                 pdf_version_url=pdf["url"],
-                id_aprobacion_responsable=id_aprobacion_actual,
-                orden_responsable=orden_actual,
+                id_aprobacion_responsable=responsable_firmas[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                orden_responsable=entero(
+                    responsable_firmas.get("ORDEN"),
+                    "ORDEN",
+                ),
                 motivo_creacion="Preparación para firma",
                 comentario=comentario,
                 creado_por=usuario,
@@ -3033,6 +3161,8 @@ def aprobar_revision():
         cerrar_cadena_para_firma(
             cadena_actual=cadena_actual,
             aprobacion_actual=aprobacion_actual,
+            responsable_firmas=responsable_firmas,
+            id_version_para_firma=id_version_nueva,
             comentario=comentario,
             fecha=fecha,
         )
@@ -3044,6 +3174,7 @@ def aprobar_revision():
             id_version=id_version_nueva,
             copia=copia,
             pdf=pdf,
+            responsable_firmas=responsable_firmas,
             usuario=usuario,
             fecha=fecha,
         )
@@ -3074,7 +3205,9 @@ def aprobar_revision():
             crear_evento_preparado_firma(
                 id_documento=id_documento,
                 id_version=id_version_nueva,
-                id_aprobacion_actual=id_aprobacion_actual,
+                id_aprobacion_actual=responsable_firmas[
+                    "ID_APROBACION_ACTUAL"
+                ],
                 usuario=usuario,
                 fecha=fecha,
                 nombre_archivo=copia["name"],
@@ -3097,7 +3230,7 @@ def aprobar_revision():
                         evento=evento_aprobacion,
                         cadena=cadena_actual,
                         aprobador_aprueba=aprobacion_actual,
-                        aprobador_actual=None,
+                        aprobador_actual=responsable_firmas,
                         ultimo_aprobador=True,
                     )
                 )
@@ -3136,6 +3269,11 @@ def aprobar_revision():
                 "pdf_id": pdf["id"],
                 "pdf_url": pdf["url"],
                 "pdf_nombre": pdf["name"],
+                "responsable_firmas_nombre": responsable_firmas.get("NOMBRE", ""),
+                "responsable_firmas_email": responsable_firmas.get("APROBADOR", ""),
+                "id_aprobacion_actual": responsable_firmas.get(
+                    "ID_APROBACION_ACTUAL", ""
+                ),
                 "notificaciones": notificaciones,
                 "advertencias": advertencias,
             }
@@ -3233,7 +3371,12 @@ def construir_cadena_nueva_por_rechazo(
             "CADENA_ACTIVA": True,
         }
 
-        if indice < indice_destino:
+        if es_responsable_firmas(fila_anterior):
+            # El responsable de firmas es operativo, no una aprobación heredable.
+            # En cada nueva versión queda pendiente hasta que finalice nuevamente
+            # toda la cadena interna.
+            fila_nueva["ESTADO"] = "Pendiente"
+        elif indice < indice_destino:
             fila_nueva.update(
                 {
                     "ESTADO": "Heredado",
@@ -3307,6 +3450,35 @@ def cerrar_cadena_anterior_por_rechazo(
         "Edit",
         filas,
     )
+
+
+def cerrar_gestion_firma_anterior_por_observacion(
+    *,
+    cadena_anterior: list[dict[str, Any]],
+    comentario: str,
+    fecha: str,
+) -> None:
+    """Desactiva la gestión de firma de la versión observada antes de reiniciar."""
+    filas: list[dict[str, Any]] = []
+    for fila in cadena_anterior:
+        if not es_verdadero(fila.get("CADENA_ACTIVA")):
+            continue
+        cambios: dict[str, Any] = {
+            "ID_APROBACION_ACTUAL": texto(fila.get("ID_APROBACION_ACTUAL")),
+            "CADENA_ACTIVA": False,
+        }
+        if es_responsable_firmas(fila):
+            cambios.update(
+                {
+                    "ESTADO": "Cerrado",
+                    "RESULTADO": "Observado en firma",
+                    "COMENTARIO": comentario,
+                    "FECHA_RESPUESTA": fecha,
+                }
+            )
+        filas.append(cambios)
+    if filas:
+        appsheet_action(TABLA_APROBADORES_ACTUAL, "Edit", filas)
 
 
 def actualizar_destino_cadena_reutilizada(
@@ -6829,11 +7001,9 @@ def construir_especificaciones_aprobacion_revision(
     - resto de la cadena: Informativa.
 
     Aprobación final:
+    - Responsable de firmas: Acción requerida;
     - quien aprobó: Confirmación;
     - resto de la cadena: Informativa.
-
-    No se asigna Acción requerida al quedar Listo para firma porque el
-    documento ya no mantiene un ID_APROBACION_ACTUAL interno.
     """
     comentario_evento = (
         texto(evento.get("COMENTARIO"))
@@ -6842,12 +7012,16 @@ def construir_especificaciones_aprobacion_revision(
 
     especificaciones: list[dict[str, Any]] = []
 
-    if not ultimo_aprobador and aprobador_actual is not None:
+    if aprobador_actual is not None:
         especificaciones.append(
             {
                 "aprobador": aprobador_actual,
                 "tipo_notificacion": "Acción requerida",
-                "movimiento": "Documento asignado para continuar la revisión",
+                "movimiento": (
+                    "Documento listo para gestionar firma"
+                    if ultimo_aprobador
+                    else "Documento asignado para continuar la revisión"
+                ),
                 "comentario_principal": comentario_evento,
                 "link_documento": normalizar_url_appsheet(
                     documento.get("GOOGLE_DOC_URL")
@@ -6869,7 +7043,17 @@ def construir_especificaciones_aprobacion_revision(
         }
     )
 
+    id_actual_notificado = (
+        texto(aprobador_actual.get("ID_APROBACION_ACTUAL"))
+        if aprobador_actual is not None
+        else ""
+    )
     for integrante in cadena:
+        if (
+            id_actual_notificado
+            and texto(integrante.get("ID_APROBACION_ACTUAL")) == id_actual_notificado
+        ):
+            continue
         especificaciones.append(
             {
                 "aprobador": integrante,
@@ -6939,19 +7123,19 @@ def reanudar_notificaciones_aprobacion_revision(
         return [], advertencias
 
     aprobador_actual: dict[str, Any] | None = None
-    if not ultimo_aprobador:
-        id_aprobacion_actual = texto(
-            documento.get("ID_APROBACION_ACTUAL")
+    id_aprobacion_actual = texto(documento.get("ID_APROBACION_ACTUAL"))
+    if not id_aprobacion_actual:
+        advertencias.append(
+            "El documento no tiene encargado actual para reanudar las notificaciones."
         )
-        if not id_aprobacion_actual:
-            advertencias.append(
-                "El documento sigue En revisión, pero no tiene encargado "
-                "actual para reanudar las notificaciones."
-            )
-            return [], advertencias
-        aprobador_actual = buscar_aprobacion_actual(
-            id_aprobacion_actual
+        return [], advertencias
+    aprobador_actual = buscar_aprobacion_actual(id_aprobacion_actual)
+    if ultimo_aprobador and not es_responsable_firmas(aprobador_actual):
+        advertencias.append(
+            "El documento está Listo para firma, pero su encargado actual no es "
+            "Responsable de firmas."
         )
+        return [], advertencias
 
     aprobador_aprueba: dict[str, Any] | None = None
     if id_aprobacion_aprueba:
@@ -7984,8 +8168,11 @@ def validar_documento_observado_listo_reenvio(documento: dict[str, Any]) -> None
         motivos.append(
             f"estado {texto(documento.get('ESTADO')) or '<vacío>'}; se requiere Listo para firma"
         )
-    if texto(documento.get("ID_APROBACION_ACTUAL")):
-        motivos.append("la nueva cadena interna todavía no ha finalizado")
+    responsable_valido, motivo_responsable = validar_responsable_firmas_actual(
+        documento
+    )
+    if not responsable_valido:
+        motivos.append(motivo_responsable)
     if not texto(documento.get("ID_VERSION_ACTUAL")):
         motivos.append("falta ID_VERSION_ACTUAL")
     if not texto(documento.get("GOOGLE_DOC_ID")):
@@ -9827,7 +10014,9 @@ def actualizar_documento_reinicio_firma(
                 "ARCHIVO_OBSERVACION_FIRMA_TEMP": "",
                 "FECHA_CIERRE": "",
                 "ULTIMO_ENVIADO_POR": usuario,
-                "FECHA_ULTIMO_ENVIO": fecha,
+                # FECHA_ULTIMO_ENVIO se reserva para acciones iniciadas desde
+                # AppSheet. No debe cambiar durante este reinicio interno, porque
+                # podría disparar Bots de envío a revisión inmediatamente.
                 "FECHA_ULTIMA_ACTUALIZACION": fecha,
                 "OBSERVACION_ACTUAL": "",
                 "ACCION_SOLICITADA": "",
@@ -10183,7 +10372,10 @@ def rechazar_firma():
                     role="reader",
                 )
 
-        primer_anterior = cadena_anterior[0]
+        primer_anterior = obtener_primer_responsable_aprobacion(
+            cadena_anterior,
+            contexto=f"Documento {id_documento} versión {numero_version_anterior}",
+        )
         email_primero = texto(primer_anterior.get("APROBADOR"))
         if not email_primero:
             raise ValueError("El primer responsable no tiene correo")
@@ -10193,6 +10385,12 @@ def rechazar_firma():
             file_id=copia["id"],
             email=email_primero,
             role="writer",
+        )
+
+        cerrar_gestion_firma_anterior_por_observacion(
+            cadena_anterior=cadena_anterior,
+            comentario=comentario,
+            fecha=fecha,
         )
 
         cadena_nueva_existente = buscar_cadena_documento_version(
@@ -10227,7 +10425,7 @@ def rechazar_firma():
                 id_plantilla=id_plantilla,
                 numero_version_anterior=numero_version_anterior,
                 numero_version_nueva=numero_version_nueva,
-                indice_destino=0,
+                indice_destino=cadena_anterior.index(primer_anterior),
                 id_version_nueva=id_version_nueva,
                 permission_id_destino=permission_id_primero,
                 fecha=fecha,
