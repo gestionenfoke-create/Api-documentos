@@ -26,6 +26,8 @@ from googleapiclient.http import MediaInMemoryUpload
 
 app = Flask(__name__)
 
+# Firma Simple por paquete - fase definitiva de envío/respuesta/rechazo/cierre.
+
 
 def registrar_tiempo(**campos: Any) -> None:
     """Escribe una medición estructurada en stdout para Cloud Logging.
@@ -902,7 +904,13 @@ def evaluar_documento_para_paquete(
     nivel: int,
     id_raiz: str,
 ) -> dict[str, Any]:
-    """Evalúa la preparación interna y expone además el estado externo."""
+    """
+    Evalúa la preparación interna usando el flujo vigente de Fase 1.
+
+    Durante esta fase tanto Simple como Notarial siguen llegando a
+    "Listo para firma" al finalizar la cadena. En fases posteriores la regla
+    se ampliará a "Listo para revisión externa" para la ruta Notarial.
+    """
     id_documento = texto(documento.get("ID_DOCUMENTO"))
     estado = texto(documento.get("ESTADO"))
     id_version = texto(documento.get("ID_VERSION_ACTUAL"))
@@ -925,26 +933,21 @@ def evaluar_documento_para_paquete(
     if not pdf_id:
         motivos.append("No tiene PDF_PARA_FIRMA_ID")
 
+    proyecto = texto(documento.get("ID_PROYECTO"))
+    padre = texto(documento.get("PADRE"))
+
     return {
         "id_documento": id_documento,
         "titulo": texto(documento.get("TITULO")),
         "nivel": nivel,
         "es_raiz": id_documento == id_raiz,
-        "padre": texto(documento.get("PADRE")),
-        "id_proyecto": texto(documento.get("ID_PROYECTO")),
+        "padre": padre,
+        "id_proyecto": proyecto,
         "tipo_firma_documento": normalizar_tipo_firma(
             documento.get("TIPO_FIRMA")
         ),
         "estado": estado,
         "estado_firma": texto(documento.get("ESTADO_FIRMA")),
-        "estado_paquete_firma": texto(documento.get("ESTADO_PAQUETE_FIRMA")),
-        "resultado_firma_externa": texto(documento.get("RESULTADO_FIRMA_EXTERNA")),
-        "id_documento_raiz_firma": texto(documento.get("ID_DOCUMENTO_RAIZ_FIRMA")),
-        "id_version_respuesta_externa": texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA")),
-        "respuesta_firma_externa_por": texto(documento.get("RESPUESTA_FIRMA_EXTERNA_POR")),
-        "fecha_respuesta_firma_externa": texto(documento.get("FECHA_RESPUESTA_FIRMA_EXTERNA")),
-        "pdf_firmado": texto(documento.get("PDF_FIRMADO")),
-        "pdf_firmado_id": texto(documento.get("PDF_FIRMADO_ID")),
         "numero_version": texto(documento.get("VERSION_ACTUAL")),
         "numero_revision": texto(documento.get("REVISION_ACTUAL")),
         "id_version_actual": id_version,
@@ -954,7 +957,6 @@ def evaluar_documento_para_paquete(
         "listo_para_paquete": not motivos,
         "motivos": motivos,
     }
-
 
 
 def validar_paquete_documental_datos(id_documento: str) -> dict[str, Any]:
@@ -4424,178 +4426,6 @@ def construir_email_firma_externo(
     return asunto, cuerpo_texto, cuerpo_html
 
 
-RESULTADOS_FIRMA_EXTERNA_VALIDOS = {
-    "Pendiente",
-    "Conforme",
-    "Observado",
-    "Firmado",
-}
-
-ESTADOS_PAQUETE_FIRMA_ACTIVOS = {
-    "Enviado",
-    "Con observaciones",
-    "Esperando firma",
-    "Listo para cierre",
-}
-
-
-def normalizar_resultado_firma_externa(valor: Any) -> str:
-    valor_limpio = texto(valor).strip()
-    if not valor_limpio:
-        return ""
-    equivalencias = {
-        "pendiente": "Pendiente",
-        "conforme": "Conforme",
-        "observado": "Observado",
-        "firmado": "Firmado",
-    }
-    normalizado = valor_limpio.casefold()
-    if normalizado not in equivalencias:
-        raise ValueError(
-            "RESULTADO_FIRMA_EXTERNA contiene un valor no reconocido: "
-            f"{valor_limpio!r}"
-        )
-    return equivalencias[normalizado]
-
-
-def obtener_jerarquia_firma_raw(
-    id_documento: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """
-    Devuelve la raíz y todos sus descendientes con su fila real de Documentos.
-    No exige que estén Listo para firma; sirve durante un ciclo externo activo.
-    """
-    documentos = buscar_todos_documentos()
-    indice = construir_indice_documentos(documentos)
-    raiz, _ = obtener_documento_raiz_desde_indice(id_documento, indice)
-    id_raiz = texto(raiz.get("ID_DOCUMENTO"))
-    jerarquia = construir_jerarquia_desde_raiz(id_raiz, indice)
-
-    miembros: list[dict[str, Any]] = []
-    proyecto_raiz = texto(raiz.get("ID_PROYECTO"))
-    for fila, nivel in jerarquia:
-        proyecto = texto(fila.get("ID_PROYECTO"))
-        if proyecto_raiz and proyecto and proyecto != proyecto_raiz:
-            raise ValueError(
-                f"{texto(fila.get('TITULO')) or texto(fila.get('ID_DOCUMENTO'))} "
-                "pertenece a un proyecto distinto del documento raíz"
-            )
-        copia = dict(fila)
-        copia["_NIVEL_PAQUETE"] = nivel
-        copia["_ES_RAIZ_PAQUETE"] = texto(fila.get("ID_DOCUMENTO")) == id_raiz
-        miembros.append(copia)
-
-    return raiz, miembros
-
-
-def validar_miembro_ciclo_firma(
-    documento: dict[str, Any],
-    id_raiz: str,
-) -> None:
-    raiz_registrada = texto(documento.get("ID_DOCUMENTO_RAIZ_FIRMA"))
-    if raiz_registrada and raiz_registrada != id_raiz:
-        raise ValueError(
-            f"{texto(documento.get('TITULO')) or texto(documento.get('ID_DOCUMENTO'))}: "
-            f"ID_DOCUMENTO_RAIZ_FIRMA={raiz_registrada} no coincide con {id_raiz}"
-        )
-
-
-def determinar_estado_paquete_firma(
-    miembros: list[dict[str, Any]],
-) -> str:
-    resultados = [
-        normalizar_resultado_firma_externa(fila.get("RESULTADO_FIRMA_EXTERNA"))
-        for fila in miembros
-    ]
-    if not resultados:
-        return "No iniciado"
-    if any(r == "Observado" for r in resultados):
-        return "Con observaciones"
-    if all(r == "Firmado" for r in resultados):
-        return "Listo para cierre"
-    if any(r in {"", "Pendiente"} for r in resultados):
-        return "Enviado"
-    # Sin Pendientes ni Observados: quedan documentos Conforme y/o Firmado.
-    return "Esperando firma"
-
-
-def actualizar_estado_paquete_firma_raiz(
-    *,
-    id_raiz: str,
-    estado_paquete: str,
-    usuario: str = "",
-    fecha: str = "",
-) -> None:
-    cambios: dict[str, Any] = {
-        "ID_DOCUMENTO": id_raiz,
-        "ESTADO_PAQUETE_FIRMA": estado_paquete,
-        "FECHA_ULTIMA_ACTUALIZACION": fecha or ahora_iso(),
-    }
-    if usuario:
-        cambios["ULTIMO_ENVIADO_POR"] = usuario
-    appsheet_action(TABLA_DOCUMENTOS, "Edit", [cambios])
-
-
-def recalcular_estado_paquete_firma(
-    *,
-    id_raiz: str,
-    usuario: str = "",
-    fecha: str = "",
-) -> str:
-    _, miembros = obtener_jerarquia_firma_raw(id_raiz)
-    estado = determinar_estado_paquete_firma(miembros)
-    actualizar_estado_paquete_firma_raiz(
-        id_raiz=id_raiz,
-        estado_paquete=estado,
-        usuario=usuario,
-        fecha=fecha,
-    )
-    return estado
-
-
-def validar_ciclo_firma_activo(
-    *,
-    id_raiz: str,
-    miembros: list[dict[str, Any]],
-) -> None:
-    if not miembros:
-        raise ValueError("El paquete de firma no contiene documentos")
-    raiz = next(
-        (fila for fila in miembros if texto(fila.get("ID_DOCUMENTO")) == id_raiz),
-        None,
-    )
-    if raiz is None:
-        raise ValueError("No se encontró la raíz dentro del paquete")
-    if normalizar_tipo_firma(raiz.get("TIPO_FIRMA")) != "Simple":
-        raise ValueError("El paquete no corresponde a Firma Simple")
-    estado_paquete = texto(raiz.get("ESTADO_PAQUETE_FIRMA"))
-    if estado_paquete not in ESTADOS_PAQUETE_FIRMA_ACTIVOS:
-        raise ValueError(
-            "El paquete no se encuentra en un ciclo externo activo. "
-            f"ESTADO_PAQUETE_FIRMA={estado_paquete!r}"
-        )
-    for fila in miembros:
-        validar_miembro_ciclo_firma(fila, id_raiz)
-
-
-def validar_version_respuesta_actual(documento: dict[str, Any]) -> str:
-    id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
-    id_version_respuesta = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
-    if not id_version_actual:
-        raise ValueError("El documento no tiene ID_VERSION_ACTUAL")
-    if not id_version_respuesta:
-        raise ValueError(
-            "El documento no tiene ID_VERSION_RESPUESTA_EXTERNA; "
-            "no se puede determinar qué versión recibió el firmante"
-        )
-    if id_version_actual != id_version_respuesta:
-        raise ValueError(
-            "La versión actual del documento no coincide con la versión enviada "
-            "al firmante. Debe volver a aprobación externa antes de conservar "
-            "una respuesta previa."
-        )
-    return id_version_respuesta
-
 def construir_email_firma_paquete_externo(
     *,
     documento: dict[str, Any],
@@ -4603,169 +4433,176 @@ def construir_email_firma_paquete_externo(
     usuario: str,
     mensaje_adicional: str,
     fecha_envio: str,
-    detalle_envio: list[dict[str, Any]],
+    documentos_paquete: list[dict[str, Any]],
 ) -> tuple[str, str, str]:
-    """Correo externo organizado por el estado de cada documento del paquete."""
-    titulo = texto(documento.get("TITULO")) or "Paquete documental"
-    proyecto = texto(documento.get("ID_PROYECTO"))
-    tipo_doc = texto(plantilla.get("NOMBRE_PLANTILLA")) or texto(
-        plantilla.get("NOMBRE")
+    """
+    Construye el correo de firma simple para uno o varios documentos.
+
+    Para un paquete de un solo documento conserva exactamente el correo
+    histórico. Cuando hay jerarquía, el documento raíz sigue siendo el
+    documento principal y se agrega una relación explícita de todos los
+    documentos incluidos en el mismo envío.
+    """
+    asunto, cuerpo_texto, cuerpo_html = construir_email_firma_externo(
+        documento=documento,
+        plantilla=plantilla,
+        usuario=usuario,
+        mensaje_adicional=mensaje_adicional,
+        fecha_envio=fecha_envio,
     )
 
-    aprobados = [x for x in detalle_envio if x.get("categoria") == "aprobado_no_firmado"]
-    firmados = [x for x in detalle_envio if x.get("categoria") == "firmado"]
-    por_aprobar = [x for x in detalle_envio if x.get("categoria") == "por_aprobar"]
+    if len(documentos_paquete) <= 1:
+        return asunto, cuerpo_texto, cuerpo_html
 
-    asunto = f"Seguimiento de firma — {titulo}"
+    cantidad = len(documentos_paquete)
+    titulo_raiz = (
+        texto(documento.get("TITULO"))
+        or f"Documento {texto(documento.get('ID_DOCUMENTO'))}"
+    )
 
-    def linea_texto(fila: dict[str, Any]) -> str:
-        nombres = ", ".join(fila.get("archivos") or [])
+    lineas_documentos: list[str] = []
+    for indice, fila in enumerate(documentos_paquete, start=1):
+        titulo = texto(fila.get("titulo")) or texto(fila.get("id_documento"))
         version = texto(fila.get("numero_version"))
         revision = texto(fila.get("numero_revision"))
-        vr = ""
+        detalle = titulo
         if version:
-            vr = f" — V{version}"
+            detalle += f" — V{version}"
             if revision:
-                vr += f" / Rev. {revision}"
-        return f"• {fila.get('titulo')}{vr}\n  Archivo(s): {nombres}"
+                detalle += f" / Rev. {revision}"
+        lineas_documentos.append(f"{indice}. {detalle}")
 
-    secciones_texto: list[str] = []
-    if aprobados:
-        secciones_texto.append(
-            "DOCUMENTOS APROBADOS NO FIRMADOS\n"
-            "Estos documentos ya fueron aprobados y solo requieren firma.\n"
-            + "\n".join(linea_texto(x) for x in aprobados)
-        )
-    if firmados:
-        secciones_texto.append(
-            "DOCUMENTOS FIRMADOS\n"
-            "Estos documentos ya fueron firmados y se incluyen como referencia.\n"
-            + "\n".join(linea_texto(x) for x in firmados)
-        )
-    if por_aprobar:
-        secciones_texto.append(
-            "DOCUMENTOS POR APROBAR\n"
-            "Estos documentos requieren revisión. Se adjunta PDF y archivo editable.\n"
-            + "\n".join(linea_texto(x) for x in por_aprobar)
-        )
-
-    cuerpo_texto = (
-        f"Estimado/a:\n\n"
-        f"Se adjunta el paquete documental \"{titulo}\". Los archivos fueron "
-        "agrupados según su estado actual para facilitar la revisión y firma.\n\n"
-        + "\n\n".join(secciones_texto)
-        + (f"\n\nMensaje adicional:\n{mensaje_adicional}" if mensaje_adicional else "")
-        + "\n\nIndicaciones:\n"
-        "1. Revise nuevamente los documentos incluidos en 'Documentos por aprobar'.\n"
-        "2. Firme los documentos incluidos en 'Documentos aprobados no firmados'.\n"
-        "3. Los documentos de 'Documentos firmados' se incluyen únicamente como referencia.\n"
-        "4. Responda este mismo correo con los PDF firmados que correspondan.\n\n"
-        f"Enviado por: {usuario}\n"
-        f"Fecha: {fecha_envio}\n"
+    listado_texto = "\n".join(lineas_documentos)
+    bloque_texto = (
+        "\n\nDOCUMENTOS INCLUIDOS EN EL PAQUETE\n"
+        f"{listado_texto}\n"
     )
 
-    def bloque_html(titulo_bloque: str, descripcion: str, filas: list[dict[str, Any]]) -> str:
-        if not filas:
-            return ""
-        items: list[str] = []
-        for fila in filas:
-            nombre = html.escape(texto(fila.get("titulo")))
-            version = html.escape(texto(fila.get("numero_version")))
-            revision = html.escape(texto(fila.get("numero_revision")))
-            vr = ""
-            if version:
-                vr = f"V{version}"
-                if revision:
-                    vr += f" / Rev. {revision}"
-            archivos = "<br>".join(
-                html.escape(texto(x)) for x in (fila.get("archivos") or [])
-            )
-            items.append(
-                f"""
-                <tr>
-                  <td style="padding:11px 12px;border-top:1px solid #e5e7eb;vertical-align:top;">
-                    <div style="font-weight:700;color:#111827;">{nombre}</div>
-                    {f'<div style="font-size:12px;color:#6b7280;margin-top:2px;">{html.escape(vr)}</div>' if vr else ''}
-                    <div style="font-size:12px;color:#4b5563;margin-top:5px;">{archivos}</div>
-                  </td>
-                </tr>
-                """
-            )
-        return f"""
-        <div style="margin-top:20px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
-          <div style="padding:12px 15px;background:#f9fafb;font-size:14px;font-weight:700;color:#111827;">
-            {html.escape(titulo_bloque)}
-          </div>
-          <div style="padding:10px 15px;color:#4b5563;font-size:13px;line-height:1.5;border-top:1px solid #e5e7eb;">
-            {html.escape(descripcion)}
-          </div>
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
-            {''.join(items)}
-          </table>
-        </div>
-        """
+    cuerpo_texto = cuerpo_texto.replace(
+        f'Adjuntamos el documento "{titulo_raiz}" para su revisión y firma.',
+        (
+            f'Adjuntamos el documento principal "{titulo_raiz}" junto con '
+            f"{cantidad - 1} documento(s) relacionado(s), para su revisión "
+            "y firma en un único envío."
+        ),
+    )
+    cuerpo_texto = cuerpo_texto.replace(
+        "\n\n¿QUÉ DEBE HACER?",
+        bloque_texto + "\n¿QUÉ DEBE HACER?",
+        1,
+    )
+    cuerpo_texto = cuerpo_texto.replace(
+        "2. Firmar el documento utilizando el archivo PDF.",
+        "2. Firmar los documentos PDF que correspondan.",
+    )
+    cuerpo_texto = cuerpo_texto.replace(
+        "3. Responder este mismo correo adjuntando el PDF firmado.",
+        "3. Responder este mismo correo adjuntando los PDF firmados que correspondan.",
+    )
 
-    bloque_mensaje = ""
-    if mensaje_adicional:
-        bloque_mensaje = f"""
-        <div style="margin-top:20px;padding:14px 16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;">
-          <div style="font-weight:700;color:#92400e;margin-bottom:6px;">Mensaje adicional</div>
-          <div style="font-size:14px;line-height:1.55;color:#78350f;white-space:pre-wrap;">{html.escape(mensaje_adicional)}</div>
-        </div>
-        """
+    filas_html = []
+    for indice, fila in enumerate(documentos_paquete, start=1):
+        titulo = html.escape(
+            texto(fila.get("titulo")) or texto(fila.get("id_documento"))
+        )
+        version = html.escape(texto(fila.get("numero_version")))
+        revision = html.escape(texto(fila.get("numero_revision")))
+        detalle_version = ""
+        if version:
+            detalle_version = f"V{version}"
+            if revision:
+                detalle_version += f" / Rev. {revision}"
+        detalle_html = (
+            f'<span style="color:#6b7280; font-size:12px;">'
+            f'{html.escape(detalle_version)}</span>'
+            if detalle_version
+            else ""
+        )
+        filas_html.append(
+            f"""
+            <tr>
+              <td style="
+                  padding:10px 12px;
+                  width:34px;
+                  border-top:1px solid #e5e7eb;
+                  color:#4338ca;
+                  font-weight:700;
+                  vertical-align:top;
+              ">{indice}.</td>
+              <td style="
+                  padding:10px 12px;
+                  border-top:1px solid #e5e7eb;
+                  color:#111827;
+                  font-size:14px;
+                  line-height:1.45;
+              ">
+                <strong>{titulo}</strong><br>
+                {detalle_html}
+              </td>
+            </tr>
+            """
+        )
 
-    resumen_meta = []
-    if proyecto:
-        resumen_meta.append(f"Proyecto: {html.escape(proyecto)}")
-    if tipo_doc:
-        resumen_meta.append(f"Tipo: {html.escape(tipo_doc)}")
-    meta_html = " · ".join(resumen_meta)
-
-    cuerpo_html = f"""
-    <!doctype html>
-    <html><body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;">
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f4f6;">
-        <tr><td align="center" style="padding:24px 12px;">
-          <table role="presentation" width="680" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
-            <tr><td style="padding:24px 28px;background:#111827;color:#ffffff;">
-              <div style="font-size:13px;color:#d1d5db;">{html.escape(NOMBRE_APLICACION)}</div>
-              <div style="margin-top:5px;font-size:25px;font-weight:700;">Revisión y firma de paquete documental</div>
-              <div style="margin-top:8px;font-size:14px;color:#d1d5db;line-height:1.5;">{html.escape(titulo)}</div>
-            </td></tr>
-            <tr><td style="padding:28px;">
-              <p style="margin:0;font-size:15px;line-height:1.65;">Estimado/a:</p>
-              <p style="margin:14px 0 0;font-size:15px;line-height:1.65;color:#374151;">
-                Se adjunta una actualización del paquete documental. Para facilitar su revisión, los archivos están agrupados según su estado actual.
-              </p>
-              {f'<div style="margin-top:8px;font-size:12px;color:#6b7280;">{meta_html}</div>' if meta_html else ''}
-
-              {bloque_html('Documentos aprobados no firmados', 'Ya fueron aprobados previamente y solo requieren firma. Se adjunta únicamente el PDF.', aprobados)}
-              {bloque_html('Documentos firmados', 'Ya fueron firmados y se incluyen como referencia del proceso.', firmados)}
-              {bloque_html('Documentos por aprobar', 'Fueron enviados por primera vez o corregidos después de observaciones. Requieren revisión; se adjuntan PDF y editable.', por_aprobar)}
-
-              {bloque_mensaje}
-
-              <div style="margin-top:22px;padding:17px 18px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;">
-                <div style="margin-bottom:9px;color:#3730a3;font-size:14px;font-weight:700;">Guía rápida</div>
-                <div style="font-size:14px;line-height:1.6;color:#374151;">
-                  <strong>Por aprobar:</strong> revisar nuevamente.<br>
-                  <strong>Aprobados no firmados:</strong> firmar el PDF.<br>
-                  <strong>Firmados:</strong> no requieren acción; se incluyen como referencia.
-                </div>
-              </div>
-              <p style="margin:24px 0 0;font-size:15px;color:#374151;">Puede responder este mismo correo adjuntando los PDF firmados que correspondan.</p>
-            </td></tr>
-            <tr><td style="padding:16px 28px;background:#f9fafb;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px;line-height:1.55;">
-              Correo generado automáticamente por <strong>{html.escape(NOMBRE_APLICACION)}</strong>.<br>
-              Enviado por {html.escape(usuario)} · {html.escape(fecha_envio)}
-            </td></tr>
-          </table>
-        </td></tr>
-      </table>
-    </body></html>
+    bloque_html = f"""
+                    <div style="
+                        margin-top:22px;
+                        border:1px solid #e5e7eb;
+                        border-radius:8px;
+                        overflow:hidden;
+                    ">
+                      <div style="
+                          padding:12px 16px;
+                          background:#eef2ff;
+                          color:#3730a3;
+                          font-size:14px;
+                          font-weight:700;
+                      ">Documentos incluidos en el paquete ({cantidad})</div>
+                      <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+                             style="width:100%; border-collapse:collapse;">
+                        {''.join(filas_html)}
+                      </table>
+                    </div>
     """
-    return asunto, cuerpo_texto, cuerpo_html
 
+    cuerpo_html = cuerpo_html.replace(
+        "Documento adjunto para revisión y firma",
+        "Paquete documental adjunto para revisión y firma",
+    )
+    cuerpo_html = cuerpo_html.replace(
+        "Se adjuntan el PDF para firma y una copia editable en formato Microsoft Word.",
+        (
+            f"Se adjuntan los archivos PDF y Microsoft Word correspondientes "
+            f"a {cantidad} documentos relacionados."
+        ),
+    )
+    cuerpo_html = cuerpo_html.replace(
+        ">Resumen del documento</div>",
+        ">Resumen del documento principal</div>",
+    )
+    marcador_acciones = """                    <div style="
+                        margin-top:22px;
+                        padding:17px 18px;"""
+    if marcador_acciones in cuerpo_html:
+        cuerpo_html = cuerpo_html.replace(
+            marcador_acciones,
+            bloque_html + "\n" + marcador_acciones,
+            1,
+        )
+
+    cuerpo_html = cuerpo_html.replace(
+        "Firmar el documento utilizando el archivo PDF.",
+        "Firmar los documentos PDF que correspondan.",
+    )
+    cuerpo_html = cuerpo_html.replace(
+        "Responder este mismo correo adjuntando el PDF firmado.",
+        "Responder este mismo correo adjuntando los PDF firmados que correspondan.",
+    )
+    cuerpo_html = cuerpo_html.replace(
+        "Puede responder directamente a este mensaje con el documento firmado.",
+        "Puede responder directamente a este mensaje con los documentos firmados.",
+    )
+
+    return asunto, cuerpo_texto, cuerpo_html
 
 
 @medir_operacion("gmail.enviar_firma_externa")
@@ -7968,46 +7805,280 @@ def diagnostico_notificacion():
 
 
 
-@medir_operacion("firma.construir_adjuntos_paquete")
-def construir_adjuntos_paquete_firma(
+# -----------------------------------------------------------------------------
+# Fase definitiva Firma Simple: paquete externo y respuestas por documento
+# -----------------------------------------------------------------------------
+
+RESULTADOS_FIRMA_EXTERNA_VALIDOS = {
+    "Pendiente",
+    "Conforme",
+    "Observado",
+    "Firmado",
+}
+ESTADOS_PAQUETE_FIRMA_ACTIVOS = {
+    "Enviado",
+    "Con observaciones",
+    "Esperando firma",
+    "Listo para cierre",
+}
+
+
+def normalizar_resultado_firma_externa(valor: Any) -> str:
+    valor_texto = texto(valor).strip()
+    if not valor_texto:
+        return ""
+    equivalencias = {
+        "pendiente": "Pendiente",
+        "conforme": "Conforme",
+        "observado": "Observado",
+        "firmado": "Firmado",
+    }
+    clave = valor_texto.casefold()
+    if clave not in equivalencias:
+        raise ValueError(
+            "RESULTADO_FIRMA_EXTERNA contiene un valor no reconocido: "
+            f"{valor_texto!r}"
+        )
+    return equivalencias[clave]
+
+
+def obtener_contexto_jerarquia_documental(
+    id_documento: str,
+) -> dict[str, Any]:
+    """Devuelve raíz + jerarquía actual sin exigir que todos estén Listo para firma."""
+    documentos = buscar_todos_documentos()
+    indice = construir_indice_documentos(documentos)
+    raiz, camino = obtener_documento_raiz_desde_indice(id_documento, indice)
+    id_raiz = texto(raiz.get("ID_DOCUMENTO"))
+    jerarquia = construir_jerarquia_desde_raiz(id_raiz, indice)
+
+    proyecto_raiz = texto(raiz.get("ID_PROYECTO"))
+    integrantes: list[dict[str, Any]] = []
+    for documento, nivel in jerarquia:
+        proyecto = texto(documento.get("ID_PROYECTO"))
+        if proyecto_raiz and proyecto and proyecto != proyecto_raiz:
+            raise ValueError(
+                f"{texto(documento.get('TITULO')) or texto(documento.get('ID_DOCUMENTO'))} "
+                f"pertenece al proyecto {proyecto}, distinto del proyecto raíz "
+                f"{proyecto_raiz}"
+            )
+        integrantes.append(
+            {
+                "documento": documento,
+                "id_documento": texto(documento.get("ID_DOCUMENTO")),
+                "titulo": texto(documento.get("TITULO"))
+                or texto(documento.get("ID_DOCUMENTO")),
+                "nivel": nivel,
+                "es_raiz": texto(documento.get("ID_DOCUMENTO")) == id_raiz,
+            }
+        )
+
+    return {
+        "raiz": raiz,
+        "id_documento_raiz": id_raiz,
+        "titulo_raiz": texto(raiz.get("TITULO")),
+        "camino_a_raiz": camino,
+        "solicitado_es_raiz": texto(id_documento) == id_raiz,
+        "integrantes": integrantes,
+        "tipo_firma_paquete": normalizar_tipo_firma(raiz.get("TIPO_FIRMA")),
+    }
+
+
+def buscar_integrantes_paquete_activo(id_documento_raiz: str) -> list[dict[str, Any]]:
+    selector = (
+        f"FILTER({TABLA_DOCUMENTOS}, "
+        f"[ID_DOCUMENTO_RAIZ_FIRMA] = {literal_appsheet(id_documento_raiz)})"
+    )
+    filas = appsheet_find(TABLA_DOCUMENTOS, selector)
+    filas.sort(
+        key=lambda fila: (
+            0 if texto(fila.get("ID_DOCUMENTO")) == id_documento_raiz else 1,
+            texto(fila.get("TITULO")).casefold(),
+            texto(fila.get("ID_DOCUMENTO")),
+        )
+    )
+    return filas
+
+
+def calcular_estado_paquete_firma(
+    integrantes: list[dict[str, Any]],
+) -> str:
+    if not integrantes:
+        raise ValueError("El paquete externo no tiene documentos asociados")
+
+    resultados = [
+        normalizar_resultado_firma_externa(
+            fila.get("RESULTADO_FIRMA_EXTERNA")
+        )
+        for fila in integrantes
+    ]
+
+    if all(resultado == "Firmado" for resultado in resultados):
+        return "Listo para cierre"
+    if any(resultado == "Observado" for resultado in resultados):
+        return "Con observaciones"
+    if any(resultado == "Pendiente" for resultado in resultados):
+        return "Enviado"
+    if all(resultado in {"Conforme", "Firmado"} for resultado in resultados):
+        return "Esperando firma"
+    return "Enviado"
+
+
+def actualizar_estado_paquete_desde_resultados(
+    id_documento_raiz: str,
+    *,
+    fecha: str | None = None,
+) -> str:
+    integrantes = buscar_integrantes_paquete_activo(id_documento_raiz)
+    if not integrantes:
+        raise LookupError(
+            f"No existen integrantes activos para el paquete {id_documento_raiz}"
+        )
+    estado = calcular_estado_paquete_firma(integrantes)
+    cambios: dict[str, Any] = {
+        "ID_DOCUMENTO": id_documento_raiz,
+        "ESTADO_PAQUETE_FIRMA": estado,
+        "FECHA_ULTIMA_ACTUALIZACION": fecha or ahora_iso(),
+    }
+    if estado == "Con observaciones":
+        cambios["ESTADO_FIRMA"] = "Observado"
+    elif estado in {"Enviado", "Esperando firma", "Listo para cierre"}:
+        cambios["ESTADO_FIRMA"] = "Pendiente"
+
+    appsheet_action(TABLA_DOCUMENTOS, "Edit", [cambios])
+    return estado
+
+
+def validar_membresia_paquete_activo(
+    *,
+    id_documento_raiz: str,
+    integrantes_jerarquia: list[dict[str, Any]],
+) -> None:
+    ids_jerarquia = {
+        texto(fila.get("id_documento"))
+        for fila in integrantes_jerarquia
+    }
+    integrantes_activos = buscar_integrantes_paquete_activo(id_documento_raiz)
+    ids_activos = {
+        texto(fila.get("ID_DOCUMENTO"))
+        for fila in integrantes_activos
+    }
+    if ids_activos != ids_jerarquia:
+        faltan = sorted(ids_jerarquia - ids_activos)
+        sobran = sorted(ids_activos - ids_jerarquia)
+        detalle: list[str] = []
+        if faltan:
+            detalle.append("sin asociación activa: " + ", ".join(faltan))
+        if sobran:
+            detalle.append("asociados pero fuera de la jerarquía: " + ", ".join(sobran))
+        raise ValueError(
+            "La composición actual de la jerarquía no coincide con el paquete "
+            "externo activo. " + "; ".join(detalle)
+        )
+
+
+def validar_documento_observado_listo_reenvio(documento: dict[str, Any]) -> None:
+    titulo = texto(documento.get("TITULO")) or texto(documento.get("ID_DOCUMENTO"))
+    motivos: list[str] = []
+    if texto(documento.get("ESTADO")) != "Listo para firma":
+        motivos.append(
+            f"estado {texto(documento.get('ESTADO')) or '<vacío>'}; se requiere Listo para firma"
+        )
+    if texto(documento.get("ID_APROBACION_ACTUAL")):
+        motivos.append("la nueva cadena interna todavía no ha finalizado")
+    if not texto(documento.get("ID_VERSION_ACTUAL")):
+        motivos.append("falta ID_VERSION_ACTUAL")
+    if not texto(documento.get("GOOGLE_DOC_ID")):
+        motivos.append("falta GOOGLE_DOC_ID")
+    if not texto(documento.get("PDF_PARA_FIRMA_ID")):
+        motivos.append("falta PDF_PARA_FIRMA_ID")
+
+    id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+    id_version_respuesta = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
+    if id_version_respuesta and id_version_actual == id_version_respuesta:
+        motivos.append("la versión corregida todavía coincide con la versión observada")
+
+    if motivos:
+        raise ValueError(f"{titulo}: " + "; ".join(motivos))
+
+
+def validar_documento_conforme_reenvio(documento: dict[str, Any]) -> None:
+    titulo = texto(documento.get("TITULO")) or texto(documento.get("ID_DOCUMENTO"))
+    id_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+    id_respuesta = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
+    if not id_actual or not id_respuesta or id_actual != id_respuesta:
+        raise ValueError(
+            f"{titulo}: el documento marcado Conforme cambió de versión y debe "
+            "volver a aprobación externa"
+        )
+    if not texto(documento.get("PDF_PARA_FIRMA_ID")):
+        raise ValueError(f"{titulo}: falta PDF_PARA_FIRMA_ID")
+
+
+def validar_documento_firmado_reenvio(documento: dict[str, Any]) -> None:
+    titulo = texto(documento.get("TITULO")) or texto(documento.get("ID_DOCUMENTO"))
+    id_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+    id_respuesta = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
+    if not id_actual or not id_respuesta or id_actual != id_respuesta:
+        raise ValueError(
+            f"{titulo}: la versión actual no coincide con la versión que fue firmada"
+        )
+    if not texto(documento.get("PDF_FIRMADO")):
+        raise ValueError(f"{titulo}: RESULTADO_FIRMA_EXTERNA=Firmado pero falta PDF_FIRMADO")
+
+
+@medir_operacion("firma.construir_adjuntos_paquete_estado")
+def construir_adjuntos_paquete_firma_por_estado(
     *,
     drive_service: Any,
-    documentos_paquete: list[dict[str, Any]],
-    es_reenvio: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Construye el paquete según la respuesta externa de cada documento.
-
-    - Conforme: PDF aprobado, sin editable.
-    - Firmado: PDF firmado recibido.
-    - Observado listo nuevamente: PDF + DOCX de la nueva versión.
-    - Primer envío: PDF + DOCX de todos los integrantes.
-    """
-    if not documentos_paquete:
+    integrantes: list[dict[str, Any]],
+    primer_envio: bool,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Construye los adjuntos y los clasifica para el cuerpo del email."""
+    if not integrantes:
         raise ValueError("El paquete documental no contiene documentos")
 
     adjuntos: list[dict[str, Any]] = []
-    detalle: list[dict[str, Any]] = []
+    secciones: dict[str, list[dict[str, Any]]] = {
+        "aprobados_no_firmados": [],
+        "firmados": [],
+        "por_aprobar": [],
+    }
 
-    for fila in documentos_paquete:
-        id_documento = texto(fila.get("ID_DOCUMENTO"))
-        titulo = texto(fila.get("TITULO")) or id_documento
-        resultado = normalizar_resultado_firma_externa(
-            fila.get("RESULTADO_FIRMA_EXTERNA")
+    for fila in integrantes:
+        documento = fila.get("documento") or fila
+        id_documento = texto(documento.get("ID_DOCUMENTO"))
+        titulo = texto(documento.get("TITULO")) or id_documento
+        nivel = fila.get("nivel", 0) if isinstance(fila, dict) else 0
+        es_raiz = bool(fila.get("es_raiz")) if isinstance(fila, dict) else False
+        resultado = (
+            "Pendiente"
+            if primer_envio
+            else normalizar_resultado_firma_externa(
+                documento.get("RESULTADO_FIRMA_EXTERNA")
+            )
         )
-        id_version = texto(fila.get("ID_VERSION_ACTUAL"))
-        pdf_id = texto(fila.get("PDF_PARA_FIRMA_ID"))
-        google_doc_id = texto(fila.get("GOOGLE_DOC_ID"))
-        archivos: list[str] = []
 
-        if not id_documento or not id_version:
-            raise ValueError(f"{titulo}: faltan identificadores del documento/versión")
+        detalle_base = {
+            "id_documento": id_documento,
+            "titulo": titulo,
+            "nivel": nivel,
+            "es_raiz": es_raiz,
+            "resultado_anterior": resultado,
+            "id_version": texto(documento.get("ID_VERSION_ACTUAL")),
+            "numero_version": texto(documento.get("VERSION_ACTUAL")),
+            "numero_revision": texto(documento.get("REVISION_ACTUAL")),
+            "archivos": [],
+        }
 
-        if not es_reenvio:
-            categoria = "por_aprobar"
+        if primer_envio or resultado == "Observado":
+            if not primer_envio:
+                validar_documento_observado_listo_reenvio(documento)
+            pdf_id = texto(documento.get("PDF_PARA_FIRMA_ID"))
+            google_doc_id = texto(documento.get("GOOGLE_DOC_ID"))
             if not pdf_id or not google_doc_id:
                 raise ValueError(
-                    f"{titulo}: faltan PDF_PARA_FIRMA_ID o GOOGLE_DOC_ID"
+                    f"{titulo}: faltan archivos para revisión externa"
                 )
             pdf_bytes, pdf_nombre = descargar_pdf_drive(
                 drive_service=drive_service,
@@ -8018,154 +8089,334 @@ def construir_adjuntos_paquete_firma(
                 google_doc_id=google_doc_id,
                 nombre_base=pdf_nombre,
             )
-            adjuntos.extend([
-                {"contenido": pdf_bytes, "nombre": pdf_nombre, "maintype": "application", "subtype": "pdf"},
-                {"contenido": docx_bytes, "nombre": docx_nombre, "maintype": "application", "subtype": "vnd.openxmlformats-officedocument.wordprocessingml.document"},
-            ])
-            archivos = [pdf_nombre, docx_nombre]
+            adjuntos.extend(
+                [
+                    {
+                        "contenido": pdf_bytes,
+                        "nombre": pdf_nombre,
+                        "maintype": "application",
+                        "subtype": "pdf",
+                    },
+                    {
+                        "contenido": docx_bytes,
+                        "nombre": docx_nombre,
+                        "maintype": "application",
+                        "subtype": (
+                            "vnd.openxmlformats-officedocument."
+                            "wordprocessingml.document"
+                        ),
+                    },
+                ]
+            )
+            detalle_base["archivos"] = [pdf_nombre, docx_nombre]
+            detalle_base["pdf_id"] = pdf_id
+            detalle_base["google_doc_id"] = google_doc_id
+            secciones["por_aprobar"].append(detalle_base)
+            continue
 
-        elif resultado == "Conforme":
-            categoria = "aprobado_no_firmado"
-            validar_version_respuesta_actual(fila)
-            if not pdf_id:
-                raise ValueError(f"{titulo}: falta PDF aprobado para reenviar")
+        if resultado == "Conforme":
+            validar_documento_conforme_reenvio(documento)
+            pdf_id = texto(documento.get("PDF_PARA_FIRMA_ID"))
             pdf_bytes, pdf_nombre = descargar_pdf_drive(
                 drive_service=drive_service,
                 file_id=pdf_id,
             )
-            adjuntos.append({
-                "contenido": pdf_bytes,
-                "nombre": pdf_nombre,
-                "maintype": "application",
-                "subtype": "pdf",
-            })
-            archivos = [pdf_nombre]
+            adjuntos.append(
+                {
+                    "contenido": pdf_bytes,
+                    "nombre": pdf_nombre,
+                    "maintype": "application",
+                    "subtype": "pdf",
+                }
+            )
+            detalle_base["archivos"] = [pdf_nombre]
+            detalle_base["pdf_id"] = pdf_id
+            secciones["aprobados_no_firmados"].append(detalle_base)
+            continue
 
-        elif resultado == "Firmado":
-            categoria = "firmado"
-            validar_version_respuesta_actual(fila)
-            valor_pdf = texto(fila.get("PDF_FIRMADO"))
-            pdf_firmado_id = texto(fila.get("PDF_FIRMADO_ID"))
-            if pdf_firmado_id:
-                metadata = obtener_metadata_pdf_drive(drive_service, pdf_firmado_id)
-            elif valor_pdf:
-                metadata = buscar_pdf_cargado_appsheet(drive_service, valor_pdf)
-            else:
-                raise ValueError(
-                    f"{titulo}: RESULTADO_FIRMA_EXTERNA=Firmado pero no tiene PDF_FIRMADO"
-                )
+        if resultado == "Firmado":
+            validar_documento_firmado_reenvio(documento)
+            metadata = buscar_pdf_cargado_appsheet(
+                drive_service,
+                texto(documento.get("PDF_FIRMADO")),
+            )
             pdf_bytes, pdf_nombre = descargar_pdf_drive(
                 drive_service=drive_service,
                 file_id=texto(metadata.get("id")),
             )
-            adjuntos.append({
-                "contenido": pdf_bytes,
-                "nombre": pdf_nombre,
-                "maintype": "application",
-                "subtype": "pdf",
-            })
-            archivos = [pdf_nombre]
-
-        elif resultado == "Observado":
-            categoria = "por_aprobar"
-            if texto(fila.get("ESTADO")) != "Listo para firma":
-                raise ValueError(
-                    f"{titulo}: fue observado y todavía no termina su nueva cadena interna"
-                )
-            if texto(fila.get("ID_APROBACION_ACTUAL")):
-                raise ValueError(f"{titulo}: todavía tiene un aprobador interno pendiente")
-            if not pdf_id or not google_doc_id:
-                raise ValueError(
-                    f"{titulo}: la corrección no tiene PDF/Google Doc final para reenviar"
-                )
-            pdf_bytes, pdf_nombre = descargar_pdf_drive(
-                drive_service=drive_service,
-                file_id=pdf_id,
+            adjuntos.append(
+                {
+                    "contenido": pdf_bytes,
+                    "nombre": pdf_nombre,
+                    "maintype": "application",
+                    "subtype": "pdf",
+                }
             )
-            docx_bytes, docx_nombre = exportar_docx_drive(
-                drive_service=drive_service,
-                google_doc_id=google_doc_id,
-                nombre_base=pdf_nombre,
-            )
-            adjuntos.extend([
-                {"contenido": pdf_bytes, "nombre": pdf_nombre, "maintype": "application", "subtype": "pdf"},
-                {"contenido": docx_bytes, "nombre": docx_nombre, "maintype": "application", "subtype": "vnd.openxmlformats-officedocument.wordprocessingml.document"},
-            ])
-            archivos = [pdf_nombre, docx_nombre]
+            detalle_base["archivos"] = [pdf_nombre]
+            detalle_base["pdf_firmado_origen_id"] = texto(metadata.get("id"))
+            secciones["firmados"].append(detalle_base)
+            continue
 
-        else:
-            raise ValueError(
-                f"{titulo}: en un reenvío se esperaba Conforme, Firmado u Observado; "
-                f"resultado actual={resultado or '<vacío>'!r}"
-            )
+        raise ValueError(
+            f"{titulo}: no se puede reenviar con RESULTADO_FIRMA_EXTERNA={resultado!r}"
+        )
 
-        detalle.append({
-            "id_documento": id_documento,
-            "titulo": titulo,
-            "nivel": fila.get("_NIVEL_PAQUETE", 0),
-            "es_raiz": bool(fila.get("_ES_RAIZ_PAQUETE")),
-            "categoria": categoria,
-            "resultado_anterior": resultado,
-            "id_version": id_version,
-            "numero_version": texto(fila.get("VERSION_ACTUAL")),
-            "numero_revision": texto(fila.get("REVISION_ACTUAL")),
-            "pdf_id": pdf_id,
-            "google_doc_id": google_doc_id,
-            "archivos": archivos,
-        })
-
-    return adjuntos, detalle
+    return adjuntos, secciones
 
 
+def _filas_texto_seccion(titulo: str, filas: list[dict[str, Any]]) -> str:
+    if not filas:
+        return ""
+    lineas = [titulo.upper()]
+    for fila in filas:
+        lineas.append(f"- {fila['titulo']}")
+        for archivo in fila.get("archivos") or []:
+            lineas.append(f"  · {archivo}")
+    return "\n".join(lineas)
 
-def crear_eventos_enviado_firma_paquete(
+
+def _bloque_html_seccion(
+    titulo: str,
+    descripcion: str,
+    filas: list[dict[str, Any]],
+) -> str:
+    if not filas:
+        return ""
+    items = []
+    for fila in filas:
+        archivos = "".join(
+            f"<div style='color:#6b7280;font-size:12px;margin-top:2px;'>"
+            f"{html.escape(texto(nombre))}</div>"
+            for nombre in (fila.get("archivos") or [])
+        )
+        items.append(
+            "<li style='margin:0 0 10px 0;'>"
+            f"<strong>{html.escape(texto(fila.get('titulo')))}</strong>"
+            f"{archivos}</li>"
+        )
+    return f"""
+    <div style="margin-top:18px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+      <div style="padding:11px 14px;background:#f3f4f6;font-weight:700;color:#111827;">
+        {html.escape(titulo)}
+      </div>
+      <div style="padding:12px 16px;color:#374151;font-size:13px;line-height:1.5;">
+        <div style="margin-bottom:10px;">{html.escape(descripcion)}</div>
+        <ul style="margin:0;padding-left:20px;">{''.join(items)}</ul>
+      </div>
+    </div>
+    """
+
+
+def construir_email_firma_paquete_por_estado(
     *,
-    id_documento_raiz: str,
-    titulo_raiz: str,
+    documento: dict[str, Any],
+    plantilla: dict[str, Any],
     usuario: str,
-    fecha: str,
-    destinatarios: list[str],
-    detalle_documentos: list[dict[str, Any]],
-    message_id: str,
-    es_reenvio: bool,
-) -> None:
-    eventos: list[dict[str, Any]] = []
-    nombres_categoria = {
-        "aprobado_no_firmado": "Aprobado no firmado",
-        "firmado": "Firmado",
-        "por_aprobar": "Por aprobar",
-    }
-    for fila in detalle_documentos:
-        id_documento = texto(fila.get("id_documento"))
-        id_version = texto(fila.get("id_version"))
-        categoria = texto(fila.get("categoria"))
-        es_raiz = bool(fila.get("es_raiz"))
-        tipo_evento = "Reenviado a firma" if es_reenvio else "Enviado a firma"
-        if not es_raiz:
-            tipo_evento = (
-                "Incluido en reenvío de firma" if es_reenvio
-                else "Incluido en envío a firma"
-            )
-        eventos.append({
-            "ID_EVENTO": nuevo_id(),
-            "ID_DOCUMENTO": id_documento,
-            "ID_VERSION": id_version,
-            "ID_APROBACION_ACTUAL": "",
-            "TIPO_EVENTO": tipo_evento,
-            "ESTADO_ANTERIOR": texto(fila.get("resultado_anterior")) or "Listo para firma",
-            "ESTADO_NUEVO": "Pendiente" if categoria == "por_aprobar" else nombres_categoria.get(categoria, categoria),
-            "USUARIO": usuario,
-            "FECHA_EVENTO": fecha,
-            "COMENTARIO": (
-                f"Paquete administrado por {titulo_raiz or id_documento_raiz}. "
-                f"Clasificación del documento: {nombres_categoria.get(categoria, categoria)}. "
-                f"Archivos: {', '.join(fila.get('archivos') or [])}. "
-                f"Destinatarios: {', '.join(destinatarios)}. Gmail message ID: {message_id}."
-            ),
-        })
-    if eventos:
-        appsheet_action(TABLA_EVENTOS, "Add", eventos)
+    mensaje_adicional: str,
+    fecha_envio: str,
+    secciones: dict[str, list[dict[str, Any]]],
+    primer_envio: bool,
+) -> tuple[str, str, str]:
+    """Correo externo claro: qué revisar, qué firmar y qué ya está firmado."""
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    titulo_raiz = texto(documento.get("TITULO")) or f"Documento {id_documento}"
+    tipo_documento = texto(documento.get("TIPO_DOCUMENTO")) or "-"
+    proyecto = (
+        texto(documento.get("NOMBRE_PROYECTO"))
+        or texto(documento.get("PROYECTO"))
+        or texto(documento.get("ID_PROYECTO"))
+    )
 
+    mapa_nombres = construir_mapa_nombres_usuarios(id_documento=id_documento)
+    enviado_por_nombre = obtener_nombre_usuario_evento(
+        usuario_evento=usuario,
+        mapa_nombres=mapa_nombres,
+    )
+    if enviado_por_nombre == "Usuario no identificado":
+        enviado_por_nombre = usuario
+
+    variables = {
+        "TITULO": titulo_raiz,
+        "TIPO_DOCUMENTO": tipo_documento,
+        "ID_PROYECTO": proyecto,
+        "PROYECTO": proyecto,
+        "ENVIADO_POR": usuario,
+        "ENVIADO_POR_NOMBRE": enviado_por_nombre,
+        "FECHA_ENVIO": fecha_envio,
+    }
+    asunto_base = texto(plantilla.get("ASUNTO_EMAIL_FIRMA")) or "Solicitud de firma — {{TITULO}}"
+    asunto = reemplazar_variables_email(asunto_base, variables).strip()
+    if not primer_envio:
+        asunto = f"Actualización — {asunto}"
+
+    cuerpo_base = texto(plantilla.get("CUERPO_EMAIL_FIRMA"))
+    mensaje_plantilla = reemplazar_variables_email(cuerpo_base, variables).strip()
+    mensaje_normalizado = mensaje_plantilla.lower()
+    if (
+        "adjuntamos el documento" in mensaje_normalizado
+        and "una vez firmado" in mensaje_normalizado
+        and "respondiendo a este correo" in mensaje_normalizado
+    ):
+        mensaje_plantilla = ""
+
+    if primer_envio:
+        introduccion = (
+            f'Se adjunta el paquete documental asociado a "{titulo_raiz}" para su revisión y firma.'
+        )
+    else:
+        introduccion = (
+            f'Se adjunta una actualización del paquete documental asociado a "{titulo_raiz}". '
+            "Los archivos se agrupan según su estado para identificar rápidamente qué debe revisar, "
+            "qué debe firmar y qué ya se encuentra firmado."
+        )
+
+    aprobados = secciones.get("aprobados_no_firmados") or []
+    firmados = secciones.get("firmados") or []
+    por_aprobar = secciones.get("por_aprobar") or []
+
+    bloques_texto = [
+        "REVISIÓN Y FIRMA DE PAQUETE DOCUMENTAL",
+        "",
+        "Estimado/a:",
+        "",
+        introduccion,
+        "",
+    ]
+    for titulo_seccion, filas in (
+        ("Documentos aprobados no firmados", aprobados),
+        ("Documentos firmados", firmados),
+        ("Documentos por aprobar", por_aprobar),
+    ):
+        bloque = _filas_texto_seccion(titulo_seccion, filas)
+        if bloque:
+            bloques_texto.extend([bloque, ""])
+
+    bloques_texto.extend(
+        [
+            "GUÍA RÁPIDA",
+            "- Documentos aprobados no firmados: ya están aprobados; corresponde firmarlos.",
+            "- Documentos firmados: ya están resueltos y se adjuntan como referencia.",
+            "- Documentos por aprobar: requieren revisión; se adjuntan PDF y archivo editable.",
+        ]
+    )
+    if mensaje_plantilla:
+        bloques_texto.extend(["", "MENSAJE", mensaje_plantilla])
+    if mensaje_adicional:
+        bloques_texto.extend(["", "INDICACIONES ADICIONALES", mensaje_adicional])
+    bloques_texto.extend(
+        [
+            "",
+            "Puede responder directamente a este correo adjuntando los PDF firmados que correspondan.",
+            "",
+            f"Este correo fue generado por {NOMBRE_APLICACION}.",
+        ]
+    )
+    cuerpo_texto = "\n".join(bloques_texto)
+
+    def esc(valor: Any) -> str:
+        return html.escape(texto(valor))
+
+    def saltos(valor: Any) -> str:
+        return esc(valor).replace("\n", "<br>")
+
+    resumen_filas = [("Documento principal", titulo_raiz)]
+    if proyecto:
+        resumen_filas.append(("Proyecto", proyecto))
+    resumen_filas.extend(
+        [
+            ("Tipo de documento", tipo_documento),
+            ("Enviado por", enviado_por_nombre),
+        ]
+    )
+    resumen_html = "".join(
+        f"<tr><td style='padding:9px 12px;border-top:1px solid #e5e7eb;color:#6b7280;width:34%;font-size:13px;'>{esc(k)}</td>"
+        f"<td style='padding:9px 12px;border-top:1px solid #e5e7eb;color:#111827;font-size:13px;font-weight:600;'>{esc(v)}</td></tr>"
+        for k, v in resumen_filas if texto(v)
+    )
+
+    bloques_secciones = (
+        _bloque_html_seccion(
+            "Documentos aprobados no firmados",
+            "Ya fueron aprobados previamente. No requieren nueva revisión; corresponde firmarlos.",
+            aprobados,
+        )
+        + _bloque_html_seccion(
+            "Documentos firmados",
+            "Ya cuentan con PDF firmado y se incluyen como referencia del paquete.",
+            firmados,
+        )
+        + _bloque_html_seccion(
+            "Documentos por aprobar",
+            "Son documentos nuevos o corregidos que requieren revisión. Se adjuntan PDF y archivo editable.",
+            por_aprobar,
+        )
+    )
+
+    bloque_mensaje = ""
+    if mensaje_plantilla:
+        bloque_mensaje = (
+            "<div style='margin-top:18px;padding:14px 16px;background:#f9fafb;border-left:4px solid #6b7280;border-radius:6px;'>"
+            "<div style='font-size:12px;font-weight:700;color:#374151;text-transform:uppercase;margin-bottom:6px;'>Mensaje</div>"
+            f"<div style='font-size:14px;line-height:1.6;color:#374151;'>{saltos(mensaje_plantilla)}</div></div>"
+        )
+    bloque_adicional = ""
+    if mensaje_adicional:
+        bloque_adicional = (
+            "<div style='margin-top:18px;padding:14px 16px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;'>"
+            "<div style='font-size:12px;font-weight:700;color:#9a3412;text-transform:uppercase;margin-bottom:6px;'>Indicaciones adicionales</div>"
+            f"<div style='font-size:14px;line-height:1.6;color:#7c2d12;'>{saltos(mensaje_adicional)}</div></div>"
+        )
+
+    cuerpo_html = f"""
+    <!doctype html>
+    <html lang="es">
+      <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;background:#f3f4f6;">
+          <tr><td align="center" style="padding:24px 12px;">
+            <table role="presentation" width="680" cellspacing="0" cellpadding="0"
+                   style="width:100%;max-width:680px;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+              <tr><td style="padding:24px 28px;background:#111827;color:#ffffff;">
+                <div style="font-size:13px;color:#d1d5db;">{esc(NOMBRE_APLICACION)}</div>
+                <div style="margin-top:5px;font-size:24px;font-weight:700;">Revisión y firma de paquete documental</div>
+                <div style="margin-top:8px;font-size:14px;color:#d1d5db;line-height:1.5;">
+                  {'Primer envío externo' if primer_envio else 'Actualización del paquete externo'}
+                </div>
+              </td></tr>
+              <tr><td style="padding:28px;">
+                <p style="margin:0;font-size:15px;line-height:1.65;">Estimado/a:</p>
+                <p style="margin:14px 0 0 0;font-size:15px;line-height:1.65;color:#374151;">{esc(introduccion)}</p>
+
+                <div style="margin-top:22px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+                  <div style="padding:11px 14px;background:#f9fafb;font-weight:700;font-size:14px;">Resumen del paquete</div>
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">{resumen_html}</table>
+                </div>
+
+                {bloques_secciones}
+
+                <div style="margin-top:18px;padding:14px 16px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;color:#3730a3;font-size:13px;line-height:1.6;">
+                  <strong>Guía rápida</strong><br>
+                  <strong>Aprobados no firmados:</strong> firmar.<br>
+                  <strong>Firmados:</strong> sin acción; se incluyen como referencia.<br>
+                  <strong>Por aprobar:</strong> revisar nuevamente antes de firmar.
+                </div>
+
+                {bloque_mensaje}
+                {bloque_adicional}
+
+                <p style="margin:24px 0 0 0;font-size:14px;line-height:1.6;color:#374151;">
+                  Puede responder directamente a este correo adjuntando los PDF firmados que correspondan.
+                </p>
+              </td></tr>
+              <tr><td style="padding:15px 28px;background:#f9fafb;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px;line-height:1.5;">
+                Correo generado automáticamente por <strong>{esc(NOMBRE_APLICACION)}</strong>.
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </body>
+    </html>
+    """
+    return asunto, cuerpo_texto, cuerpo_html
 
 
 def marcar_envio_firma_en_proceso(
@@ -8175,135 +8426,151 @@ def marcar_envio_firma_en_proceso(
     appsheet_action(
         TABLA_DOCUMENTOS,
         "Edit",
-        [{
-            "ID_DOCUMENTO": id_documento,
-            "ESTADO_FIRMA": "Enviando",
-            "FECHA_ULTIMA_ACTUALIZACION": fecha,
-            "OBSERVACION_ACTUAL": "",
-        }],
-    )
-
-
-
-def actualizar_documento_enviado_firma(
-    *,
-    id_documento: str,
-    usuario: str,
-    destinatarios: list[str],
-    mensaje_adicional: str,
-    message_id: str,
-    fecha: str,
-    detalle_documentos: list[dict[str, Any]],
-    es_reenvio: bool,
-) -> None:
-    """Actualiza raíz + integrantes solamente después de que Gmail confirmó."""
-    filas: list[dict[str, Any]] = []
-    for detalle in detalle_documentos:
-        id_miembro = texto(detalle.get("id_documento"))
-        categoria = texto(detalle.get("categoria"))
-        cambios: dict[str, Any] = {
-            "ID_DOCUMENTO": id_miembro,
-            "ID_DOCUMENTO_RAIZ_FIRMA": id_documento,
-            "FECHA_ULTIMA_ACTUALIZACION": fecha,
-            "ACCION_SOLICITADA": "",
-            "OBSERVACION_ACTUAL": "",
-        }
-
-        # Solo los documentos que requieren una nueva respuesta cambian a Pendiente.
-        if categoria == "por_aprobar":
-            cambios.update({
-                "RESULTADO_FIRMA_EXTERNA": "Pendiente",
-                "ID_VERSION_RESPUESTA_EXTERNA": texto(detalle.get("id_version")),
-                "RESPUESTA_FIRMA_EXTERNA_POR": "",
-                "FECHA_RESPUESTA_FIRMA_EXTERNA": "",
-                "ESTADO_FIRMA": "Pendiente",
-            })
-
-        if id_miembro == id_documento:
-            cambios.update({
-                "ESTADO": "En firma",
-                "ESTADO_FIRMA": "Pendiente",
-                "ESTADO_PAQUETE_FIRMA": "Enviado",
-                "DESTINATARIOS_FIRMA": ", ".join(destinatarios),
-                "MENSAJE_ADICIONAL_FIRMA": mensaje_adicional,
-                "ENVIADO_FIRMA_POR": usuario,
-                "EMAIL_FIRMA_MESSAGE_ID": message_id,
-                "FECHA_ENVIO_FIRMA": fecha,
-                "ULTIMO_ENVIADO_POR": usuario,
-                "FECHA_ULTIMO_ENVIO": fecha,
-            })
-        filas.append(cambios)
-
-    appsheet_action(TABLA_DOCUMENTOS, "Edit", filas)
-
-
-
-def restaurar_documento_tras_error_envio_firma(
-    id_documento: str,
-    mensaje: str,
-    estado_firma_anterior: str = "",
-) -> None:
-    try:
-        appsheet_action(
-            TABLA_DOCUMENTOS,
-            "Edit",
-            [{
-                "ID_DOCUMENTO": id_documento,
-                "ESTADO_FIRMA": estado_firma_anterior or "No iniciado",
-                "ACCION_SOLICITADA": "",
-                "OBSERVACION_ACTUAL": mensaje[:1000],
-                "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
-            }],
-        )
-    except Exception:
-        traceback.print_exc()
-
-
-
-def crear_evento_enviado_firma(
-    *,
-    id_documento: str,
-    id_version: str,
-    usuario: str,
-    fecha: str,
-    destinatarios: list[str],
-    pdf_nombre: str,
-    docx_nombre: str,
-    message_id: str,
-) -> None:
-    appsheet_action(
-        TABLA_EVENTOS,
-        "Add",
         [
             {
-                "ID_EVENTO": nuevo_id(),
                 "ID_DOCUMENTO": id_documento,
-                "ID_VERSION": id_version,
-                "ID_APROBACION_ACTUAL": "",
-                "TIPO_EVENTO": "Enviado a firma",
-                "ESTADO_ANTERIOR": "Listo para firma",
-                "ESTADO_NUEVO": "En firma",
-                "USUARIO": usuario,
-                "FECHA_EVENTO": fecha,
-                "COMENTARIO": (
-                    f"Se enviaron {pdf_nombre} y {docx_nombre} a "
-                    f"{', '.join(destinatarios)}. "
-                    f"Gmail message ID: {message_id}."
-                ),
+                "ESTADO_FIRMA": "Enviando",
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
             }
         ],
     )
 
 
+def restaurar_documento_tras_error_envio_firma(
+    id_documento: str,
+    mensaje: str,
+    estado_firma_anterior: str = "No iniciado",
+) -> None:
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "ESTADO_FIRMA": estado_firma_anterior or "No iniciado",
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": mensaje[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+def actualizar_paquete_tras_envio_exitoso(
+    *,
+    id_documento_raiz: str,
+    integrantes: list[dict[str, Any]],
+    primer_envio: bool,
+    usuario: str,
+    destinatarios: list[str],
+    mensaje_adicional: str,
+    message_id: str,
+    fecha: str,
+) -> None:
+    filas: list[dict[str, Any]] = []
+    for fila in integrantes:
+        documento = fila.get("documento") or fila
+        id_documento = texto(documento.get("ID_DOCUMENTO"))
+        cambios: dict[str, Any] = {
+            "ID_DOCUMENTO": id_documento,
+            "ID_DOCUMENTO_RAIZ_FIRMA": id_documento_raiz,
+            "FECHA_ULTIMA_ACTUALIZACION": fecha,
+        }
+
+        resultado_previo = normalizar_resultado_firma_externa(
+            documento.get("RESULTADO_FIRMA_EXTERNA")
+        )
+        if primer_envio or resultado_previo == "Observado":
+            cambios.update(
+                {
+                    "RESULTADO_FIRMA_EXTERNA": "Pendiente",
+                    "ID_VERSION_RESPUESTA_EXTERNA": texto(
+                        documento.get("ID_VERSION_ACTUAL")
+                    ),
+                    "RESPUESTA_FIRMA_EXTERNA_POR": "",
+                    "FECHA_RESPUESTA_FIRMA_EXTERNA": "",
+                    "OBSERVACION_ACTUAL": "",
+                }
+            )
+
+        if id_documento == id_documento_raiz:
+            cambios.update(
+                {
+                    "ESTADO": "En firma",
+                    "ESTADO_FIRMA": "Pendiente",
+                    "ESTADO_PAQUETE_FIRMA": "Enviado",
+                    "DESTINATARIOS_FIRMA": ", ".join(destinatarios),
+                    "MENSAJE_ADICIONAL_FIRMA": mensaje_adicional,
+                    "ENVIADO_FIRMA_POR": usuario,
+                    "EMAIL_FIRMA_MESSAGE_ID": message_id,
+                    "FECHA_ENVIO_FIRMA": fecha,
+                    "ULTIMO_ENVIADO_POR": usuario,
+                    "FECHA_ULTIMO_ENVIO": fecha,
+                    "ACCION_SOLICITADA": "",
+                }
+            )
+        filas.append(cambios)
+
+    appsheet_action(TABLA_DOCUMENTOS, "Edit", filas)
+
+
+def crear_eventos_envio_paquete_por_estado(
+    *,
+    id_documento_raiz: str,
+    usuario: str,
+    fecha: str,
+    destinatarios: list[str],
+    secciones: dict[str, list[dict[str, Any]]],
+    message_id: str,
+    primer_envio: bool,
+) -> None:
+    eventos: list[dict[str, Any]] = []
+    etiquetas = {
+        "aprobados_no_firmados": "Aprobado no firmado",
+        "firmados": "Firmado",
+        "por_aprobar": "Por aprobar",
+    }
+    for clave, filas in secciones.items():
+        for fila in filas:
+            es_raiz = texto(fila.get("id_documento")) == id_documento_raiz
+            archivos = ", ".join(fila.get("archivos") or [])
+            if primer_envio:
+                tipo_evento = "Enviado a firma" if es_raiz else "Incluido en envío a firma"
+            else:
+                tipo_evento = "Reenviado a firma" if es_raiz else "Incluido en reenvío a firma"
+            eventos.append(
+                {
+                    "ID_EVENTO": nuevo_id(),
+                    "ID_DOCUMENTO": texto(fila.get("id_documento")),
+                    "ID_VERSION": texto(fila.get("id_version")),
+                    "ID_APROBACION_ACTUAL": "",
+                    "TIPO_EVENTO": tipo_evento,
+                    "ESTADO_ANTERIOR": texto(fila.get("resultado_anterior")),
+                    "ESTADO_NUEVO": "Pendiente" if clave == "por_aprobar" else etiquetas[clave],
+                    "USUARIO": usuario,
+                    "FECHA_EVENTO": fecha,
+                    "COMENTARIO": (
+                        f"Paquete {'inicial' if primer_envio else 'reenviado'} a "
+                        f"{', '.join(destinatarios)}. Categoría: {etiquetas[clave]}. "
+                        f"Archivos: {archivos}. Gmail message ID: {message_id}."
+                    ),
+                }
+            )
+    if eventos:
+        appsheet_action(TABLA_EVENTOS, "Add", eventos)
+
+
 @app.route("/enviar-firma", methods=["POST"])
 def enviar_firma():
-    """Primer envío o reenvío inteligente de un paquete de Firma Simple."""
+    """Primer envío o reenvío de un paquete de Firma Simple."""
     id_documento = ""
     correo_enviado = False
     message_id = ""
-    fecha_envio = ""
-    estado_firma_anterior = ""
-    datos_finales: dict[str, Any] = {}
+    estado_firma_anterior = "No iniciado"
 
     try:
         validar_configuracion()
@@ -8316,71 +8583,93 @@ def enviar_firma():
         if not id_documento:
             return {"error": "Falta id_documento"}, 400
 
-        raiz, miembros = obtener_jerarquia_firma_raw(id_documento)
-        id_raiz = texto(raiz.get("ID_DOCUMENTO"))
-        if id_documento != id_raiz:
-            raise ValueError("Solo el documento raíz puede iniciar el envío externo")
-        if normalizar_tipo_firma(raiz.get("TIPO_FIRMA")) != "Simple":
-            raise ValueError("/enviar-firma corresponde únicamente a TIPO_FIRMA=Simple")
+        contexto = obtener_contexto_jerarquia_documental(id_documento)
+        if not contexto.get("solicitado_es_raiz"):
+            raise ValueError(
+                "Solo el documento raíz puede iniciar el envío externo. "
+                f"Raíz: {contexto.get('id_documento_raiz')}"
+            )
+        if contexto.get("tipo_firma_paquete") != "Simple":
+            raise ValueError(
+                "Este endpoint corresponde a Firma Simple; el paquete no es Simple"
+            )
 
+        raiz = contexto["raiz"]
+        integrantes = contexto["integrantes"]
+        id_raiz = contexto["id_documento_raiz"]
         estado_paquete = texto(raiz.get("ESTADO_PAQUETE_FIRMA")) or "No iniciado"
-        estado_firma_anterior = texto(raiz.get("ESTADO_FIRMA"))
-        es_reenvio = estado_paquete == "Con observaciones"
+        estado_firma_anterior = texto(raiz.get("ESTADO_FIRMA")) or "No iniciado"
+        message_id_existente = texto(raiz.get("EMAIL_FIRMA_MESSAGE_ID"))
 
-        # Idempotencia: tras un envío exitoso el paquete queda Enviado.
-        if estado_paquete == "Enviado" and texto(raiz.get("EMAIL_FIRMA_MESSAGE_ID")):
-            return jsonify({
-                "ok": True,
-                "ya_procesado": True,
-                "id_documento": id_raiz,
-                "estado_paquete_firma": estado_paquete,
-                "message_id": texto(raiz.get("EMAIL_FIRMA_MESSAGE_ID")),
-                "fecha_envio_firma": texto(raiz.get("FECHA_ENVIO_FIRMA")),
-            })
-        if estado_firma_anterior == "Enviando":
-            return {"error": "Ya existe un envío en proceso para este paquete"}, 409
+        primer_envio = estado_paquete in {"", "No iniciado"} and not texto(
+            raiz.get("ID_DOCUMENTO_RAIZ_FIRMA")
+        )
+        reenvio = estado_paquete == "Con observaciones"
 
-        if es_reenvio:
-            resultados = [
-                normalizar_resultado_firma_externa(x.get("RESULTADO_FIRMA_EXTERNA"))
-                for x in miembros
-            ]
-            if any(r in {"", "Pendiente"} for r in resultados):
-                raise ValueError(
-                    "No se puede reenviar mientras existan respuestas externas pendientes de la ronda anterior"
+        if not primer_envio and not reenvio:
+            if estado_paquete in {"Enviado", "Esperando firma", "Listo para cierre"} and message_id_existente:
+                return jsonify(
+                    {
+                        "ok": True,
+                        "ya_procesado": True,
+                        "id_documento": id_raiz,
+                        "estado_paquete_firma": estado_paquete,
+                        "message_id": message_id_existente,
+                        "fecha_envio_firma": texto(raiz.get("FECHA_ENVIO_FIRMA")),
+                    }
                 )
-            if not any(r == "Observado" for r in resultados):
-                raise ValueError("No existen documentos observados que requieran reenvío")
-            for fila in miembros:
-                validar_miembro_ciclo_firma(fila, id_raiz)
-        else:
-            # Primer envío: conserva la validación estricta de Fase 1.
+            raise ValueError(
+                f"ESTADO_PAQUETE_FIRMA={estado_paquete!r} no permite enviar el paquete"
+            )
+
+        if estado_firma_anterior == "Enviando":
+            return {"error": "Ya existe un envío de firma en proceso"}, 409
+
+        if primer_envio:
             paquete = validar_paquete_documental_datos(id_raiz)
             if not paquete.get("paquete_listo"):
-                pendientes = paquete.get("documentos_pendientes") or []
-                detalle_error = " | ".join(
-                    f"{x.get('titulo') or x.get('id_documento')}: "
-                    + "; ".join(x.get("motivos") or [])
-                    for x in pendientes
-                )
+                detalles = []
+                for fila in paquete.get("documentos_pendientes") or []:
+                    detalles.append(
+                        f"{texto(fila.get('titulo')) or texto(fila.get('id_documento'))}: "
+                        + "; ".join(fila.get("motivos") or [])
+                    )
                 raise ValueError(
-                    "No se puede enviar el paquete porque existen documentos pendientes. "
-                    + detalle_error
+                    "No se puede realizar el primer envío: " + " | ".join(detalles)
                 )
             if texto(raiz.get("ESTADO")) != "Listo para firma":
-                raise ValueError("El documento raíz debe estar Listo para firma para el primer envío")
-            if estado_paquete not in {"", "No iniciado"}:
-                raise ValueError(
-                    f"Estado de paquete no válido para primer envío: {estado_paquete!r}"
+                raise ValueError("La raíz debe estar Listo para firma en el primer envío")
+        else:
+            validar_membresia_paquete_activo(
+                id_documento_raiz=id_raiz,
+                integrantes_jerarquia=integrantes,
+            )
+            pendientes = []
+            observados = []
+            for fila in integrantes:
+                documento = fila["documento"]
+                resultado = normalizar_resultado_firma_externa(
+                    documento.get("RESULTADO_FIRMA_EXTERNA")
                 )
+                if resultado == "Pendiente":
+                    pendientes.append(fila["titulo"])
+                if resultado == "Observado":
+                    observados.append(fila["titulo"])
+            if pendientes:
+                raise ValueError(
+                    "No se puede reenviar mientras existan respuestas pendientes: "
+                    + ", ".join(pendientes)
+                )
+            if not observados:
+                raise ValueError("No existen documentos Observados para reenviar")
 
         usuario_registrado = texto(raiz.get("ENVIADO_FIRMA_POR"))
         usuario = usuario or usuario_registrado
         if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
             raise ValueError("El usuario que envía a firma no es válido")
-        if usuario_registrado and usuario_registrado.lower() != usuario.lower():
+        if reenvio and usuario_registrado and usuario_registrado.lower() != usuario.lower():
             raise PermissionError(
-                "El usuario del webhook no coincide con quien administra el envío a firma"
+                "Solo el usuario que administra este paquete puede reenviarlo"
             )
 
         if destinatarios_entrada in (None, ""):
@@ -8391,26 +8680,26 @@ def enviar_firma():
         if not mensaje_adicional:
             mensaje_adicional = texto(raiz.get("MENSAJE_ADICIONAL_FIRMA"))
 
-        drive_service = obtener_drive_service()
-        gmail_service = obtener_gmail_service()
-        adjuntos, detalle_documentos = construir_adjuntos_paquete_firma(
-            drive_service=drive_service,
-            documentos_paquete=miembros,
-            es_reenvio=es_reenvio,
-        )
-
         plantilla = buscar_plantilla(texto(raiz.get("ID_PLANTILLA")))
         fecha_envio = ahora_iso()
-        asunto, cuerpo, cuerpo_html = construir_email_firma_paquete_externo(
+        marcar_envio_firma_en_proceso(id_raiz, fecha_envio)
+        drive_service = obtener_drive_service()
+        gmail_service = obtener_gmail_service()
+
+        adjuntos, secciones = construir_adjuntos_paquete_firma_por_estado(
+            drive_service=drive_service,
+            integrantes=integrantes,
+            primer_envio=primer_envio,
+        )
+        asunto, cuerpo, cuerpo_html = construir_email_firma_paquete_por_estado(
             documento=raiz,
             plantilla=plantilla,
             usuario=usuario,
             mensaje_adicional=mensaje_adicional,
             fecha_envio=fecha_envio,
-            detalle_envio=detalle_documentos,
+            secciones=secciones,
+            primer_envio=primer_envio,
         )
-
-        marcar_envio_firma_en_proceso(id_raiz, fecha_envio)
         respuesta_gmail = enviar_email_con_adjuntos(
             gmail_service=gmail_service,
             destinatarios=destinatarios,
@@ -8423,84 +8712,90 @@ def enviar_firma():
         correo_enviado = True
         message_id = respuesta_gmail["message_id"]
 
-        datos_finales = {
-            "id_documento": id_raiz,
-            "usuario": usuario,
-            "destinatarios": destinatarios,
-            "mensaje_adicional": mensaje_adicional,
-            "message_id": message_id,
-            "fecha": fecha_envio,
-            "detalle_documentos": detalle_documentos,
-            "es_reenvio": es_reenvio,
-        }
-        actualizar_documento_enviado_firma(**datos_finales)
+        actualizar_paquete_tras_envio_exitoso(
+            id_documento_raiz=id_raiz,
+            integrantes=integrantes,
+            primer_envio=primer_envio,
+            usuario=usuario,
+            destinatarios=destinatarios,
+            mensaje_adicional=mensaje_adicional,
+            message_id=message_id,
+            fecha=fecha_envio,
+        )
 
         advertencias: list[str] = []
         try:
-            crear_eventos_enviado_firma_paquete(
+            crear_eventos_envio_paquete_por_estado(
                 id_documento_raiz=id_raiz,
-                titulo_raiz=texto(raiz.get("TITULO")),
                 usuario=usuario,
                 fecha=fecha_envio,
                 destinatarios=destinatarios,
-                detalle_documentos=detalle_documentos,
+                secciones=secciones,
                 message_id=message_id,
-                es_reenvio=es_reenvio,
+                primer_envio=primer_envio,
             )
         except Exception as exc_evento:
             traceback.print_exc()
             advertencias.append(
-                f"El correo se envió, pero falló parte de la trazabilidad: {exc_evento}"
+                "El correo se envió, pero falló parte de la trazabilidad: "
+                f"{exc_evento}"
             )
 
-        conteos = {
-            "aprobados_no_firmados": sum(x.get("categoria") == "aprobado_no_firmado" for x in detalle_documentos),
-            "firmados": sum(x.get("categoria") == "firmado" for x in detalle_documentos),
-            "por_aprobar": sum(x.get("categoria") == "por_aprobar" for x in detalle_documentos),
-        }
-        return jsonify({
-            "ok": True,
-            "ya_procesado": False,
-            "es_reenvio": es_reenvio,
-            "id_documento": id_raiz,
-            "estado": "En firma",
-            "estado_firma": "Pendiente",
-            "estado_paquete_firma": "Enviado",
-            "message_id": message_id,
-            "destinatarios": destinatarios,
-            "cantidad_documentos": len(detalle_documentos),
-            "cantidad_adjuntos": len(adjuntos),
-            "clasificacion": conteos,
-            "documentos_paquete": detalle_documentos,
-            "advertencias": advertencias,
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "tipo_envio": "Primer envío" if primer_envio else "Reenvío",
+                "id_documento_raiz": id_raiz,
+                "estado_paquete_firma": "Enviado",
+                "message_id": message_id,
+                "destinatarios": destinatarios,
+                "cantidad_documentos": len(integrantes),
+                "cantidad_adjuntos": len(adjuntos),
+                "secciones": {
+                    clave: [
+                        {
+                            "id_documento": fila.get("id_documento"),
+                            "titulo": fila.get("titulo"),
+                            "archivos": fila.get("archivos"),
+                        }
+                        for fila in filas
+                    ]
+                    for clave, filas in secciones.items()
+                },
+                "advertencias": advertencias,
+            }
+        )
 
     except PermissionError as exc:
         if id_documento and not correo_enviado:
             restaurar_documento_tras_error_envio_firma(
-                id_documento, str(exc), estado_firma_anterior
+                id_documento,
+                str(exc),
+                estado_firma_anterior,
             )
         return {"error": str(exc)}, 403
     except (ValueError, LookupError) as exc:
         if id_documento and not correo_enviado:
             restaurar_documento_tras_error_envio_firma(
-                id_documento, str(exc), estado_firma_anterior
+                id_documento,
+                str(exc),
+                estado_firma_anterior,
             )
         return {"error": str(exc)}, 400
     except Exception as exc:
         traceback.print_exc()
-        if id_documento and correo_enviado and datos_finales:
-            try:
-                actualizar_documento_enviado_firma(**datos_finales)
-            except Exception:
-                traceback.print_exc()
-        elif id_documento:
+        if id_documento and not correo_enviado:
             restaurar_documento_tras_error_envio_firma(
-                id_documento, str(exc), estado_firma_anterior
+                id_documento,
+                str(exc),
+                estado_firma_anterior,
             )
-        return {"error": str(exc), "correo_enviado": correo_enviado, "message_id": message_id}, 500
-
-
+        return {
+            "error": str(exc),
+            "correo_enviado": correo_enviado,
+            "message_id": message_id,
+        }, 500
 
 # -----------------------------------------------------------------------------
 # Flujo: registrar PDF firmado y cerrar documento
@@ -8975,6 +9270,7 @@ def crear_eventos_cierre_firma(
     nombre_origen: str,
     nombre_final: str,
     comentario: str,
+    estado_anterior: str = "En firma",
 ) -> dict[str, Any]:
     """Crea los eventos de cierre y devuelve el evento Proceso terminado."""
     detalle_carga = (
@@ -8989,7 +9285,7 @@ def crear_eventos_cierre_firma(
         "ID_VERSION": id_version,
         "ID_APROBACION_ACTUAL": "",
         "TIPO_EVENTO": "PDF firmado cargado",
-        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_ANTERIOR": estado_anterior,
         "ESTADO_NUEVO": "En firma",
         "USUARIO": usuario,
         "FECHA_EVENTO": fecha,
@@ -9001,7 +9297,7 @@ def crear_eventos_cierre_firma(
         "ID_VERSION": id_version,
         "ID_APROBACION_ACTUAL": "",
         "TIPO_EVENTO": "Proceso terminado",
-        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_ANTERIOR": estado_anterior,
         "ESTADO_NUEVO": "Proceso terminado",
         "USUARIO": usuario,
         "FECHA_EVENTO": fecha,
@@ -9018,164 +9314,166 @@ def crear_eventos_cierre_firma(
     return evento_cierre
 
 
-def crear_evento_respuesta_firma_externa(
+def validar_documento_en_paquete_activo(
     *,
     documento: dict[str, Any],
-    id_version: str,
-    usuario: str,
-    fecha: str,
-    resultado: str,
-    comentario: str = "",
+    id_documento_raiz: str,
 ) -> dict[str, Any]:
-    evento = {
-        "ID_EVENTO": nuevo_id(),
-        "ID_DOCUMENTO": texto(documento.get("ID_DOCUMENTO")),
-        "ID_VERSION": id_version,
-        "ID_APROBACION_ACTUAL": "",
-        "TIPO_EVENTO": (
-            "PDF firmado recibido" if resultado == "Firmado"
-            else "Conforme firma externa"
-        ),
-        "ESTADO_ANTERIOR": "Pendiente",
-        "ESTADO_NUEVO": resultado,
-        "USUARIO": usuario,
-        "FECHA_EVENTO": fecha,
-        "COMENTARIO": comentario or (
-            "Se registró el PDF firmado recibido del firmante."
-            if resultado == "Firmado"
-            else "El firmante manifestó conformidad con esta versión; queda pendiente su firma."
-        ),
-    }
-    appsheet_action(TABLA_EVENTOS, "Add", [evento])
-    return evento
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    raiz_asignada = texto(documento.get("ID_DOCUMENTO_RAIZ_FIRMA"))
+    if not raiz_asignada:
+        raise ValueError(f"{id_documento}: no pertenece a un paquete de firma activo")
+    if raiz_asignada != id_documento_raiz:
+        raise ValueError(
+            f"{id_documento}: pertenece al paquete {raiz_asignada}, no a {id_documento_raiz}"
+        )
+    raiz = buscar_documento(id_documento_raiz)
+    estado_paquete = texto(raiz.get("ESTADO_PAQUETE_FIRMA"))
+    if estado_paquete not in ESTADOS_PAQUETE_FIRMA_ACTIVOS:
+        raise ValueError(
+            f"El paquete {id_documento_raiz} no está activo. Estado: {estado_paquete!r}"
+        )
+    return raiz
 
 
 @app.route("/registrar-respuesta-firma", methods=["POST"])
 def registrar_respuesta_firma():
-    """Registra Conforme o PDF firmado sin cerrar todavía el paquete."""
+    """Registra Conforme o PDF Firmado sin cerrar todavía el paquete."""
     id_documento = ""
     try:
         validar_configuracion()
         validar_token()
         data = request.get_json(silent=True) or {}
         id_documento = texto(data.get("id_documento"))
-        id_raiz_solicitud = texto(data.get("id_documento_raiz"))
-        id_version_solicitud = texto(data.get("id_version"))
+        id_documento_raiz = texto(data.get("id_documento_raiz"))
+        id_version = texto(data.get("id_version"))
         usuario = texto(data.get("usuario"))
         accion = texto(data.get("accion"))
-        valor_pdf = texto(data.get("pdf_firmado"))
+        pdf_firmado = texto(data.get("pdf_firmado"))
 
-        if not id_documento or not id_raiz_solicitud:
-            return {"error": "Faltan id_documento o id_documento_raiz"}, 400
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+        if not id_documento_raiz:
+            return {"error": "Falta id_documento_raiz"}, 400
+        if accion not in {"Conforme firma", "Registrar PDF firmado"}:
+            raise ValueError(f"Acción de respuesta externa no reconocida: {accion!r}")
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("El usuario que registra la respuesta no es válido")
 
-        raiz, miembros = obtener_jerarquia_firma_raw(id_raiz_solicitud)
-        id_raiz = texto(raiz.get("ID_DOCUMENTO"))
-        if id_raiz != id_raiz_solicitud:
-            raise ValueError("id_documento_raiz no corresponde a una raíz documental")
-        validar_ciclo_firma_activo(id_raiz=id_raiz, miembros=miembros)
-        documento = next(
-            (x for x in miembros if texto(x.get("ID_DOCUMENTO")) == id_documento),
-            None,
+        documento = buscar_documento(id_documento)
+        validar_documento_en_paquete_activo(
+            documento=documento,
+            id_documento_raiz=id_documento_raiz,
         )
-        if documento is None:
-            raise ValueError("El documento no pertenece al paquete de firma indicado")
+        id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+        id_version_esperada = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
+        id_version = id_version or id_version_actual
+        if not id_version or id_version != id_version_actual:
+            raise ValueError("La versión indicada ya no coincide con la versión actual")
+        if id_version_esperada and id_version_esperada != id_version:
+            raise ValueError(
+                "La respuesta corresponde a una versión distinta de la enviada externamente"
+            )
 
         resultado_actual = normalizar_resultado_firma_externa(
             documento.get("RESULTADO_FIRMA_EXTERNA")
         )
-        id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
-        id_version_enviada = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
-        if not id_version_actual or id_version_actual != id_version_enviada:
-            raise ValueError(
-                "La versión actual no coincide con la versión enviada al firmante"
-            )
-        if id_version_solicitud and id_version_solicitud != id_version_actual:
-            raise ValueError("La versión enviada por AppSheet ya no es la versión actual")
-
-        usuario_envio = texto(raiz.get("ENVIADO_FIRMA_POR"))
-        usuario = usuario or usuario_envio
-        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
-            raise ValueError("El usuario que registra la respuesta no es válido")
-        if usuario_envio and usuario_envio.lower() != usuario.lower():
-            raise PermissionError(
-                "Solo el usuario que administra el paquete puede registrar la respuesta externa"
-            )
 
         if accion == "Conforme firma":
             if resultado_actual == "Conforme":
-                return jsonify({"ok": True, "ya_procesado": True, "resultado": "Conforme"})
+                return jsonify(
+                    {
+                        "ok": True,
+                        "ya_procesado": True,
+                        "id_documento": id_documento,
+                        "resultado_firma_externa": "Conforme",
+                    }
+                )
             if resultado_actual != "Pendiente":
                 raise ValueError(
-                    f"Solo un documento Pendiente puede marcarse Conforme. Resultado actual: {resultado_actual!r}"
-                )
-            resultado_nuevo = "Conforme"
-            comentario_evento = "El firmante aprobó el documento y lo dejó pendiente de firma."
-
-        elif accion == "Registrar PDF firmado":
-            if resultado_actual == "Firmado":
-                return jsonify({"ok": True, "ya_procesado": True, "resultado": "Firmado"})
-            if resultado_actual not in {"Pendiente", "Conforme"}:
-                raise ValueError(
-                    "El PDF firmado solo puede registrarse desde Pendiente o Conforme. "
+                    "Solo un documento Pendiente puede registrarse como Conforme. "
                     f"Resultado actual: {resultado_actual!r}"
                 )
-            valor_pdf = valor_pdf or texto(documento.get("PDF_FIRMADO"))
-            if not valor_pdf:
-                raise ValueError("Debe cargar un archivo en PDF_FIRMADO")
-            drive_service = obtener_drive_service()
-            metadata_pdf = buscar_pdf_cargado_appsheet(drive_service, valor_pdf)
-            resultado_nuevo = "Firmado"
-            comentario_evento = (
-                f"Se registró el PDF firmado recibido: {texto(metadata_pdf.get('name'))}."
-            )
+            nuevo_resultado = "Conforme"
+            cambios_extra: dict[str, Any] = {}
         else:
-            raise ValueError(
-                "accion debe ser 'Conforme firma' o 'Registrar PDF firmado'"
-            )
+            if resultado_actual == "Firmado" and texto(documento.get("PDF_FIRMADO")):
+                return jsonify(
+                    {
+                        "ok": True,
+                        "ya_procesado": True,
+                        "id_documento": id_documento,
+                        "resultado_firma_externa": "Firmado",
+                    }
+                )
+            if resultado_actual not in {"Pendiente", "Conforme"}:
+                raise ValueError(
+                    "Solo un documento Pendiente o Conforme puede registrarse como Firmado. "
+                    f"Resultado actual: {resultado_actual!r}"
+                )
+            pdf_firmado = pdf_firmado or texto(documento.get("PDF_FIRMADO"))
+            if not pdf_firmado:
+                raise ValueError("Debe cargar PDF_FIRMADO antes de registrar la firma")
+            if not nombre_archivo_desde_valor_appsheet(pdf_firmado).lower().endswith(".pdf"):
+                raise ValueError("PDF_FIRMADO debe corresponder a un archivo .pdf")
+            nuevo_resultado = "Firmado"
+            cambios_extra = {"PDF_FIRMADO": pdf_firmado, "CARGADO_POR": usuario}
 
         fecha = ahora_iso()
         cambios = {
             "ID_DOCUMENTO": id_documento,
-            "RESULTADO_FIRMA_EXTERNA": resultado_nuevo,
-            "ID_VERSION_RESPUESTA_EXTERNA": id_version_actual,
+            "RESULTADO_FIRMA_EXTERNA": nuevo_resultado,
+            "ID_VERSION_RESPUESTA_EXTERNA": id_version,
             "RESPUESTA_FIRMA_EXTERNA_POR": usuario,
             "FECHA_RESPUESTA_FIRMA_EXTERNA": fecha,
             "ULTIMO_ENVIADO_POR": usuario,
             "FECHA_ULTIMO_ENVIO": fecha,
             "FECHA_ULTIMA_ACTUALIZACION": fecha,
             "ACCION_SOLICITADA": "",
-            "OBSERVACION_ACTUAL": "",
+            **cambios_extra,
         }
-        if resultado_nuevo == "Firmado":
-            cambios["CARGADO_POR"] = usuario
         appsheet_action(TABLA_DOCUMENTOS, "Edit", [cambios])
 
         try:
-            crear_evento_respuesta_firma_externa(
-                documento=documento,
-                id_version=id_version_actual,
-                usuario=usuario,
-                fecha=fecha,
-                resultado=resultado_nuevo,
-                comentario=comentario_evento,
+            appsheet_action(
+                TABLA_EVENTOS,
+                "Add",
+                [
+                    {
+                        "ID_EVENTO": nuevo_id(),
+                        "ID_DOCUMENTO": id_documento,
+                        "ID_VERSION": id_version,
+                        "ID_APROBACION_ACTUAL": "",
+                        "TIPO_EVENTO": "Respuesta de firma externa",
+                        "ESTADO_ANTERIOR": resultado_actual,
+                        "ESTADO_NUEVO": nuevo_resultado,
+                        "USUARIO": usuario,
+                        "FECHA_EVENTO": fecha,
+                        "COMENTARIO": (
+                            "El usuario registró la respuesta externa como "
+                            f"{nuevo_resultado}."
+                        ),
+                    }
+                ],
             )
         except Exception:
             traceback.print_exc()
 
-        estado_paquete = recalcular_estado_paquete_firma(
-            id_raiz=id_raiz,
-            usuario=usuario,
+        estado_paquete = actualizar_estado_paquete_desde_resultados(
+            id_documento_raiz,
             fecha=fecha,
         )
-        return jsonify({
-            "ok": True,
-            "ya_procesado": False,
-            "id_documento": id_documento,
-            "id_documento_raiz": id_raiz,
-            "resultado_firma_externa": resultado_nuevo,
-            "id_version_respuesta_externa": id_version_actual,
-            "estado_paquete_firma": estado_paquete,
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "id_documento_raiz": id_documento_raiz,
+                "resultado_firma_externa": nuevo_resultado,
+                "id_version_respuesta_externa": id_version,
+                "estado_paquete_firma": estado_paquete,
+            }
+        )
 
     except PermissionError as exc:
         if id_documento:
@@ -9192,37 +9490,45 @@ def registrar_respuesta_firma():
         return {"error": str(exc)}, 500
 
 
-def cerrar_documento_firmado_paquete(
+def cerrar_documento_firmado_del_paquete(
     *,
     documento: dict[str, Any],
     usuario: str,
-    fecha: str,
     drive_service: Any,
 ) -> dict[str, Any]:
-    """Archiva un PDF firmado y crea/reutiliza la versión Firmado de un integrante."""
     id_documento = texto(documento.get("ID_DOCUMENTO"))
-    titulo_original = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+    titulo = texto(documento.get("TITULO")) or id_documento
+    resultado = normalizar_resultado_firma_externa(
+        documento.get("RESULTADO_FIRMA_EXTERNA")
+    )
+    if resultado != "Firmado":
+        raise ValueError(f"{titulo}: el resultado externo todavía no es Firmado")
 
-    # Idempotencia para cierres parciales reintentados.
-    if (
-        texto(documento.get("ESTADO")) == "Proceso terminado"
-        and texto(documento.get("PDF_FIRMADO_ID"))
+    if texto(documento.get("ESTADO")) == "Proceso terminado" and texto(
+        documento.get("PDF_FIRMADO_ID")
     ):
         return {
             "id_documento": id_documento,
-            "titulo": titulo_original,
+            "titulo": titulo,
             "ya_procesado": True,
             "id_version_final": texto(documento.get("ID_VERSION_ACTUAL")),
             "pdf_firmado_id": texto(documento.get("PDF_FIRMADO_ID")),
             "pdf_firmado_url": texto(documento.get("PDF_FIRMADO_URL")),
+            "advertencias": [],
         }
 
-    if normalizar_resultado_firma_externa(documento.get("RESULTADO_FIRMA_EXTERNA")) != "Firmado":
-        raise ValueError(f"{titulo_original}: no está marcado como Firmado")
-    id_version_origen = validar_version_respuesta_actual(documento)
-    valor_pdf = texto(documento.get("PDF_FIRMADO"))
-    if not valor_pdf:
-        raise ValueError(f"{titulo_original}: falta PDF_FIRMADO")
+    id_version_origen = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA")) or texto(
+        documento.get("ID_VERSION_ACTUAL")
+    )
+    if not id_version_origen:
+        raise ValueError(f"{titulo}: falta la versión firmada externamente")
+    if texto(documento.get("ID_VERSION_ACTUAL")) != id_version_origen:
+        raise ValueError(
+            f"{titulo}: la versión actual cambió después de recibir la firma"
+        )
+    valor_pdf_firmado = texto(documento.get("PDF_FIRMADO"))
+    if not valor_pdf_firmado:
+        raise ValueError(f"{titulo}: falta PDF_FIRMADO")
 
     version_origen = buscar_version_por_id(id_version_origen)
     numero_version = entero(documento.get("VERSION_ACTUAL"), "VERSION_ACTUAL")
@@ -9230,10 +9536,11 @@ def cerrar_documento_firmado_paquete(
     plantilla = buscar_plantilla(texto(documento.get("ID_PLANTILLA")))
     folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
     if not folder_id:
-        raise ValueError(f"{titulo_original}: la plantilla no tiene CARPETA_DESTINO_ID")
+        raise ValueError(f"{titulo}: la plantilla no tiene CARPETA_DESTINO_ID")
 
-    pdf_subido = buscar_pdf_cargado_appsheet(drive_service, valor_pdf)
-    titulo_archivo = limpiar_nombre_archivo(titulo_original)
+    fecha = ahora_iso()
+    pdf_subido = buscar_pdf_cargado_appsheet(drive_service, valor_pdf_firmado)
+    titulo_archivo = limpiar_nombre_archivo(titulo)
     nombre_final = f"{titulo_archivo}_V{numero_version:02d}_FIRMADO.pdf"
     pdf_final = copiar_pdf_firmado_o_reutilizar(
         drive_service=drive_service,
@@ -9268,7 +9575,6 @@ def cerrar_documento_firmado_paquete(
             fecha=fecha,
         )
 
-    estado_anterior = texto(documento.get("ESTADO")) or "En firma"
     actualizar_documento_proceso_terminado(
         id_documento=id_documento,
         id_version_final=id_version_final,
@@ -9277,55 +9583,61 @@ def cerrar_documento_firmado_paquete(
         fecha=fecha,
     )
 
-    evento_cierre = {
-        "ID_EVENTO": nuevo_id(),
-        "ID_DOCUMENTO": id_documento,
-        "ID_VERSION": id_version_final,
-        "ID_APROBACION_ACTUAL": "",
-        "TIPO_EVENTO": "Proceso terminado",
-        "ESTADO_ANTERIOR": estado_anterior,
-        "ESTADO_NUEVO": "Proceso terminado",
-        "USUARIO": usuario,
-        "FECHA_EVENTO": fecha,
-        "COMENTARIO": (
-            f"Se archivó el PDF firmado definitivo como {pdf_final['name']} y "
-            "se cerró este integrante del paquete de firma."
-        ),
-    }
+    advertencias: list[str] = []
+    evento_cierre: dict[str, Any] | None = None
     try:
-        appsheet_action(TABLA_EVENTOS, "Add", [evento_cierre])
-    except Exception:
-        traceback.print_exc()
-
-    notificaciones: list[dict[str, Any]] = []
-    try:
-        documento_actualizado = buscar_documento(id_documento)
-        cadena = buscar_cadena_documento_version(
+        evento_cierre = crear_eventos_cierre_firma(
             id_documento=id_documento,
-            numero_version=numero_version,
+            id_version=id_version_final,
+            usuario=usuario,
+            fecha=fecha,
+            nombre_origen=texto(pdf_subido.get("name")),
+            nombre_final=pdf_final["name"],
+            comentario="Cierre de paquete de firma simple",
+            estado_anterior=texto(documento.get("ESTADO")) or "En firma externa",
         )
-        notificaciones = ejecutar_notificaciones_cierre_proceso(
-            documento=documento_actualizado,
-            evento=evento_cierre,
-            cadena=cadena,
-        )
-    except Exception:
+    except Exception as exc_evento:
         traceback.print_exc()
+        advertencias.append(f"No se pudieron crear todos los eventos: {exc_evento}")
+
+    if evento_cierre is not None:
+        try:
+            documento_actualizado = buscar_documento(id_documento)
+            cadena = buscar_cadena_documento_version(
+                id_documento=id_documento,
+                numero_version=numero_version,
+            )
+            resultados_notificacion = ejecutar_notificaciones_cierre_proceso(
+                documento=documento_actualizado,
+                evento=evento_cierre,
+                cadena=cadena,
+            )
+            fallidas = [fila for fila in resultados_notificacion if not fila.get("ok")]
+            if fallidas:
+                advertencias.append(
+                    f"{len(fallidas)} notificación(es) internas quedaron con error"
+                )
+        except Exception as exc_notificacion:
+            traceback.print_exc()
+            advertencias.append(
+                f"Falló el proceso de notificaciones internas: {exc_notificacion}"
+            )
 
     return {
         "id_documento": id_documento,
-        "titulo": titulo_original,
+        "titulo": titulo,
         "ya_procesado": False,
         "id_version_final": id_version_final,
         "pdf_firmado_id": pdf_final["id"],
         "pdf_firmado_url": pdf_final["url"],
         "pdf_firmado_nombre": pdf_final["name"],
-        "notificaciones": notificaciones,
+        "advertencias": advertencias,
     }
+
 
 @app.route("/registrar-firma", methods=["POST"])
 def registrar_firma():
-    """Cierra definitivamente el paquete cuando todos sus integrantes están Firmados."""
+    """Cierra definitivamente un paquete cuando todos sus documentos están Firmados."""
     id_documento = ""
     try:
         validar_configuracion()
@@ -9336,127 +9648,121 @@ def registrar_firma():
         if not id_documento:
             return {"error": "Falta id_documento"}, 400
 
-        raiz, miembros = obtener_jerarquia_firma_raw(id_documento)
-        id_raiz = texto(raiz.get("ID_DOCUMENTO"))
-        if id_documento != id_raiz:
+        contexto = obtener_contexto_jerarquia_documental(id_documento)
+        if not contexto.get("solicitado_es_raiz"):
             raise ValueError("Solo la raíz puede cerrar el paquete de firma")
-        if normalizar_tipo_firma(raiz.get("TIPO_FIRMA")) != "Simple":
-            raise ValueError("Este cierre corresponde únicamente a Firma Simple")
-
-        # Cierre ya realizado.
+        id_raiz = contexto["id_documento_raiz"]
+        raiz = contexto["raiz"]
         if texto(raiz.get("ESTADO_PAQUETE_FIRMA")) == "Cerrado":
-            return jsonify({
-                "ok": True,
-                "ya_procesado": True,
-                "id_documento": id_raiz,
-                "estado_paquete_firma": "Cerrado",
-            })
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento_raiz": id_raiz,
+                    "estado_paquete_firma": "Cerrado",
+                }
+            )
 
-        for fila in miembros:
-            validar_miembro_ciclo_firma(fila, id_raiz)
+        validar_membresia_paquete_activo(
+            id_documento_raiz=id_raiz,
+            integrantes_jerarquia=contexto["integrantes"],
+        )
+        activos = buscar_integrantes_paquete_activo(id_raiz)
+        faltantes: list[str] = []
+        for fila in activos:
+            titulo = texto(fila.get("TITULO")) or texto(fila.get("ID_DOCUMENTO"))
             resultado = normalizar_resultado_firma_externa(
                 fila.get("RESULTADO_FIRMA_EXTERNA")
             )
-            ya_cerrado = (
-                texto(fila.get("ESTADO")) == "Proceso terminado"
-                and texto(fila.get("PDF_FIRMADO_ID"))
+            if resultado != "Firmado":
+                faltantes.append(f"{titulo}: resultado {resultado or '<vacío>'}")
+            elif not texto(fila.get("PDF_FIRMADO")) and not texto(fila.get("PDF_FIRMADO_ID")):
+                faltantes.append(f"{titulo}: falta PDF_FIRMADO")
+        if faltantes:
+            raise ValueError(
+                "No se puede cerrar el paquete. " + " | ".join(faltantes)
             )
-            if not ya_cerrado and resultado != "Firmado":
-                raise ValueError(
-                    f"{texto(fila.get('TITULO')) or texto(fila.get('ID_DOCUMENTO'))}: "
-                    f"resultado externo={resultado or '<vacío>'}; todos deben estar Firmados"
-                )
-            if not ya_cerrado and not texto(fila.get("PDF_FIRMADO")):
-                raise ValueError(
-                    f"{texto(fila.get('TITULO')) or texto(fila.get('ID_DOCUMENTO'))}: falta PDF_FIRMADO"
-                )
 
-        usuario_envio = texto(raiz.get("ENVIADO_FIRMA_POR"))
-        usuario = usuario or usuario_envio
+        usuario = usuario or texto(raiz.get("ULTIMO_ENVIADO_POR")) or texto(
+            raiz.get("ENVIADO_FIRMA_POR")
+        )
         if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
             raise ValueError("El usuario que cierra la firma no es válido")
-        if usuario_envio and usuario_envio.lower() != usuario.lower():
-            raise PermissionError(
-                "Solo el usuario que administra el paquete puede cerrar la firma"
+
+        # Procesamos descendientes primero y la raíz al final. En caso de
+        # error parcial, un reintento omite los documentos ya cerrados.
+        orden = sorted(
+            contexto["integrantes"],
+            key=lambda fila: (fila.get("nivel", 0), fila.get("titulo", "")),
+            reverse=True,
+        )
+        drive_service = obtener_drive_service()
+        resultados: list[dict[str, Any]] = []
+        for item in orden:
+            documento_actual = buscar_documento(item["id_documento"])
+            resultados.append(
+                cerrar_documento_firmado_del_paquete(
+                    documento=documento_actual,
+                    usuario=usuario,
+                    drive_service=drive_service,
+                )
             )
 
         fecha = ahora_iso()
         appsheet_action(
             TABLA_DOCUMENTOS,
             "Edit",
-            [{
-                "ID_DOCUMENTO": id_raiz,
-                "ESTADO_FIRMA": "Procesando",
-                "FECHA_ULTIMA_ACTUALIZACION": fecha,
-                "ACCION_SOLICITADA": "",
-            }],
-        )
-
-        drive_service = obtener_drive_service()
-        # Hijos primero y raíz al final para evitar cerrar visualmente el paquete antes de tiempo.
-        ordenados = sorted(
-            miembros,
-            key=lambda x: (bool(x.get("_ES_RAIZ_PAQUETE")), -int(x.get("_NIVEL_PAQUETE", 0))),
-        )
-        resultados_cierre: list[dict[str, Any]] = []
-        for fila in ordenados:
-            # Refrescar la fila permite reintentos después de un cierre parcial.
-            actual = buscar_documento(texto(fila.get("ID_DOCUMENTO")))
-            resultados_cierre.append(
-                cerrar_documento_firmado_paquete(
-                    documento=actual,
-                    usuario=usuario,
-                    fecha=fecha,
-                    drive_service=drive_service,
-                )
-            )
-
-        appsheet_action(
-            TABLA_DOCUMENTOS,
-            "Edit",
-            [{
-                "ID_DOCUMENTO": id_raiz,
-                "ESTADO_PAQUETE_FIRMA": "Cerrado",
-                "ACCION_SOLICITADA": "",
-                "OBSERVACION_ACTUAL": "",
-                "ULTIMO_ENVIADO_POR": usuario,
-                "FECHA_ULTIMO_ENVIO": fecha,
-                "FECHA_ULTIMA_ACTUALIZACION": fecha,
-            }],
+            [
+                {
+                    "ID_DOCUMENTO": id_raiz,
+                    "ESTADO_PAQUETE_FIRMA": "Cerrado",
+                    "ESTADO_FIRMA": "Firmado",
+                    "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": "",
+                }
+            ],
         )
         try:
             appsheet_action(
                 TABLA_EVENTOS,
                 "Add",
-                [{
-                    "ID_EVENTO": nuevo_id(),
-                    "ID_DOCUMENTO": id_raiz,
-                    "ID_VERSION": texto(buscar_documento(id_raiz).get("ID_VERSION_ACTUAL")),
-                    "ID_APROBACION_ACTUAL": "",
-                    "TIPO_EVENTO": "Paquete de firma cerrado",
-                    "ESTADO_ANTERIOR": "Listo para cierre",
-                    "ESTADO_NUEVO": "Cerrado",
-                    "USUARIO": usuario,
-                    "FECHA_EVENTO": fecha,
-                    "COMENTARIO": (
-                        f"Se cerró el paquete de firma con {len(resultados_cierre)} "
-                        "documento(s) firmados y archivados."
-                    ),
-                }],
+                [
+                    {
+                        "ID_EVENTO": nuevo_id(),
+                        "ID_DOCUMENTO": id_raiz,
+                        "ID_VERSION": texto(buscar_documento(id_raiz).get("ID_VERSION_ACTUAL")),
+                        "ID_APROBACION_ACTUAL": "",
+                        "TIPO_EVENTO": "Paquete de firma cerrado",
+                        "ESTADO_ANTERIOR": "Listo para cierre",
+                        "ESTADO_NUEVO": "Cerrado",
+                        "USUARIO": usuario,
+                        "FECHA_EVENTO": fecha,
+                        "COMENTARIO": (
+                            f"Se cerró el paquete con {len(resultados)} documento(s) firmados."
+                        ),
+                    }
+                ],
             )
         except Exception:
             traceback.print_exc()
 
-        return jsonify({
-            "ok": True,
-            "ya_procesado": False,
-            "id_documento": id_raiz,
-            "estado": "Proceso terminado",
-            "estado_firma": "Firmado",
-            "estado_paquete_firma": "Cerrado",
-            "cantidad_documentos": len(resultados_cierre),
-            "documentos": resultados_cierre,
-        })
+        advertencias = [
+            adv
+            for resultado in resultados
+            for adv in (resultado.get("advertencias") or [])
+        ]
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento_raiz": id_raiz,
+                "estado_paquete_firma": "Cerrado",
+                "cantidad_documentos": len(resultados),
+                "documentos": resultados,
+                "advertencias": advertencias,
+            }
+        )
 
     except PermissionError as exc:
         if id_documento:
@@ -9473,7 +9779,6 @@ def registrar_firma():
         return {"error": str(exc)}, 500
 
 
-
 # -----------------------------------------------------------------------------
 # Flujo: observaciones/rechazo después del envío a firma
 # -----------------------------------------------------------------------------
@@ -9484,56 +9789,70 @@ def actualizar_documento_reinicio_firma(
     id_documento: str,
     numero_version: int,
     id_version: str,
+    id_version_observada: str,
     copia: dict[str, str],
     primer_encargado: dict[str, Any],
     usuario: str,
     fecha: str,
-    id_documento_raiz_firma: str = "",
-    id_version_respuesta_externa: str = "",
 ) -> None:
-    """Reinicia solo el documento observado sin destruir el ciclo externo del paquete."""
+    """Reinicia solo el documento observado y conserva su paquete externo activo."""
     appsheet_action(
         TABLA_DOCUMENTOS,
         "Edit",
-        [{
-            "ID_DOCUMENTO": id_documento,
-            "ESTADO": "Borrador",
-            "VERSION_ACTUAL": numero_version,
-            "REVISION_ACTUAL": 0,
-            "ID_VERSION_ACTUAL": id_version,
-            "GOOGLE_DOC_ID": copia["id"],
-            "GOOGLE_DOC_URL": copia["url"],
-            "ORDEN_ACTUAL": primer_encargado["ORDEN"],
-            "ID_APROBACION_ACTUAL": primer_encargado["ID_APROBACION_ACTUAL"],
-            "ENCARGADO_ACTUAL_NOMBRE": primer_encargado.get("NOMBRE", ""),
-            "ENCARGADO_ACTUAL_EMAIL": primer_encargado.get("APROBADOR", ""),
-            "PDF_PARA_FIRMA_ID": "",
-            "PDF_PARA_FIRMA_URL": "",
-            "ESTADO_FIRMA": "Observado",
-            "RESULTADO_FIRMA_EXTERNA": "Observado",
-            "ID_DOCUMENTO_RAIZ_FIRMA": id_documento_raiz_firma,
-            "ID_VERSION_RESPUESTA_EXTERNA": id_version_respuesta_externa,
-            "RESPUESTA_FIRMA_EXTERNA_POR": usuario,
-            "FECHA_RESPUESTA_FIRMA_EXTERNA": fecha,
-            "PDF_FIRMADO": "",
-            "PDF_FIRMADO_ID": "",
-            "PDF_FIRMADO_URL": "",
-            "FECHA_FIRMA_COMPLETA": "",
-            "CARGADO_POR": "",
-            # Se conservan DESTINATARIOS_FIRMA, ENVIADO_FIRMA_POR,
-            # EMAIL_FIRMA_MESSAGE_ID y FECHA_ENVIO_FIRMA: pertenecen al ciclo
-            # externo que sigue activo aunque este documento vuelva a Borrador.
-            "FECHA_CIERRE": "",
-            "ULTIMO_ENVIADO_POR": usuario,
-            "FECHA_ULTIMO_ENVIO": fecha,
-            "FECHA_ULTIMA_ACTUALIZACION": fecha,
-            "OBSERVACION_ACTUAL": "",
-            "ARCHIVO_OBSERVACION_FIRMA_TEMP": "",
-            "ACCION_SOLICITADA": "",
-        }],
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ESTADO": "Borrador",
+                "VERSION_ACTUAL": numero_version,
+                "REVISION_ACTUAL": 0,
+                "ID_VERSION_ACTUAL": id_version,
+                "GOOGLE_DOC_ID": copia["id"],
+                "GOOGLE_DOC_URL": copia["url"],
+                "ORDEN_ACTUAL": primer_encargado["ORDEN"],
+                "ID_APROBACION_ACTUAL": primer_encargado["ID_APROBACION_ACTUAL"],
+                "ENCARGADO_ACTUAL_NOMBRE": primer_encargado.get("NOMBRE", ""),
+                "ENCARGADO_ACTUAL_EMAIL": primer_encargado.get("APROBADOR", ""),
+                "PDF_PARA_FIRMA_ID": "",
+                "PDF_PARA_FIRMA_URL": "",
+                "ESTADO_FIRMA": "Observado",
+                "RESULTADO_FIRMA_EXTERNA": "Observado",
+                "ID_VERSION_RESPUESTA_EXTERNA": id_version_observada,
+                "RESPUESTA_FIRMA_EXTERNA_POR": usuario,
+                "FECHA_RESPUESTA_FIRMA_EXTERNA": fecha,
+                "PDF_FIRMADO": "",
+                "PDF_FIRMADO_ID": "",
+                "PDF_FIRMADO_URL": "",
+                "FECHA_FIRMA_COMPLETA": "",
+                "CARGADO_POR": "",
+                "ARCHIVO_OBSERVACION_FIRMA_TEMP": "",
+                "FECHA_CIERRE": "",
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
     )
 
 
+def marcar_paquete_con_observaciones(
+    id_documento_raiz: str,
+    *,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento_raiz,
+                "ESTADO_PAQUETE_FIRMA": "Con observaciones",
+                "ESTADO_FIRMA": "Observado",
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+            }
+        ],
+    )
 
 def crear_eventos_reinicio_firma(
     *,
@@ -9547,6 +9866,7 @@ def crear_eventos_reinicio_firma(
     numero_version_nueva: int,
     nombre_archivo: str,
     nombre_archivo_observacion: str = "",
+    estado_anterior: str = "En firma",
 ) -> tuple[list[str], dict[str, Any] | None]:
     """Crea la bitácora del reinicio y devuelve el evento principal."""
     advertencias: list[str] = []
@@ -9556,7 +9876,7 @@ def crear_eventos_reinicio_firma(
         "ID_VERSION": id_version_observada,
         "ID_APROBACION_ACTUAL": "",
         "TIPO_EVENTO": "Proceso reiniciado",
-        "ESTADO_ANTERIOR": "En firma",
+        "ESTADO_ANTERIOR": estado_anterior,
         "ESTADO_NUEVO": "Borrador",
         "USUARIO": usuario,
         "FECHA_EVENTO": fecha,
@@ -9603,131 +9923,216 @@ def crear_eventos_reinicio_firma(
         return advertencias, None
 
 
-
-
-
-
 @app.route("/rechazar-firma", methods=["POST"])
 def rechazar_firma():
-    """Registra una observación y reinicia únicamente la cadena del documento rechazado."""
     id_documento = ""
+
     try:
         validar_configuracion()
         validar_token()
+
         data = request.get_json(silent=True) or {}
         id_documento = texto(data.get("id_documento"))
-        id_raiz_solicitud = texto(data.get("id_documento_raiz"))
         id_version_solicitud = texto(data.get("id_version_firma"))
+        id_documento_raiz_solicitud = texto(data.get("id_documento_raiz"))
         usuario = texto(data.get("usuario"))
         comentario = texto(data.get("comentario"))
-        archivo_observacion_firma = texto(data.get("archivo_observacion_firma"))
-
-        if not id_documento or not id_raiz_solicitud:
-            return {"error": "Faltan id_documento o id_documento_raiz"}, 400
-        if not comentario:
-            return {"error": "El comentario es obligatorio para rechazar la firma"}, 400
-
-        raiz, miembros = obtener_jerarquia_firma_raw(id_raiz_solicitud)
-        id_raiz = texto(raiz.get("ID_DOCUMENTO"))
-        if id_raiz != id_raiz_solicitud:
-            raise ValueError("id_documento_raiz no corresponde a una raíz documental")
-        validar_ciclo_firma_activo(id_raiz=id_raiz, miembros=miembros)
-        documento = next(
-            (x for x in miembros if texto(x.get("ID_DOCUMENTO")) == id_documento),
-            None,
+        archivo_observacion_firma = texto(
+            data.get("archivo_observacion_firma")
         )
-        if documento is None:
-            raise ValueError("El documento observado no pertenece al paquete")
 
-        resultado_actual = normalizar_resultado_firma_externa(
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+        if not comentario:
+            return {
+                "error": (
+                    "El comentario es obligatorio para reiniciar el proceso "
+                    "por observaciones durante la firma"
+                )
+            }, 400
+
+        documento = buscar_documento(id_documento)
+        id_documento_raiz = texto(documento.get("ID_DOCUMENTO_RAIZ_FIRMA"))
+        if not id_documento_raiz:
+            raise ValueError("El documento no pertenece a un paquete de firma activo")
+        if id_documento_raiz_solicitud and id_documento_raiz_solicitud != id_documento_raiz:
+            raise ValueError("id_documento_raiz no coincide con el paquete activo del documento")
+        raiz_paquete = buscar_documento(id_documento_raiz)
+        if texto(raiz_paquete.get("ESTADO_PAQUETE_FIRMA")) not in ESTADOS_PAQUETE_FIRMA_ACTIVOS:
+            raise ValueError("El paquete de firma ya no está activo")
+        id_version_documento = texto(documento.get("ID_VERSION_ACTUAL"))
+        id_version_origen = id_version_solicitud or id_version_documento
+        if not id_version_origen:
+            raise ValueError("No se pudo identificar la versión enviada a firma")
+
+        version_origen = buscar_version_por_id(id_version_origen)
+        numero_version_anterior = entero(
+            version_origen.get("NUMERO_VERSION"),
+            "NUMERO_VERSION",
+        )
+        estado_version_origen = texto(
+            version_origen.get("ESTADO_VERSION")
+        )
+        etapa_origen = texto(version_origen.get("ETAPA"))
+
+        numero_version_documento = entero(
+            documento.get("VERSION_ACTUAL"),
+            "VERSION_ACTUAL",
+        )
+        estado_documento = texto(documento.get("ESTADO"))
+
+        # Reintento del mismo webhook después de una transición ya terminada.
+        # También intenta completar notificaciones pendientes o con error.
+        if (
+            estado_version_origen == "Observada"
+            and numero_version_documento > numero_version_anterior
+            and estado_documento in {"Borrador", "En revisión"}
+        ):
+            # Si AppSheet reintenta el webhook con un archivo que no alcanzó a
+            # quedar registrado, completamos solamente el respaldo histórico.
+            if archivo_observacion_firma:
+                ruta_validada, nombre_validado = validar_archivo_observacion_firma(
+                    archivo_observacion_firma
+                )
+                ruta_guardada = texto(
+                    version_origen.get("ARCHIVO_OBSERVACION_FIRMA")
+                )
+                if ruta_validada and ruta_guardada != ruta_validada:
+                    marcar_version_observada_firma(
+                        id_version=id_version_origen,
+                        fecha=ahora_iso(),
+                        usuario=usuario or texto(raiz_paquete.get("ENVIADO_FIRMA_POR")),
+                        comentario=comentario,
+                        archivo_observacion_firma=ruta_validada,
+                    )
+                    version_origen["ARCHIVO_OBSERVACION_FIRMA"] = ruta_validada
+                    version_origen[
+                        "NOMBRE_ARCHIVO_OBSERVACION_FIRMA"
+                    ] = nombre_validado
+
+            notificaciones_reintento: list[dict[str, Any]] = []
+            advertencias_reintento: list[str] = []
+            try:
+                documento = buscar_documento(id_documento)
+                (
+                    notificaciones_reintento,
+                    advertencias_reintento,
+                ) = reanudar_notificaciones_reinicio_firma(
+                    documento=documento,
+                    id_version_observada=id_version_origen,
+                    datos_solicitud=data,
+                )
+            except Exception as exc_notificacion:
+                traceback.print_exc()
+                advertencias_reintento.append(
+                    "El reinicio ya estaba procesado, pero no se pudieron "
+                    "reanudar sus notificaciones: "
+                    f"{exc_notificacion}"
+                )
+
+            try:
+                marcar_paquete_con_observaciones(
+                    id_documento_raiz,
+                    fecha=ahora_iso(),
+                )
+            except Exception:
+                traceback.print_exc()
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "estado": texto(documento.get("ESTADO")),
+                    "estado_firma": texto(
+                        documento.get("ESTADO_FIRMA")
+                    ),
+                    "numero_version": entero(
+                        documento.get("VERSION_ACTUAL"),
+                        "VERSION_ACTUAL",
+                    ),
+                    "numero_revision": entero(
+                        documento.get("REVISION_ACTUAL") or 0,
+                        "REVISION_ACTUAL",
+                    ),
+                    "id_version": texto(
+                        documento.get("ID_VERSION_ACTUAL")
+                    ),
+                    "google_doc_id": texto(
+                        documento.get("GOOGLE_DOC_ID")
+                    ),
+                    "google_doc_url": normalizar_url_appsheet(
+                        documento.get("GOOGLE_DOC_URL")
+                    ),
+                    "archivo_observacion_firma": texto(
+                        version_origen.get("ARCHIVO_OBSERVACION_FIRMA")
+                    ),
+                    "nombre_archivo_observacion_firma": texto(
+                        version_origen.get(
+                            "NOMBRE_ARCHIVO_OBSERVACION_FIRMA"
+                        )
+                    ),
+                    "notificaciones": notificaciones_reintento,
+                    "advertencias": advertencias_reintento,
+                }
+            )
+
+        resultado_firma_externa = normalizar_resultado_firma_externa(
             documento.get("RESULTADO_FIRMA_EXTERNA")
         )
-        id_version_enviada = texto(documento.get("ID_VERSION_RESPUESTA_EXTERNA"))
-        id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
-
-        # Reintento idempotente después de que ya se creó la nueva versión.
-        if resultado_actual == "Observado" and id_version_enviada:
-            try:
-                version_enviada = buscar_version_por_id(id_version_enviada)
-                if texto(version_enviada.get("ESTADO_VERSION")) == "Observada":
-                    if archivo_observacion_firma:
-                        ruta_validada, _ = validar_archivo_observacion_firma(
-                            archivo_observacion_firma
-                        )
-                        if ruta_validada and texto(version_enviada.get("ARCHIVO_OBSERVACION_FIRMA")) != ruta_validada:
-                            marcar_version_observada_firma(
-                                id_version=id_version_enviada,
-                                fecha=ahora_iso(),
-                                usuario=usuario or texto(raiz.get("ENVIADO_FIRMA_POR")),
-                                comentario=comentario,
-                                archivo_observacion_firma=ruta_validada,
-                            )
-                    actualizar_estado_paquete_firma_raiz(
-                        id_raiz=id_raiz,
-                        estado_paquete="Con observaciones",
-                        usuario=usuario,
-                    )
-                    return jsonify({
-                        "ok": True,
-                        "ya_procesado": True,
-                        "id_documento": id_documento,
-                        "id_documento_raiz": id_raiz,
-                        "resultado_firma_externa": "Observado",
-                        "estado": texto(documento.get("ESTADO")),
-                        "estado_paquete_firma": "Con observaciones",
-                    })
-            except LookupError:
-                pass
-
-        if resultado_actual != "Pendiente":
+        if resultado_firma_externa != "Pendiente":
             raise ValueError(
-                f"Solo un documento Pendiente puede rechazarse. Resultado actual: {resultado_actual!r}"
+                "Solo puede rechazarse un documento con respuesta externa Pendiente. "
+                f"Resultado actual: {resultado_firma_externa!r}"
             )
-        if not id_version_enviada or id_version_enviada != id_version_actual:
+        if id_version_documento != id_version_origen:
             raise ValueError(
-                "La versión actual no coincide con la versión que recibió el firmante"
+                "La versión enviada por AppSheet ya no coincide con la versión "
+                "actual del documento"
             )
-        if id_version_solicitud and id_version_solicitud != id_version_enviada:
-            raise ValueError("La versión enviada por AppSheet no coincide con la versión externa")
+        if etapa_origen != "Para firma":
+            raise ValueError(
+                "La versión que se intenta observar no corresponde a la etapa "
+                f"Para firma. Etapa encontrada: {etapa_origen!r}"
+            )
 
-        usuario_envio = texto(raiz.get("ENVIADO_FIRMA_POR"))
+        usuario_envio = texto(raiz_paquete.get("ENVIADO_FIRMA_POR"))
         usuario = usuario or usuario_envio
         if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
-            raise ValueError("El usuario que registra el rechazo no es válido")
+            raise ValueError("El usuario que reinicia la aprobación no es válido")
         if usuario_envio and usuario_envio.lower() != usuario.lower():
             raise PermissionError(
-                "Solo el usuario que administra el paquete puede registrar observaciones"
+                "Solo el usuario que administra el paquete de firma puede "
+                "reiniciar la aprobación"
             )
 
-        version_origen = buscar_version_por_id(id_version_enviada)
-        if texto(version_origen.get("ID_DOCUMENTO")) != id_documento:
-            raise ValueError("La versión enviada no pertenece al documento observado")
-        if texto(version_origen.get("ETAPA")) != "Para firma":
-            raise ValueError(
-                "La versión observada no corresponde a la etapa Para firma"
-            )
-        numero_version_anterior = entero(
-            version_origen.get("NUMERO_VERSION"), "NUMERO_VERSION"
-        )
-        google_doc_id_origen = texto(version_origen.get("GOOGLE_DOC_ID")) or texto(
-            documento.get("GOOGLE_DOC_ID")
-        )
+        google_doc_id_origen = texto(
+            version_origen.get("GOOGLE_DOC_ID")
+        ) or texto(documento.get("GOOGLE_DOC_ID"))
         if not google_doc_id_origen:
-            raise ValueError("La versión Para firma no tiene GOOGLE_DOC_ID")
+            raise ValueError(
+                "La versión Para firma no tiene GOOGLE_DOC_ID para crear "
+                "el nuevo borrador"
+            )
 
         cadena_anterior = buscar_cadena_documento_version(
             id_documento=id_documento,
             numero_version=numero_version_anterior,
         )
         if not cadena_anterior:
-            raise ValueError("No se encontró la cadena de aprobación de la versión enviada")
+            raise ValueError(
+                "No se encontró la cadena de aprobación de la versión enviada "
+                "a firma"
+            )
 
-        plantilla = buscar_plantilla(texto(documento.get("ID_PLANTILLA")))
+        id_plantilla = texto(documento.get("ID_PLANTILLA"))
+        plantilla = buscar_plantilla(id_plantilla)
         folder_id = texto(plantilla.get("CARPETA_DESTINO_ID"))
         if not folder_id:
             raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
 
         numero_version_nueva = numero_version_anterior + 1
+        numero_revision_nueva = 0
         titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
         nombre_archivo = limpiar_nombre_archivo(
             f"{titulo}_V{numero_version_nueva:02d}_BORRADOR"
@@ -9738,17 +10143,25 @@ def rechazar_firma():
         version_existente = buscar_version_numero_revision(
             id_documento=id_documento,
             numero_version=numero_version_nueva,
-            numero_revision=0,
+            numero_revision=numero_revision_nueva,
         )
+
         if version_existente:
             id_version_nueva = texto(version_existente.get("ID_VERSION"))
             copia = {
                 "id": texto(version_existente.get("GOOGLE_DOC_ID")),
-                "url": normalizar_url_appsheet(version_existente.get("GOOGLE_DOC_URL")),
-                "name": texto(version_existente.get("NOMBRE_ARCHIVO")) or nombre_archivo,
+                "url": normalizar_url_appsheet(
+                    version_existente.get("GOOGLE_DOC_URL")
+                ),
+                "name": (
+                    texto(version_existente.get("NOMBRE_ARCHIVO"))
+                    or nombre_archivo
+                ),
             }
             if not copia["id"]:
-                raise RuntimeError("La nueva versión existente no tiene GOOGLE_DOC_ID")
+                raise RuntimeError(
+                    "La nueva versión existente no tiene GOOGLE_DOC_ID"
+                )
         else:
             id_version_nueva = nuevo_id()
             copia = copiar_archivo_o_reutilizar(
@@ -9758,6 +10171,8 @@ def rechazar_firma():
                 nombre_archivo=nombre_archivo,
             )
 
+        # La versión Para firma queda congelada. El nuevo borrador comienza
+        # nuevamente con edición exclusiva para el primer responsable.
         for fila in cadena_anterior:
             email = texto(fila.get("APROBADOR"))
             if email:
@@ -9772,6 +10187,7 @@ def rechazar_firma():
         email_primero = texto(primer_anterior.get("APROBADOR"))
         if not email_primero:
             raise ValueError("El primer responsable no tiene correo")
+
         permission_id_primero = asegurar_permiso_rol(
             drive_service=drive_service,
             file_id=copia["id"],
@@ -9783,13 +10199,19 @@ def rechazar_firma():
             id_documento=id_documento,
             numero_version=numero_version_nueva,
         )
+
         if cadena_nueva_existente:
             primeros = [
-                fila for fila in cadena_nueva_existente
-                if entero(fila.get("ORDEN"), "ORDEN") == entero(primer_anterior.get("ORDEN"), "ORDEN")
+                fila
+                for fila in cadena_nueva_existente
+                if entero(fila.get("ORDEN"), "ORDEN")
+                == entero(primer_anterior.get("ORDEN"), "ORDEN")
             ]
             if len(primeros) != 1:
-                raise RuntimeError("La cadena nueva no tiene un único primer responsable")
+                raise RuntimeError(
+                    "La cadena nueva existente no tiene un único primer "
+                    "responsable"
+                )
             primer_nuevo = primeros[0]
             actualizar_destino_cadena_reutilizada(
                 destino=primer_nuevo,
@@ -9802,7 +10224,7 @@ def rechazar_firma():
             filas_nuevas, primer_nuevo = construir_cadena_nueva_por_rechazo(
                 cadena_anterior=cadena_anterior,
                 id_documento=id_documento,
-                id_plantilla=texto(documento.get("ID_PLANTILLA")),
+                id_plantilla=id_plantilla,
                 numero_version_anterior=numero_version_anterior,
                 numero_version_nueva=numero_version_nueva,
                 indice_destino=0,
@@ -9810,29 +10232,41 @@ def rechazar_firma():
                 permission_id_destino=permission_id_primero,
                 fecha=fecha,
             )
-            appsheet_action(TABLA_APROBADORES_ACTUAL, "Add", filas_nuevas)
+            appsheet_action(
+                TABLA_APROBADORES_ACTUAL,
+                "Add",
+                filas_nuevas,
+            )
 
         if not version_existente:
             crear_registro_version_por_aprobacion(
                 id_version=id_version_nueva,
                 id_documento=id_documento,
-                id_version_origen=id_version_enviada,
+                id_version_origen=id_version_origen,
                 numero_version=numero_version_nueva,
                 numero_revision=0,
                 etapa="Borrador",
                 nombre_archivo=copia["name"],
                 google_doc_id=copia["id"],
                 google_doc_url=copia["url"],
-                id_aprobacion_responsable=primer_nuevo["ID_APROBACION_ACTUAL"],
-                orden_responsable=entero(primer_nuevo.get("ORDEN"), "ORDEN"),
+                id_aprobacion_responsable=primer_nuevo[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                orden_responsable=entero(
+                    primer_nuevo.get("ORDEN"),
+                    "ORDEN",
+                ),
                 motivo_creacion="Reinicio por observaciones de firma",
                 comentario=comentario,
                 creado_por=usuario,
                 fecha_creacion=fecha,
             )
 
-        archivo_guardado, nombre_archivo_observacion = marcar_version_observada_firma(
-            id_version=id_version_enviada,
+        (
+            archivo_observacion_guardado,
+            nombre_archivo_observacion,
+        ) = marcar_version_observada_firma(
+            id_version=id_version_origen,
             fecha=fecha,
             usuario=usuario,
             comentario=comentario,
@@ -9843,31 +10277,31 @@ def rechazar_firma():
             id_documento=id_documento,
             numero_version=numero_version_nueva,
             id_version=id_version_nueva,
+            id_version_observada=id_version_origen,
             copia=copia,
             primer_encargado=primer_nuevo,
             usuario=usuario,
             fecha=fecha,
-            id_documento_raiz_firma=id_raiz,
-            id_version_respuesta_externa=id_version_enviada,
         )
-        actualizar_estado_paquete_firma_raiz(
-            id_raiz=id_raiz,
-            estado_paquete="Con observaciones",
-            usuario=usuario,
+        marcar_paquete_con_observaciones(
+            id_documento_raiz,
             fecha=fecha,
         )
 
         advertencias, evento_reinicio = crear_eventos_reinicio_firma(
             id_documento=id_documento,
-            id_version_observada=id_version_enviada,
+            id_version_observada=id_version_origen,
             id_version_nueva=id_version_nueva,
-            id_aprobacion_nueva=primer_nuevo["ID_APROBACION_ACTUAL"],
+            id_aprobacion_nueva=primer_nuevo[
+                "ID_APROBACION_ACTUAL"
+            ],
             usuario=usuario,
             fecha=fecha,
             comentario=comentario,
             numero_version_nueva=numero_version_nueva,
             nombre_archivo=copia["name"],
             nombre_archivo_observacion=nombre_archivo_observacion,
+            estado_anterior=estado_documento or "En firma externa",
         )
 
         notificaciones: list[dict[str, Any]] = []
@@ -9882,7 +10316,8 @@ def rechazar_firma():
                     texto(documento_actualizado.get("ID_APROBACION_ACTUAL"))
                 )
                 aprobador_confirma = buscar_integrante_cadena_por_usuario(
-                    cadena_nueva, usuario
+                    cadena_nueva,
+                    usuario,
                 )
                 notificaciones = ejecutar_notificaciones_reinicio_firma(
                     documento=documento_actualizado,
@@ -9891,49 +10326,67 @@ def rechazar_firma():
                     aprobador_destino=aprobador_destino,
                     aprobador_confirma=aprobador_confirma,
                 )
+                fallidas = [
+                    resultado
+                    for resultado in notificaciones
+                    if not resultado.get("ok")
+                ]
+                if fallidas:
+                    advertencias.append(
+                        f"{len(fallidas)} notificación(es) quedaron omitidas "
+                        "o con error. Revisa Documento_Notificaciones."
+                    )
             except Exception as exc_notificacion:
                 traceback.print_exc()
                 advertencias.append(
-                    f"El reinicio terminó, pero falló una notificación interna: {exc_notificacion}"
+                    "El proceso se reinició correctamente, pero falló el "
+                    f"envío de notificaciones internas: {exc_notificacion}"
                 )
 
-        return jsonify({
-            "ok": True,
-            "ya_procesado": False,
-            "id_documento": id_documento,
-            "id_documento_raiz": id_raiz,
-            "resultado_firma_externa": "Observado",
-            "estado_paquete_firma": "Con observaciones",
-            "estado": "Borrador",
-            "estado_firma": "Observado",
-            "numero_version": numero_version_nueva,
-            "numero_revision": 0,
-            "id_version": id_version_nueva,
-            "id_version_observada": id_version_enviada,
-            "google_doc_id": copia["id"],
-            "google_doc_url": copia["url"],
-            "archivo_observacion_firma": archivo_guardado,
-            "nombre_archivo_observacion_firma": nombre_archivo_observacion,
-            "encargado_actual": primer_nuevo.get("NOMBRE", ""),
-            "encargado_email": email_primero,
-            "notificaciones": notificaciones,
-            "advertencias": advertencias,
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "id_documento_raiz": id_documento_raiz,
+                "estado_paquete_firma": "Con observaciones",
+                "resultado_firma_externa": "Observado",
+                "estado": "Borrador",
+                "estado_firma": "Observado",
+                "numero_version": numero_version_nueva,
+                "numero_revision": 0,
+                "id_version": id_version_nueva,
+                "google_doc_id": copia["id"],
+                "google_doc_url": copia["url"],
+                "nombre_archivo": copia["name"],
+                "archivo_observacion_firma": archivo_observacion_guardado,
+                "nombre_archivo_observacion_firma": nombre_archivo_observacion,
+                "orden_actual": primer_nuevo["ORDEN"],
+                "id_aprobacion_actual": primer_nuevo[
+                    "ID_APROBACION_ACTUAL"
+                ],
+                "encargado_actual": primer_nuevo.get("NOMBRE", ""),
+                "encargado_email": email_primero,
+                "notificaciones": notificaciones,
+                "advertencias": advertencias,
+            }
+        )
 
     except PermissionError as exc:
         if id_documento:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 403
+
     except (ValueError, LookupError) as exc:
         if id_documento:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 400
+
     except Exception as exc:
         traceback.print_exc()
         if id_documento:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 500
-
 
 
 if __name__ == "__main__":
