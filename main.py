@@ -1,4 +1,4 @@
-from __future__ import annotations
+
 
 import base64
 import html
@@ -896,6 +896,51 @@ def construir_jerarquia_desde_raiz(
 
     recorrer(id_raiz, 0)
     return resultado
+
+
+ESTADO_LISTO_FIRMA = "Listo para firma"
+ESTADO_LISTO_REVISION_EXTERNA = "Listo para revisión externa"
+ESTADOS_APROBACION_INTERNA_COMPLETA = {
+    ESTADO_LISTO_FIRMA,
+    ESTADO_LISTO_REVISION_EXTERNA,
+}
+
+
+def obtener_tipo_firma_efectivo_documento(id_documento: str) -> str:
+    """
+    Devuelve el TIPO_FIRMA que gobierna al documento. En una jerarquía,
+    siempre manda el TIPO_FIRMA de la raíz del paquete.
+    """
+    documentos = buscar_todos_documentos()
+    indice = construir_indice_documentos(documentos)
+    raiz, _ = obtener_documento_raiz_desde_indice(id_documento, indice)
+    return normalizar_tipo_firma(raiz.get("TIPO_FIRMA"))
+
+
+def configuracion_salida_aprobacion(tipo_firma: str) -> dict[str, str]:
+    """Define la salida de la aprobación interna según el tipo de firma."""
+    tipo = normalizar_tipo_firma(tipo_firma)
+    if tipo == "Notarial":
+        return {
+            "tipo_firma": "Notarial",
+            "estado_documento": ESTADO_LISTO_REVISION_EXTERNA,
+            "etapa_version": "Para revisión externa",
+            "sufijo_archivo": "PARA_REVISION_EXTERNA",
+            "motivo_creacion": "Preparación para revisión externa",
+            "tipo_evento_preparado": "Preparado para revisión externa",
+            "movimiento_responsable": "Documento listo para gestionar revisión externa",
+            "movimiento_informativo": "Documento listo para revisión externa",
+        }
+    return {
+        "tipo_firma": "Simple",
+        "estado_documento": ESTADO_LISTO_FIRMA,
+        "etapa_version": "Para firma",
+        "sufijo_archivo": "PARA_FIRMA",
+        "motivo_creacion": "Preparación para firma",
+        "tipo_evento_preparado": "Preparado para firma",
+        "movimiento_responsable": "Documento listo para gestionar firma",
+        "movimiento_informativo": "Documento listo para firma",
+    }
 
 
 ROL_RESPONSABLE_FIRMAS = "responsable de firmas"
@@ -2445,11 +2490,11 @@ def actualizar_aprobadores_aprobacion_intermedia(
     )
 
 
-def cerrar_cadena_para_firma(
+def cerrar_cadena_para_gestion_externa(
     cadena_actual: list[dict[str, Any]],
     aprobacion_actual: dict[str, Any],
     responsable_firmas: dict[str, Any],
-    id_version_para_firma: str,
+    id_version_salida_externa: str,
     comentario: str,
     fecha: str,
 ) -> None:
@@ -2482,7 +2527,7 @@ def cerrar_cadena_para_firma(
                     "ESTADO": ESTADO_GESTION_FIRMA,
                     "RESULTADO": "",
                     "COMENTARIO": "",
-                    "ID_VERSION_TRABAJADA": id_version_para_firma,
+                    "ID_VERSION_TRABAJADA": id_version_salida_externa,
                     "FECHA_INICIO": fecha,
                     "FECHA_RESPUESTA": "",
                 }
@@ -2532,7 +2577,7 @@ def actualizar_documento_aprobacion_intermedia(
     )
 
 
-def actualizar_documento_listo_para_firma(
+def actualizar_documento_listo_salida_externa(
     *,
     id_documento: str,
     numero_version: int,
@@ -2541,38 +2586,50 @@ def actualizar_documento_listo_para_firma(
     copia: dict[str, str],
     pdf: dict[str, str],
     responsable_firmas: dict[str, Any],
+    tipo_firma: str,
     usuario: str,
     fecha: str,
 ) -> None:
-    appsheet_action(
-        TABLA_DOCUMENTOS,
-        "Edit",
-        [
+    config = configuracion_salida_aprobacion(tipo_firma)
+    cambios: dict[str, Any] = {
+        "ID_DOCUMENTO": id_documento,
+        "ESTADO": config["estado_documento"],
+        "VERSION_ACTUAL": numero_version,
+        "REVISION_ACTUAL": numero_revision,
+        "ID_VERSION_ACTUAL": id_version,
+        "GOOGLE_DOC_ID": copia["id"],
+        "GOOGLE_DOC_URL": copia["url"],
+        "ORDEN_ACTUAL": responsable_firmas["ORDEN"],
+        "ID_APROBACION_ACTUAL": responsable_firmas["ID_APROBACION_ACTUAL"],
+        "ENCARGADO_ACTUAL_NOMBRE": responsable_firmas.get("NOMBRE", ""),
+        "ENCARGADO_ACTUAL_EMAIL": responsable_firmas.get("APROBADOR", ""),
+        "ULTIMO_ENVIADO_POR": usuario,
+        "FECHA_ULTIMO_ENVIO": fecha,
+        "FECHA_ULTIMA_ACTUALIZACION": fecha,
+        "OBSERVACION_ACTUAL": "",
+        "ACCION_SOLICITADA": "",
+    }
+
+    if config["tipo_firma"] == "Simple":
+        cambios.update(
             {
-                "ID_DOCUMENTO": id_documento,
-                "ESTADO": "Listo para firma",
-                "VERSION_ACTUAL": numero_version,
-                "REVISION_ACTUAL": numero_revision,
-                "ID_VERSION_ACTUAL": id_version,
-                "GOOGLE_DOC_ID": copia["id"],
-                "GOOGLE_DOC_URL": copia["url"],
-                "ORDEN_ACTUAL": responsable_firmas["ORDEN"],
-                "ID_APROBACION_ACTUAL": responsable_firmas[
-                    "ID_APROBACION_ACTUAL"
-                ],
-                "ENCARGADO_ACTUAL_NOMBRE": responsable_firmas.get("NOMBRE", ""),
-                "ENCARGADO_ACTUAL_EMAIL": responsable_firmas.get("APROBADOR", ""),
                 "PDF_PARA_FIRMA_ID": pdf["id"],
                 "PDF_PARA_FIRMA_URL": pdf["url"],
                 "ESTADO_FIRMA": "No iniciado",
-                "ULTIMO_ENVIADO_POR": usuario,
-                "FECHA_ULTIMO_ENVIO": fecha,
-                "FECHA_ULTIMA_ACTUALIZACION": fecha,
-                "OBSERVACION_ACTUAL": "",
-                "ACCION_SOLICITADA": "",
             }
-        ],
-    )
+        )
+    else:
+        # En la ruta Notarial el PDF se conserva en Documento_Versiones.
+        # PDF_PARA_FIRMA pertenece al flujo Simple y no debe representar
+        # la revisión externa notarial.
+        cambios.update(
+            {
+                "PDF_PARA_FIRMA_ID": "",
+                "PDF_PARA_FIRMA_URL": "",
+            }
+        )
+
+    appsheet_action(TABLA_DOCUMENTOS, "Edit", [cambios])
 
 
 def crear_evento_revision_aprobada(
@@ -2585,9 +2642,10 @@ def crear_evento_revision_aprobada(
     comentario: str,
     orden_actual: int,
     orden_siguiente: int | None,
+    estado_final: str | None = None,
 ) -> dict[str, Any]:
     if orden_siguiente is None:
-        estado_nuevo = "Listo para firma"
+        estado_nuevo = estado_final or ESTADO_LISTO_FIRMA
         detalle = (
             f"El responsable de orden {orden_actual} aprobó la revisión final."
         )
@@ -2627,7 +2685,9 @@ def crear_evento_preparado_firma(
     fecha: str,
     nombre_archivo: str,
     nombre_pdf: str,
+    tipo_firma: str = "Simple",
 ) -> None:
+    config = configuracion_salida_aprobacion(tipo_firma)
     appsheet_action(
         TABLA_EVENTOS,
         "Add",
@@ -2637,9 +2697,9 @@ def crear_evento_preparado_firma(
                 "ID_DOCUMENTO": id_documento,
                 "ID_VERSION": id_version,
                 "ID_APROBACION_ACTUAL": id_aprobacion_actual,
-                "TIPO_EVENTO": "Preparado para firma",
+                "TIPO_EVENTO": config["tipo_evento_preparado"],
                 "ESTADO_ANTERIOR": "En revisión",
-                "ESTADO_NUEVO": "Listo para firma",
+                "ESTADO_NUEVO": config["estado_documento"],
                 "USUARIO": usuario,
                 "FECHA_EVENTO": fecha,
                 "COMENTARIO": (
@@ -2672,7 +2732,7 @@ def aprobar_revision():
         documento = buscar_documento(id_documento)
         estado_documento = texto(documento.get("ESTADO"))
 
-        if estado_documento == "Listo para firma":
+        if estado_documento in ESTADOS_APROBACION_INTERNA_COMPLETA:
             notificaciones_reintento: list[dict[str, Any]] = []
             advertencias_reintento: list[str] = []
             try:
@@ -2687,7 +2747,7 @@ def aprobar_revision():
             except Exception as exc_notificacion:
                 traceback.print_exc()
                 advertencias_reintento.append(
-                    "El documento ya estaba Listo para firma, pero no se "
+                    f"El documento ya estaba {estado_documento}, pero no se "
                     "pudieron reanudar sus notificaciones: "
                     f"{exc_notificacion}"
                 )
@@ -3053,19 +3113,25 @@ def aprobar_revision():
                 }
             )
 
-        # Último aprobador: la aprobación interna termina, pero el documento
-        # conserva un responsable operativo durante toda la gestión de firma.
+        # Último aprobador: la aprobación interna termina. El TIPO_FIRMA
+        # efectivo lo gobierna la raíz de la jerarquía, no el hijo aislado.
+        tipo_firma_efectivo = obtener_tipo_firma_efectivo_documento(id_documento)
+        config_salida = configuracion_salida_aprobacion(tipo_firma_efectivo)
+        estado_salida = config_salida["estado_documento"]
+
+        # El Responsable de firmas queda como responsable operativo tanto para
+        # Firma Simple como para la futura gestión de revisión externa Notarial.
         responsable_firmas = obtener_responsable_firmas_cadena(
             cadena_actual,
             contexto=f"Documento {id_documento} versión {numero_version}",
         )
 
-        # Último aprobador: prepara el Google Docs y el PDF para firma.
+        sufijo_salida = config_salida["sufijo_archivo"]
         nombre_archivo = limpiar_nombre_archivo(
-            f"{titulo}_V{numero_version:02d}_PARA_FIRMA"
+            f"{titulo}_V{numero_version:02d}_{sufijo_salida}"
         )
         nombre_pdf = limpiar_nombre_archivo(
-            f"{titulo}_V{numero_version:02d}_PARA_FIRMA.pdf"
+            f"{titulo}_V{numero_version:02d}_{sufijo_salida}.pdf"
         )
 
         version_existente = buscar_version_numero_revision(
@@ -3133,7 +3199,7 @@ def aprobar_revision():
                 id_version_origen=id_version_actual,
                 numero_version=numero_version,
                 numero_revision=numero_revision_nueva,
-                etapa="Para firma",
+                etapa=config_salida["etapa_version"],
                 nombre_archivo=copia["name"],
                 google_doc_id=copia["id"],
                 google_doc_url=copia["url"],
@@ -3146,7 +3212,7 @@ def aprobar_revision():
                     responsable_firmas.get("ORDEN"),
                     "ORDEN",
                 ),
-                motivo_creacion="Preparación para firma",
+                motivo_creacion=config_salida["motivo_creacion"],
                 comentario=comentario,
                 creado_por=usuario,
                 fecha_creacion=fecha,
@@ -3158,16 +3224,16 @@ def aprobar_revision():
             fecha_cierre=fecha,
         )
 
-        cerrar_cadena_para_firma(
+        cerrar_cadena_para_gestion_externa(
             cadena_actual=cadena_actual,
             aprobacion_actual=aprobacion_actual,
             responsable_firmas=responsable_firmas,
-            id_version_para_firma=id_version_nueva,
+            id_version_salida_externa=id_version_nueva,
             comentario=comentario,
             fecha=fecha,
         )
 
-        actualizar_documento_listo_para_firma(
+        actualizar_documento_listo_salida_externa(
             id_documento=id_documento,
             numero_version=numero_version,
             numero_revision=numero_revision_nueva,
@@ -3175,6 +3241,7 @@ def aprobar_revision():
             copia=copia,
             pdf=pdf,
             responsable_firmas=responsable_firmas,
+            tipo_firma=tipo_firma_efectivo,
             usuario=usuario,
             fecha=fecha,
         )
@@ -3193,6 +3260,7 @@ def aprobar_revision():
                 comentario=comentario,
                 orden_actual=orden_actual,
                 orden_siguiente=None,
+                estado_final=estado_salida,
             )
         except Exception as exc_evento:
             traceback.print_exc()
@@ -3212,12 +3280,13 @@ def aprobar_revision():
                 fecha=fecha,
                 nombre_archivo=copia["name"],
                 nombre_pdf=pdf["name"],
+                tipo_firma=tipo_firma_efectivo,
             )
         except Exception as exc_evento_firma:
             traceback.print_exc()
             advertencias.append(
-                "El documento quedó Listo para firma, pero no se pudo crear "
-                "el evento técnico Preparado para firma: "
+                f"El documento quedó {estado_salida}, pero no se pudo crear "
+                f"el evento técnico {config_salida['tipo_evento_preparado']}: "
                 f"{exc_evento_firma}"
             )
 
@@ -3259,7 +3328,9 @@ def aprobar_revision():
                 "ya_procesado": False,
                 "ultimo_aprobador": True,
                 "id_documento": id_documento,
-                "estado": "Listo para firma",
+                "estado": estado_salida,
+                "tipo_firma_paquete": tipo_firma_efectivo,
+                "etapa_version": config_salida["etapa_version"],
                 "numero_version": numero_version,
                 "numero_revision": numero_revision_nueva,
                 "id_version": id_version_nueva,
@@ -7011,6 +7082,21 @@ def construir_especificaciones_aprobacion_revision(
     )
 
     especificaciones: list[dict[str, Any]] = []
+    estado_documento = texto(documento.get("ESTADO"))
+    es_salida_notarial = (
+        ultimo_aprobador
+        and estado_documento == ESTADO_LISTO_REVISION_EXTERNA
+    )
+    movimiento_final_responsable = (
+        "Documento listo para gestionar revisión externa"
+        if es_salida_notarial
+        else "Documento listo para gestionar firma"
+    )
+    movimiento_final_informativo = (
+        "Documento listo para revisión externa"
+        if es_salida_notarial
+        else "Documento listo para firma"
+    )
 
     if aprobador_actual is not None:
         especificaciones.append(
@@ -7018,7 +7104,7 @@ def construir_especificaciones_aprobacion_revision(
                 "aprobador": aprobador_actual,
                 "tipo_notificacion": "Acción requerida",
                 "movimiento": (
-                    "Documento listo para gestionar firma"
+                    movimiento_final_responsable
                     if ultimo_aprobador
                     else "Documento asignado para continuar la revisión"
                 ),
@@ -7059,7 +7145,7 @@ def construir_especificaciones_aprobacion_revision(
                 "aprobador": integrante,
                 "tipo_notificacion": "Informativa",
                 "movimiento": (
-                    "Documento listo para firma"
+                    movimiento_final_informativo
                     if ultimo_aprobador
                     else "El documento avanzó al siguiente responsable"
                 ),
@@ -7109,7 +7195,8 @@ def reanudar_notificaciones_aprobacion_revision(
         documento.get("VERSION_ACTUAL"),
         "VERSION_ACTUAL",
     )
-    ultimo_aprobador = texto(documento.get("ESTADO")) == "Listo para firma"
+    estado_documento = texto(documento.get("ESTADO"))
+    ultimo_aprobador = estado_documento in ESTADOS_APROBACION_INTERNA_COMPLETA
 
     cadena = buscar_cadena_documento_version(
         id_documento=id_documento,
@@ -7132,7 +7219,7 @@ def reanudar_notificaciones_aprobacion_revision(
     aprobador_actual = buscar_aprobacion_actual(id_aprobacion_actual)
     if ultimo_aprobador and not es_responsable_firmas(aprobador_actual):
         advertencias.append(
-            "El documento está Listo para firma, pero su encargado actual no es "
+            f"El documento está {estado_documento}, pero su encargado actual no es "
             "Responsable de firmas."
         )
         return [], advertencias
@@ -7216,6 +7303,7 @@ def reanudar_notificaciones_aprobacion_revision(
             ),
             orden_actual=orden_aprueba,
             orden_siguiente=orden_siguiente,
+            estado_final=(estado_documento if ultimo_aprobador else None),
         )
         advertencias.append(
             "El evento de aprobación faltaba y fue reconstruido antes de "
