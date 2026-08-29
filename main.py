@@ -168,6 +168,11 @@ TABLA_REVISIONES_EXTERNAS = os.environ.get(
     "Documento_Revisiones_Externas",
 )
 
+TABLA_REVISION_EXTERNA_DETALLE = os.environ.get(
+    "TABLA_REVISION_EXTERNA_DETALLE",
+    "Documento_Revision_Externa_Detalle",
+)
+
 APPSHEET_DOCUMENT_VIEW_URL = os.environ.get(
     "APPSHEET_DOCUMENT_VIEW_URL",
     "",
@@ -9071,6 +9076,853 @@ def enviar_firma():
             "correo_enviado": correo_enviado,
             "message_id": message_id,
         }, 500
+
+# -----------------------------------------------------------------------------
+# Flujo Notarial - primer envío a revisión externa
+# -----------------------------------------------------------------------------
+
+
+def buscar_revisiones_externas_raiz(id_documento_raiz: str) -> list[dict[str, Any]]:
+    selector = (
+        f"FILTER({TABLA_REVISIONES_EXTERNAS}, "
+        f"[ID_DOCUMENTO_RAIZ] = {literal_appsheet(id_documento_raiz)})"
+    )
+    filas = appsheet_find(TABLA_REVISIONES_EXTERNAS, selector)
+    filas.sort(
+        key=lambda fila: entero(
+            fila.get("NUMERO_REVISION_EXTERNA") or 0,
+            "NUMERO_REVISION_EXTERNA",
+        )
+    )
+    return filas
+
+
+def buscar_detalles_revision_externa(id_revision_externa: str) -> list[dict[str, Any]]:
+    selector = (
+        f"FILTER({TABLA_REVISION_EXTERNA_DETALLE}, "
+        f"[ID_REVISION_EXTERNA] = {literal_appsheet(id_revision_externa)})"
+    )
+    return appsheet_find(TABLA_REVISION_EXTERNA_DETALLE, selector)
+
+
+def validar_paquete_para_revision_externa_notarial(
+    *,
+    contexto: dict[str, Any],
+    permitir_reanudacion_post_gmail: bool = False,
+) -> list[dict[str, Any]]:
+    """Valida raíz + descendientes y devuelve su versión exacta para envío."""
+    if contexto.get("tipo_firma_paquete") != "Notarial":
+        raise ValueError("El paquete no corresponde a Firma Notarial")
+
+    preparados: list[dict[str, Any]] = []
+    errores: list[str] = []
+
+    for item in contexto.get("integrantes") or []:
+        documento = item.get("documento") or {}
+        id_documento = texto(documento.get("ID_DOCUMENTO"))
+        titulo = texto(documento.get("TITULO")) or id_documento
+        motivos: list[str] = []
+
+        estado_documento = texto(documento.get("ESTADO"))
+        estados_admitidos = {ESTADO_LISTO_REVISION_EXTERNA}
+        if permitir_reanudacion_post_gmail:
+            estados_admitidos.add("En revisión externa")
+        if estado_documento not in estados_admitidos:
+            motivos.append(
+                f"ESTADO={estado_documento!r}; se requiere "
+                + " o ".join(repr(valor) for valor in sorted(estados_admitidos))
+            )
+
+        if estado_documento == "En revisión externa":
+            raiz_notarial_fila = texto(documento.get("ID_DOCUMENTO_RAIZ_NOTARIAL"))
+            resultado_externo = texto(documento.get("RESULTADO_REVISION_EXTERNA"))
+            id_version_externa = texto(documento.get("ID_VERSION_REVISION_EXTERNA"))
+            id_raiz = texto(contexto.get("id_documento_raiz"))
+            if raiz_notarial_fila and raiz_notarial_fila != id_raiz:
+                motivos.append("ID_DOCUMENTO_RAIZ_NOTARIAL apunta a otra raíz")
+            if resultado_externo and resultado_externo != "Pendiente":
+                motivos.append(
+                    f"RESULTADO_REVISION_EXTERNA={resultado_externo!r}; "
+                    "se esperaba 'Pendiente' durante la reanudación"
+                )
+            if id_version_externa and id_version_externa != texto(documento.get("ID_VERSION_ACTUAL")):
+                motivos.append(
+                    "ID_VERSION_REVISION_EXTERNA no coincide con ID_VERSION_ACTUAL"
+                )
+
+        responsable_ok, motivo_responsable = validar_responsable_firmas_actual(
+            documento
+        )
+        if not responsable_ok:
+            motivos.append(motivo_responsable)
+
+        id_version = texto(documento.get("ID_VERSION_ACTUAL"))
+        version: dict[str, Any] = {}
+        if not id_version:
+            motivos.append("falta ID_VERSION_ACTUAL")
+        else:
+            try:
+                version = buscar_version_por_id(id_version)
+            except Exception as exc:
+                motivos.append(f"no se pudo resolver ID_VERSION_ACTUAL: {exc}")
+
+        if version:
+            if texto(version.get("ID_DOCUMENTO")) != id_documento:
+                motivos.append("ID_VERSION_ACTUAL pertenece a otro documento")
+            if texto(version.get("ETAPA")) != "Para revisión externa":
+                motivos.append(
+                    "la versión vigente no está en ETAPA='Para revisión externa'"
+                )
+            if texto(version.get("ESTADO_VERSION")) != "Activa":
+                motivos.append(
+                    f"ESTADO_VERSION={texto(version.get('ESTADO_VERSION'))!r}; "
+                    "se requiere 'Activa'"
+                )
+            if not texto(version.get("GOOGLE_DOC_ID")):
+                motivos.append("la versión no tiene GOOGLE_DOC_ID")
+            if not texto(version.get("PDF_VERSION_ID")):
+                motivos.append("la versión no tiene PDF_VERSION_ID")
+
+        if motivos:
+            errores.append(f"{titulo}: " + "; ".join(motivos))
+            continue
+
+        preparados.append(
+            {
+                **item,
+                "documento": documento,
+                "version": version,
+                "id_version": id_version,
+                "titulo": titulo,
+            }
+        )
+
+    if errores:
+        raise ValueError(
+            "El paquete no está listo para revisión externa: " + " | ".join(errores)
+        )
+    if not preparados:
+        raise ValueError("El paquete notarial no contiene documentos")
+
+    return preparados
+
+
+@medir_operacion("notarial.construir_adjuntos_revision_externa")
+def construir_adjuntos_revision_externa_notarial(
+    *,
+    drive_service: Any,
+    integrantes_preparados: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Adjunta PDF + DOCX de la versión exacta Para revisión externa."""
+    adjuntos: list[dict[str, Any]] = []
+    resumen: list[dict[str, Any]] = []
+
+    for item in integrantes_preparados:
+        documento = item["documento"]
+        version = item["version"]
+        titulo = item["titulo"]
+        pdf_id = texto(version.get("PDF_VERSION_ID"))
+        google_doc_id = texto(version.get("GOOGLE_DOC_ID"))
+        nombre_base = (
+            texto(version.get("NOMBRE_ARCHIVO"))
+            or f"{titulo}_PARA_REVISION_EXTERNA"
+        )
+
+        pdf_bytes, pdf_nombre = descargar_pdf_drive(
+            drive_service=drive_service,
+            file_id=pdf_id,
+        )
+        docx_bytes, docx_nombre = exportar_docx_drive(
+            drive_service=drive_service,
+            google_doc_id=google_doc_id,
+            nombre_base=nombre_base,
+        )
+
+        adjuntos.extend(
+            [
+                {
+                    "contenido": pdf_bytes,
+                    "nombre": pdf_nombre,
+                    "maintype": "application",
+                    "subtype": "pdf",
+                },
+                {
+                    "contenido": docx_bytes,
+                    "nombre": docx_nombre,
+                    "maintype": "application",
+                    "subtype": (
+                        "vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
+                    ),
+                },
+            ]
+        )
+        resumen.append(
+            {
+                "id_documento": texto(documento.get("ID_DOCUMENTO")),
+                "titulo": titulo,
+                "id_version": item["id_version"],
+                "numero_version": texto(documento.get("VERSION_ACTUAL")),
+                "numero_revision": texto(documento.get("REVISION_ACTUAL")),
+                "nivel": item.get("nivel", 0),
+                "es_raiz": bool(item.get("es_raiz")),
+                "archivos": [pdf_nombre, docx_nombre],
+            }
+        )
+
+    return adjuntos, resumen
+
+
+def construir_email_revision_externa_notarial(
+    *,
+    raiz: dict[str, Any],
+    usuario: str,
+    mensaje_adicional: str,
+    fecha_envio: str,
+    documentos: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    titulo_raiz = texto(raiz.get("TITULO")) or texto(raiz.get("ID_DOCUMENTO"))
+    proyecto = texto(raiz.get("ID_PROYECTO"))
+    tipo_documento = texto(raiz.get("TIPO_DOCUMENTO"))
+    cantidad = len(documentos)
+
+    asunto = f"Revisión externa de paquete documental - {titulo_raiz}"
+
+    lineas = []
+    for indice, item in enumerate(documentos, start=1):
+        detalle = item["titulo"]
+        if item.get("numero_version"):
+            detalle += f" — V{item['numero_version']}"
+            if item.get("numero_revision"):
+                detalle += f" / Rev. {item['numero_revision']}"
+        lineas.append(f"{indice}. {detalle}")
+
+    bloques = [
+        "REVISIÓN EXTERNA DE PAQUETE DOCUMENTAL",
+        "",
+        "Estimado/a:",
+        "",
+        (
+            f"Se envía el paquete documental asociado a \"{titulo_raiz}\" "
+            "para revisión externa."
+        ),
+        "",
+        "DOCUMENTOS INCLUIDOS",
+        *lineas,
+        "",
+        "ACCIÓN REQUERIDA",
+        (
+            "Por favor revise los documentos adjuntos y responda este mismo correo "
+            "indicando, para cada documento, si queda Aprobado u Observado."
+        ),
+        (
+            "Cuando existan observaciones, incorpore el comentario correspondiente "
+            "y el respaldo que estime necesario."
+        ),
+    ]
+    if mensaje_adicional:
+        bloques.extend(["", "INDICACIONES ADICIONALES", mensaje_adicional])
+    bloques.extend(
+        [
+            "",
+            f"Enviado por: {usuario}",
+            f"Fecha de envío: {fecha_envio}",
+            "",
+            f"Correo generado automáticamente por {NOMBRE_APLICACION}.",
+        ]
+    )
+    cuerpo_texto = "\n".join(bloques)
+
+    def esc(valor: Any) -> str:
+        return html.escape(texto(valor))
+
+    filas_html = []
+    for indice, item in enumerate(documentos, start=1):
+        detalle_version = ""
+        if item.get("numero_version"):
+            detalle_version = f"V{esc(item['numero_version'])}"
+            if item.get("numero_revision"):
+                detalle_version += f" / Rev. {esc(item['numero_revision'])}"
+        filas_html.append(
+            "<tr>"
+            f"<td style='padding:10px 12px;border-top:1px solid #e5e7eb;width:34px;"
+            f"color:#4338ca;font-weight:700;vertical-align:top;'>{indice}.</td>"
+            "<td style='padding:10px 12px;border-top:1px solid #e5e7eb;"
+            "color:#111827;font-size:14px;line-height:1.45;'>"
+            f"<strong>{esc(item['titulo'])}</strong>"
+            + (
+                f"<br><span style='color:#6b7280;font-size:12px;'>{detalle_version}</span>"
+                if detalle_version
+                else ""
+            )
+            + "</td></tr>"
+        )
+
+    resumen = [
+        ("Documento principal", titulo_raiz),
+        ("Proyecto", proyecto),
+        ("Tipo de documento", tipo_documento),
+        ("Enviado por", usuario),
+        ("Fecha de envío", fecha_envio),
+    ]
+    resumen_html = "".join(
+        "<tr>"
+        f"<td style='padding:9px 12px;border-top:1px solid #e5e7eb;"
+        f"color:#6b7280;width:34%;font-size:13px;'>{esc(clave)}</td>"
+        f"<td style='padding:9px 12px;border-top:1px solid #e5e7eb;"
+        f"color:#111827;font-size:13px;font-weight:600;'>{esc(valor)}</td>"
+        "</tr>"
+        for clave, valor in resumen
+        if texto(valor)
+    )
+
+    bloque_adicional = ""
+    if mensaje_adicional:
+        bloque_adicional = (
+            "<div style='margin-top:18px;padding:14px 16px;background:#fff7ed;"
+            "border:1px solid #fed7aa;border-radius:8px;'>"
+            "<div style='font-size:12px;font-weight:700;color:#9a3412;"
+            "text-transform:uppercase;margin-bottom:6px;'>Indicaciones adicionales</div>"
+            f"<div style='font-size:14px;line-height:1.6;color:#7c2d12;'>"
+            f"{esc(mensaje_adicional).replace(chr(10), '<br>')}</div></div>"
+        )
+
+    cuerpo_html = f"""
+    <!doctype html>
+    <html lang="es">
+      <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;color:#111827;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;background:#f3f4f6;">
+          <tr><td align="center" style="padding:24px 12px;">
+            <table role="presentation" width="680" cellspacing="0" cellpadding="0"
+                   style="width:100%;max-width:680px;background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+              <tr><td style="padding:24px 28px;background:#111827;color:#ffffff;">
+                <div style="font-size:13px;color:#d1d5db;">{esc(NOMBRE_APLICACION)}</div>
+                <div style="margin-top:5px;font-size:24px;font-weight:700;">Revisión externa de paquete documental</div>
+                <div style="margin-top:8px;font-size:14px;color:#d1d5db;line-height:1.5;">Primer envío de revisión externa</div>
+              </td></tr>
+              <tr><td style="padding:28px;">
+                <p style="margin:0;font-size:15px;line-height:1.65;">Estimado/a:</p>
+                <p style="margin:14px 0 0 0;font-size:15px;line-height:1.65;color:#374151;">
+                  Se envía el paquete documental asociado a <strong>{esc(titulo_raiz)}</strong> para revisión externa.
+                </p>
+
+                <div style="margin-top:22px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+                  <div style="padding:11px 14px;background:#f9fafb;font-weight:700;font-size:14px;">Resumen del paquete</div>
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">{resumen_html}</table>
+                </div>
+
+                <div style="margin-top:22px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+                  <div style="padding:12px 16px;background:#eef2ff;color:#3730a3;font-size:14px;font-weight:700;">
+                    Documentos incluidos ({cantidad})
+                  </div>
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;">
+                    {''.join(filas_html)}
+                  </table>
+                </div>
+
+                <div style="margin-top:18px;padding:14px 16px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;color:#3730a3;font-size:13px;line-height:1.65;">
+                  <strong>Acción requerida</strong><br>
+                  Revise los documentos adjuntos y responda este mismo correo indicando, para cada documento, si queda <strong>Aprobado</strong> u <strong>Observado</strong>.<br>
+                  Si existen observaciones, incorpore el comentario correspondiente y el respaldo que estime necesario.
+                </div>
+
+                {bloque_adicional}
+
+                <p style="margin:24px 0 0 0;font-size:14px;line-height:1.6;color:#374151;">
+                  Puede responder directamente a este correo. La respuesta será registrada por el Responsable de firmas en el sistema.
+                </p>
+              </td></tr>
+              <tr><td style="padding:15px 28px;background:#f9fafb;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px;line-height:1.5;">
+                Correo generado automáticamente por <strong>{esc(NOMBRE_APLICACION)}</strong>.
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </body>
+    </html>
+    """
+
+    return asunto, cuerpo_texto, cuerpo_html
+
+
+def marcar_correo_revision_externa_enviado(
+    *,
+    id_documento_raiz: str,
+    usuario: str,
+    destinatarios: list[str],
+    mensaje_adicional: str,
+    message_id: str,
+    thread_id: str,
+    fecha: str,
+) -> None:
+    """Marca Gmail inmediatamente para poder reanudar sin reenviar el correo."""
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento_raiz,
+                "DESTINATARIOS_REVISION_EXTERNA": ", ".join(destinatarios),
+                "MENSAJE_ADICIONAL_REVISION_EXTERNA": mensaje_adicional,
+                "ENVIADO_REVISION_EXTERNA_POR": usuario,
+                "FECHA_ENVIO_REVISION_EXTERNA": fecha,
+                "EMAIL_REVISION_EXTERNA_MESSAGE_ID": message_id,
+                "GMAIL_THREAD_ID_REVISION_EXTERNA": thread_id,
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+            }
+        ],
+    )
+
+
+def obtener_o_crear_revision_externa_cabecera(
+    *,
+    id_documento_raiz: str,
+    usuario: str,
+    destinatarios: list[str],
+    fecha: str,
+    message_id: str,
+    thread_id: str,
+    mensaje_enviado: str,
+) -> tuple[str, int, bool]:
+    revisiones = buscar_revisiones_externas_raiz(id_documento_raiz)
+    for revision in revisiones:
+        if texto(revision.get("GMAIL_MESSAGE_ID")) == message_id:
+            return (
+                texto(revision.get("ID_REVISION_EXTERNA")),
+                entero(
+                    revision.get("NUMERO_REVISION_EXTERNA") or 1,
+                    "NUMERO_REVISION_EXTERNA",
+                ),
+                False,
+            )
+
+    numero = 1
+    if revisiones:
+        numero = max(
+            entero(
+                fila.get("NUMERO_REVISION_EXTERNA") or 0,
+                "NUMERO_REVISION_EXTERNA",
+            )
+            for fila in revisiones
+        ) + 1
+
+    id_revision = nuevo_id()
+    appsheet_action(
+        TABLA_REVISIONES_EXTERNAS,
+        "Add",
+        [
+            {
+                "ID_REVISION_EXTERNA": id_revision,
+                "ID_DOCUMENTO_RAIZ": id_documento_raiz,
+                "NUMERO_REVISION_EXTERNA": numero,
+                "ESTADO_REVISION": "Pendiente",
+                "DESTINATARIOS": ", ".join(destinatarios),
+                "FECHA_ENVIO": fecha,
+                "ENVIADO_POR": usuario,
+                "FECHA_RESPUESTA": "",
+                "REGISTRADO_POR": "",
+                "COMENTARIO_RESPUESTA": "",
+                "ARCHIVO_RESPALDO_RESPUESTA": "",
+                "NOMBRE_ARCHIVO_RESPALDO": "",
+                "GMAIL_MESSAGE_ID": message_id,
+                "MENSAJE_ENVIADO": mensaje_enviado,
+                "GMAIL_THREAD_ID": thread_id,
+            }
+        ],
+    )
+    return id_revision, numero, True
+
+
+def crear_detalles_revision_externa_faltantes(
+    *,
+    id_revision_externa: str,
+    integrantes_preparados: list[dict[str, Any]],
+) -> int:
+    existentes = buscar_detalles_revision_externa(id_revision_externa)
+    ids_existentes = {
+        texto(fila.get("ID_DOCUMENTO"))
+        for fila in existentes
+        if texto(fila.get("ID_DOCUMENTO"))
+    }
+
+    nuevas: list[dict[str, Any]] = []
+    for item in integrantes_preparados:
+        documento = item["documento"]
+        id_documento = texto(documento.get("ID_DOCUMENTO"))
+        if id_documento in ids_existentes:
+            continue
+        nuevas.append(
+            {
+                "ID_REVISION_EXTERNA_DETALLE": nuevo_id(),
+                "ID_REVISION_EXTERNA": id_revision_externa,
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION_ENVIADA": item["id_version"],
+                "RESULTADO": "Pendiente",
+                "COMENTARIO": "",
+                "FECHA_RESPUESTA": "",
+                "REGISTRADO_POR": "",
+            }
+        )
+
+    if nuevas:
+        appsheet_action(TABLA_REVISION_EXTERNA_DETALLE, "Add", nuevas)
+    return len(nuevas)
+
+
+def actualizar_documentos_tras_envio_revision_externa(
+    *,
+    id_documento_raiz: str,
+    integrantes_preparados: list[dict[str, Any]],
+    usuario: str,
+    destinatarios: list[str],
+    mensaje_adicional: str,
+    message_id: str,
+    thread_id: str,
+    fecha: str,
+) -> None:
+    filas: list[dict[str, Any]] = []
+    for item in integrantes_preparados:
+        documento = item["documento"]
+        id_documento = texto(documento.get("ID_DOCUMENTO"))
+        cambios: dict[str, Any] = {
+            "ID_DOCUMENTO": id_documento,
+            "ESTADO": "En revisión externa",
+            "ID_DOCUMENTO_RAIZ_NOTARIAL": id_documento_raiz,
+            "RESULTADO_REVISION_EXTERNA": "Pendiente",
+            "ID_VERSION_REVISION_EXTERNA": item["id_version"],
+            "RESPUESTA_REVISION_EXTERNA_POR": "",
+            "FECHA_RESPUESTA_REVISION_EXTERNA": "",
+            "FECHA_ULTIMA_ACTUALIZACION": fecha,
+            "OBSERVACION_ACTUAL": "",
+        }
+
+        if id_documento == id_documento_raiz:
+            cambios.update(
+                {
+                    "ESTADO_PAQUETE_NOTARIAL": "En revisión externa",
+                    "DESTINATARIOS_REVISION_EXTERNA": ", ".join(destinatarios),
+                    "MENSAJE_ADICIONAL_REVISION_EXTERNA": mensaje_adicional,
+                    "ENVIADO_REVISION_EXTERNA_POR": usuario,
+                    "FECHA_ENVIO_REVISION_EXTERNA": fecha,
+                    "EMAIL_REVISION_EXTERNA_MESSAGE_ID": message_id,
+                    "GMAIL_THREAD_ID_REVISION_EXTERNA": thread_id,
+                    "ULTIMO_ENVIADO_POR": usuario,
+                    "FECHA_ULTIMO_ENVIO": fecha,
+                    "ACCION_SOLICITADA": "",
+                }
+            )
+        filas.append(cambios)
+
+    appsheet_action(TABLA_DOCUMENTOS, "Edit", filas)
+
+
+def crear_eventos_envio_revision_externa(
+    *,
+    integrantes_preparados: list[dict[str, Any]],
+    id_revision_externa: str,
+    numero_revision_externa: int,
+    usuario: str,
+    destinatarios: list[str],
+    fecha: str,
+) -> None:
+    filas = []
+    for item in integrantes_preparados:
+        documento = item["documento"]
+        filas.append(
+            {
+                "ID_EVENTO": nuevo_id(),
+                "ID_DOCUMENTO": texto(documento.get("ID_DOCUMENTO")),
+                "ID_VERSION": item["id_version"],
+                "ID_APROBACION_ACTUAL": texto(
+                    documento.get("ID_APROBACION_ACTUAL")
+                ),
+                "TIPO_EVENTO": "Envío a revisión externa",
+                "ESTADO_ANTERIOR": ESTADO_LISTO_REVISION_EXTERNA,
+                "ESTADO_NUEVO": "En revisión externa",
+                "USUARIO": usuario,
+                "FECHA_EVENTO": fecha,
+                "COMENTARIO": (
+                    f"Revisión externa N° {numero_revision_externa}. "
+                    f"Destinatarios: {', '.join(destinatarios)}. "
+                    f"ID revisión externa: {id_revision_externa}."
+                ),
+            }
+        )
+    if filas:
+        appsheet_action(TABLA_EVENTOS, "Add", filas)
+
+
+def registrar_error_envio_revision_externa(
+    id_documento: str,
+    mensaje: str,
+) -> None:
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": mensaje[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+@app.route("/enviar-revision-externa", methods=["POST"])
+def enviar_revision_externa():
+    """Primer envío del paquete Notarial al revisor externo."""
+    id_documento = ""
+    correo_enviado = False
+    message_id = ""
+    thread_id = ""
+
+    try:
+        validar_configuracion()
+        validar_token()
+        data = request.get_json(silent=True) or {}
+        id_documento = texto(data.get("id_documento"))
+        usuario = texto(data.get("usuario"))
+        destinatarios_entrada = data.get("destinatarios")
+        mensaje_adicional = texto(data.get("mensaje_adicional"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+
+        contexto = obtener_contexto_jerarquia_documental(id_documento)
+        if not contexto.get("solicitado_es_raiz"):
+            raise ValueError(
+                "Solo la raíz puede iniciar la revisión externa. "
+                f"Raíz: {contexto.get('id_documento_raiz')}"
+            )
+        if contexto.get("tipo_firma_paquete") != "Notarial":
+            raise ValueError(
+                "Este endpoint corresponde a Firma Notarial; el paquete no es Notarial"
+            )
+
+        raiz = contexto["raiz"]
+        id_raiz = contexto["id_documento_raiz"]
+        estado_paquete = texto(raiz.get("ESTADO_PAQUETE_NOTARIAL")) or "No iniciado"
+        id_raiz_notarial = texto(raiz.get("ID_DOCUMENTO_RAIZ_NOTARIAL"))
+        message_id_existente = texto(raiz.get("EMAIL_REVISION_EXTERNA_MESSAGE_ID"))
+        thread_id_existente = texto(raiz.get("GMAIL_THREAD_ID_REVISION_EXTERNA"))
+
+        if (
+            estado_paquete == "En revisión externa"
+            and id_raiz_notarial == id_raiz
+            and message_id_existente
+        ):
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento_raiz": id_raiz,
+                    "estado_paquete_notarial": estado_paquete,
+                    "message_id": message_id_existente,
+                    "thread_id": thread_id_existente,
+                    "fecha_envio_revision_externa": texto(
+                        raiz.get("FECHA_ENVIO_REVISION_EXTERNA")
+                    ),
+                }
+            )
+
+        reanudando_post_gmail = bool(message_id_existente)
+        estados_permitidos = {"", "No iniciado"}
+        if reanudando_post_gmail:
+            estados_permitidos.add("En revisión externa")
+        if estado_paquete not in estados_permitidos:
+            raise ValueError(
+                f"ESTADO_PAQUETE_NOTARIAL={estado_paquete!r} no permite el primer envío"
+            )
+        if id_raiz_notarial and not (
+            reanudando_post_gmail and id_raiz_notarial == id_raiz
+        ):
+            raise ValueError(
+                "El paquete ya tiene ID_DOCUMENTO_RAIZ_NOTARIAL; "
+                "el reenvío se implementará en la siguiente fase"
+            )
+
+        preparados = validar_paquete_para_revision_externa_notarial(
+            contexto=contexto,
+            permitir_reanudacion_post_gmail=reanudando_post_gmail,
+        )
+
+        usuario_guardado = texto(raiz.get("ENVIADO_REVISION_EXTERNA_POR"))
+        usuario = usuario or usuario_guardado
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("El usuario que envía a revisión externa no es válido")
+
+        if destinatarios_entrada in (None, ""):
+            destinatarios_entrada = raiz.get("DESTINATARIOS_REVISION_EXTERNA")
+        destinatarios = normalizar_destinatarios(destinatarios_entrada)
+        if not destinatarios:
+            raise ValueError("No se indicaron destinatarios para la revisión externa")
+
+        if not mensaje_adicional:
+            mensaje_adicional = texto(
+                raiz.get("MENSAJE_ADICIONAL_REVISION_EXTERNA")
+            )
+
+        fecha_envio = (
+            texto(raiz.get("FECHA_ENVIO_REVISION_EXTERNA"))
+            if message_id_existente
+            else ahora_iso()
+        ) or ahora_iso()
+
+        resumen_documentos = [
+            {
+                "id_documento": texto(item["documento"].get("ID_DOCUMENTO")),
+                "titulo": item["titulo"],
+                "id_version": item["id_version"],
+                "numero_version": texto(item["documento"].get("VERSION_ACTUAL")),
+                "numero_revision": texto(item["documento"].get("REVISION_ACTUAL")),
+                "nivel": item.get("nivel", 0),
+                "es_raiz": bool(item.get("es_raiz")),
+            }
+            for item in preparados
+        ]
+        asunto, cuerpo_texto, cuerpo_html = construir_email_revision_externa_notarial(
+            raiz=raiz,
+            usuario=usuario,
+            mensaje_adicional=mensaje_adicional,
+            fecha_envio=fecha_envio,
+            documentos=resumen_documentos,
+        )
+
+        cantidad_adjuntos = 0
+
+        if reanudando_post_gmail:
+            correo_enviado = True
+            message_id = message_id_existente
+            thread_id = thread_id_existente
+        else:
+            drive_service = obtener_drive_service()
+            gmail_service = obtener_gmail_service()
+            adjuntos, resumen_documentos = construir_adjuntos_revision_externa_notarial(
+                drive_service=drive_service,
+                integrantes_preparados=preparados,
+            )
+            cantidad_adjuntos = len(adjuntos)
+            asunto, cuerpo_texto, cuerpo_html = construir_email_revision_externa_notarial(
+                raiz=raiz,
+                usuario=usuario,
+                mensaje_adicional=mensaje_adicional,
+                fecha_envio=fecha_envio,
+                documentos=resumen_documentos,
+            )
+            respuesta_gmail = enviar_email_con_adjuntos(
+                gmail_service=gmail_service,
+                destinatarios=destinatarios,
+                asunto=asunto,
+                cuerpo=cuerpo_texto,
+                adjuntos=adjuntos,
+                reply_to=usuario,
+                cuerpo_html=cuerpo_html,
+            )
+            correo_enviado = True
+            message_id = respuesta_gmail["message_id"]
+            thread_id = respuesta_gmail["thread_id"]
+
+            marcar_correo_revision_externa_enviado(
+                id_documento_raiz=id_raiz,
+                usuario=usuario,
+                destinatarios=destinatarios,
+                mensaje_adicional=mensaje_adicional,
+                message_id=message_id,
+                thread_id=thread_id,
+                fecha=fecha_envio,
+            )
+
+        id_revision_externa, numero_revision_externa, cabecera_creada = (
+            obtener_o_crear_revision_externa_cabecera(
+                id_documento_raiz=id_raiz,
+                usuario=usuario,
+                destinatarios=destinatarios,
+                fecha=fecha_envio,
+                message_id=message_id,
+                thread_id=thread_id,
+                mensaje_enviado=cuerpo_texto,
+            )
+        )
+
+        detalles_creados = crear_detalles_revision_externa_faltantes(
+            id_revision_externa=id_revision_externa,
+            integrantes_preparados=preparados,
+        )
+
+        actualizar_documentos_tras_envio_revision_externa(
+            id_documento_raiz=id_raiz,
+            integrantes_preparados=preparados,
+            usuario=usuario,
+            destinatarios=destinatarios,
+            mensaje_adicional=mensaje_adicional,
+            message_id=message_id,
+            thread_id=thread_id,
+            fecha=fecha_envio,
+        )
+
+        advertencias: list[str] = []
+        try:
+            crear_eventos_envio_revision_externa(
+                integrantes_preparados=preparados,
+                id_revision_externa=id_revision_externa,
+                numero_revision_externa=numero_revision_externa,
+                usuario=usuario,
+                destinatarios=destinatarios,
+                fecha=fecha_envio,
+            )
+        except Exception as exc_evento:
+            traceback.print_exc()
+            advertencias.append(
+                "El envío quedó registrado, pero falló la creación de eventos: "
+                f"{exc_evento}"
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "reanudado_post_gmail": reanudando_post_gmail,
+                "id_documento_raiz": id_raiz,
+                "id_revision_externa": id_revision_externa,
+                "numero_revision_externa": numero_revision_externa,
+                "estado_paquete_notarial": "En revisión externa",
+                "message_id": message_id,
+                "thread_id": thread_id,
+                "destinatarios": destinatarios,
+                "cantidad_documentos": len(preparados),
+                "cantidad_adjuntos": cantidad_adjuntos,
+                "cabecera_creada": cabecera_creada,
+                "detalles_creados": detalles_creados,
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            registrar_error_envio_revision_externa(id_documento, str(exc))
+        return {"error": str(exc)}, 403
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            registrar_error_envio_revision_externa(id_documento, str(exc))
+        return {"error": str(exc)}, 400
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            registrar_error_envio_revision_externa(id_documento, str(exc))
+        return {
+            "error": str(exc),
+            "correo_enviado": correo_enviado,
+            "message_id": message_id,
+            "thread_id": thread_id,
+        }, 500
+
 
 # -----------------------------------------------------------------------------
 # Flujo: registrar PDF firmado y cerrar documento
