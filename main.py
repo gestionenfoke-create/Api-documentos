@@ -9561,6 +9561,8 @@ def crear_detalles_revision_externa_faltantes(
                 "ID_VERSION_ENVIADA": item["id_version"],
                 "RESULTADO": "Pendiente",
                 "COMENTARIO": "",
+                "ARCHIVO_RESPALDO_RESPUESTA": "",
+                "NOMBRE_ARCHIVO_RESPALDO": "",
                 "FECHA_RESPUESTA": "",
                 "REGISTRADO_POR": "",
             }
@@ -10066,14 +10068,29 @@ def validar_contexto_respuesta_revision_externa(
             "ID_VERSION_REVISION_EXTERNA no coincide con la versión respondida"
         )
 
-    archivo_respaldo = texto(revision.get("ARCHIVO_RESPALDO_RESPUESTA"))
-    if not archivo_respaldo:
-        raise ValueError(
-            "Debe registrar ARCHIVO_RESPALDO_RESPUESTA antes de procesar "
-            "la respuesta externa"
-        )
-
+    # La evidencia de respuesta ya no es obligatoria en la cabecera de la ronda.
+    # Cada documento conserva su propio archivo en Documento_Revision_Externa_Detalle.
     return documento, raiz, revision, detalle
+
+
+def validar_archivo_respaldo_revision_externa(valor: Any) -> tuple[str, str]:
+    """
+    Normaliza el File de AppSheet usado como evidencia de una respuesta externa.
+
+    El backend conserva la referencia histórica en el detalle de la ronda; no usa
+    este archivo para crear el nuevo borrador. El reinicio siempre parte del
+    GOOGLE_DOC_ID de la versión que efectivamente fue enviada a revisión externa.
+    """
+    ruta = normalizar_archivo_observacion_appsheet(texto(valor))
+    if not ruta:
+        return "", ""
+
+    nombre = nombre_archivo_desde_valor_appsheet(ruta)
+    if not nombre:
+        raise ValueError(
+            "No se pudo determinar el nombre del archivo de respaldo de revisión externa"
+        )
+    return ruta, nombre
 
 
 def actualizar_detalle_revision_externa(
@@ -10083,22 +10100,39 @@ def actualizar_detalle_revision_externa(
     comentario: str,
     usuario: str,
     fecha: str,
-) -> None:
+    archivo_respaldo: str = "",
+) -> tuple[str, str]:
+    # En reintentos, si AppSheet ya limpió el campo TEMP, conservamos el archivo
+    # histórico que pudo haberse grabado en un intento anterior.
+    archivo_existente = texto(detalle.get("ARCHIVO_RESPALDO_RESPUESTA"))
+    valor_archivo = archivo_respaldo or archivo_existente
+    ruta_archivo, nombre_archivo = validar_archivo_respaldo_revision_externa(
+        valor_archivo
+    )
+
+    cambios: dict[str, Any] = {
+        "ID_REVISION_EXTERNA_DETALLE": texto(
+            detalle.get("ID_REVISION_EXTERNA_DETALLE")
+        ),
+        "RESULTADO": resultado,
+        "COMENTARIO": comentario,
+        "FECHA_RESPUESTA": fecha,
+        "REGISTRADO_POR": usuario,
+    }
+    if ruta_archivo:
+        cambios.update(
+            {
+                "ARCHIVO_RESPALDO_RESPUESTA": ruta_archivo,
+                "NOMBRE_ARCHIVO_RESPALDO": nombre_archivo,
+            }
+        )
+
     appsheet_action(
         TABLA_REVISION_EXTERNA_DETALLE,
         "Edit",
-        [
-            {
-                "ID_REVISION_EXTERNA_DETALLE": texto(
-                    detalle.get("ID_REVISION_EXTERNA_DETALLE")
-                ),
-                "RESULTADO": resultado,
-                "COMENTARIO": comentario,
-                "FECHA_RESPUESTA": fecha,
-                "REGISTRADO_POR": usuario,
-            }
-        ],
+        [cambios],
     )
+    return ruta_archivo, nombre_archivo
 
 
 def actualizar_documento_aprobado_revision_externa(
@@ -10121,6 +10155,7 @@ def actualizar_documento_aprobado_revision_externa(
                 "ULTIMO_ENVIADO_POR": usuario,
                 "FECHA_ULTIMA_ACTUALIZACION": fecha,
                 "OBSERVACION_ACTUAL": "",
+                "ARCHIVO_RESPUESTA_REVISION_EXTERNA_TEMP": "",
                 "ACCION_SOLICITADA": "",
             }
         ],
@@ -10198,6 +10233,7 @@ def actualizar_documento_reinicio_revision_externa(
                 # desde AppSheet, evitando disparar nuevamente Bots internos.
                 "FECHA_ULTIMA_ACTUALIZACION": fecha,
                 "OBSERVACION_ACTUAL": "",
+                "ARCHIVO_RESPUESTA_REVISION_EXTERNA_TEMP": "",
                 "ACCION_SOLICITADA": "",
             }
         ],
@@ -10363,17 +10399,9 @@ def recalcular_revision_y_paquete_notarial(
     else:
         estado_revision = "Aprobada"
 
-    revision = buscar_revision_externa_por_id(id_revision_externa)
-    archivo_respaldo = texto(revision.get("ARCHIVO_RESPALDO_RESPUESTA"))
-    nombre_respaldo = (
-        texto(revision.get("NOMBRE_ARCHIVO_RESPALDO"))
-        or nombre_respaldo_revision_externa(archivo_respaldo)
-    )
-
     cambios_revision: dict[str, Any] = {
         "ID_REVISION_EXTERNA": id_revision_externa,
         "ESTADO_REVISION": estado_revision,
-        "NOMBRE_ARCHIVO_RESPALDO": nombre_respaldo,
     }
     if estado_revision != "Pendiente":
         cambios_revision.update(
@@ -10429,9 +10457,17 @@ def procesar_observacion_revision_externa(
     usuario: str,
     comentario: str,
     fecha: str,
+    archivo_respaldo: str = "",
 ) -> dict[str, Any]:
     if not comentario:
         raise ValueError("El comentario es obligatorio al observar una revisión externa")
+
+    archivo_existente = texto(detalle.get("ARCHIVO_RESPALDO_RESPUESTA"))
+    archivo_efectivo = archivo_respaldo or archivo_existente
+    if not normalizar_archivo_observacion_appsheet(archivo_efectivo):
+        raise ValueError(
+            "El archivo de respaldo es obligatorio al observar una revisión externa"
+        )
 
     id_documento = texto(documento.get("ID_DOCUMENTO"))
     id_documento_raiz = texto(raiz.get("ID_DOCUMENTO"))
@@ -10469,6 +10505,7 @@ def procesar_observacion_revision_externa(
             comentario=comentario,
             usuario=usuario,
             fecha=fecha,
+            archivo_respaldo=archivo_efectivo,
         )
         return {
             "ya_reiniciado": True,
@@ -10632,6 +10669,18 @@ def procesar_observacion_revision_externa(
         fecha_cierre=fecha,
     )
 
+    # Archivamos la respuesta individual antes de limpiar el File temporal de
+    # Documentos. Si una escritura posterior falla, el reintento puede recuperar
+    # comentario y respaldo desde el detalle de esta misma ronda.
+    actualizar_detalle_revision_externa(
+        detalle=detalle,
+        resultado="Observado",
+        comentario=comentario,
+        usuario=usuario,
+        fecha=fecha,
+        archivo_respaldo=archivo_efectivo,
+    )
+
     actualizar_documento_reinicio_revision_externa(
         id_documento=id_documento,
         id_documento_raiz=id_documento_raiz,
@@ -10656,14 +10705,6 @@ def procesar_observacion_revision_externa(
                 "FECHA_ULTIMA_ACTUALIZACION": fecha,
             }
         ],
-    )
-
-    actualizar_detalle_revision_externa(
-        detalle=detalle,
-        resultado="Observado",
-        comentario=comentario,
-        usuario=usuario,
-        fecha=fecha,
     )
 
     advertencias: list[str] = []
@@ -10755,6 +10796,7 @@ def registrar_respuesta_revision_externa():
         usuario = texto(data.get("usuario"))
         accion = texto(data.get("accion"))
         comentario = texto(data.get("comentario"))
+        archivo_respaldo = texto(data.get("archivo_respaldo"))
 
         if not id_documento:
             return {"error": "Falta id_documento"}, 400
@@ -10792,6 +10834,15 @@ def registrar_respuesta_revision_externa():
             if accion == "Aprobar revisión externa"
             else "Observado"
         )
+        archivo_efectivo = archivo_respaldo or texto(
+            detalle.get("ARCHIVO_RESPALDO_RESPUESTA")
+        )
+        if resultado_esperado == "Observado" and not normalizar_archivo_observacion_appsheet(
+            archivo_efectivo
+        ):
+            raise ValueError(
+                "El archivo de respaldo es obligatorio al observar una revisión externa"
+            )
         fecha = ahora_iso()
 
         advertencias: list[str] = []
@@ -10816,6 +10867,7 @@ def registrar_respuesta_revision_externa():
                     usuario=usuario,
                     comentario=comentario or texto(detalle.get("COMENTARIO")),
                     fecha=fecha,
+                    archivo_respaldo=archivo_efectivo,
                 )
                 advertencias.extend(datos_reinicio.get("advertencias") or [])
 
@@ -10875,6 +10927,7 @@ def registrar_respuesta_revision_externa():
                 comentario=comentario,
                 usuario=usuario,
                 fecha=fecha,
+                archivo_respaldo=archivo_efectivo,
             )
             actualizar_documento_aprobado_revision_externa(
                 id_documento=id_documento,
@@ -10892,6 +10945,7 @@ def registrar_respuesta_revision_externa():
                 usuario=usuario,
                 comentario=comentario,
                 fecha=fecha,
+                archivo_respaldo=archivo_efectivo,
             )
             advertencias.extend(datos_reinicio.get("advertencias") or [])
 
