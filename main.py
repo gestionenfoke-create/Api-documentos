@@ -10240,6 +10240,34 @@ def actualizar_documento_reinicio_revision_externa(
     )
 
 
+def buscar_evento_respuesta_revision_externa(
+    *,
+    id_documento: str,
+    id_version: str,
+    resultado: str,
+    id_revision_externa: str,
+) -> dict[str, Any] | None:
+    """Recupera el evento único de respuesta externa para reintentos idempotentes."""
+    prefijo = f"Revisión externa {id_revision_externa}:"
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Respuesta revisión externa"
+        and texto(evento.get("ID_VERSION")) == id_version
+        and texto(evento.get("ESTADO_NUEVO")) == resultado
+        and texto(evento.get("COMENTARIO")).startswith(prefijo)
+    ]
+    if not candidatos:
+        return None
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
 def crear_evento_respuesta_revision_externa(
     *,
     id_documento: str,
@@ -10249,28 +10277,33 @@ def crear_evento_respuesta_revision_externa(
     resultado: str,
     comentario: str,
     id_revision_externa: str,
-) -> None:
-    appsheet_action(
-        TABLA_EVENTOS,
-        "Add",
-        [
-            {
-                "ID_EVENTO": nuevo_id(),
-                "ID_DOCUMENTO": id_documento,
-                "ID_VERSION": id_version,
-                "ID_APROBACION_ACTUAL": "",
-                "TIPO_EVENTO": "Respuesta revisión externa",
-                "ESTADO_ANTERIOR": "Pendiente",
-                "ESTADO_NUEVO": resultado,
-                "USUARIO": usuario,
-                "FECHA_EVENTO": fecha,
-                "COMENTARIO": (
-                    f"Revisión externa {id_revision_externa}: {resultado}."
-                    + (f" {comentario}" if comentario else "")
-                ),
-            }
-        ],
+) -> dict[str, Any]:
+    existente = buscar_evento_respuesta_revision_externa(
+        id_documento=id_documento,
+        id_version=id_version,
+        resultado=resultado,
+        id_revision_externa=id_revision_externa,
     )
+    if existente is not None:
+        return existente
+
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": id_version,
+        "ID_APROBACION_ACTUAL": "",
+        "TIPO_EVENTO": "Respuesta revisión externa",
+        "ESTADO_ANTERIOR": "Pendiente",
+        "ESTADO_NUEVO": resultado,
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            f"Revisión externa {id_revision_externa}: {resultado}."
+            + (f" {comentario}" if comentario else "")
+        ),
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
 
 
 def crear_eventos_reinicio_revision_externa(
@@ -10349,7 +10382,15 @@ def construir_especificaciones_reinicio_revision_externa(
                 "link_documento": "",
             }
         )
+    ids_excluidos = {
+        texto(aprobador_destino.get("ID_APROBACION_ACTUAL")),
+        texto(responsable_firmas.get("ID_APROBACION_ACTUAL"))
+        if responsable_firmas is not None
+        else "",
+    }
     for integrante in cadena:
+        if texto(integrante.get("ID_APROBACION_ACTUAL")) in ids_excluidos:
+            continue
         especificaciones.append(
             {
                 "aprobador": integrante,
@@ -10360,6 +10401,311 @@ def construir_especificaciones_reinicio_revision_externa(
             }
         )
     return especificaciones
+
+
+def obtener_responsable_firmas_documento_notarial(
+    documento: dict[str, Any],
+) -> dict[str, Any]:
+    """Obtiene el Responsable de firmas de la versión vigente del documento."""
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    numero_version = entero(documento.get("VERSION_ACTUAL"), "VERSION_ACTUAL")
+    cadena = buscar_cadena_documento_version(id_documento, numero_version)
+    if not cadena:
+        raise LookupError(
+            f"No se encontró cadena para notificar el documento {id_documento} "
+            f"versión {numero_version}"
+        )
+    return obtener_responsable_firmas_cadena(
+        cadena,
+        contexto=f"Documento {id_documento} versión {numero_version}",
+    )
+
+
+def notificar_aprobacion_revision_externa_documento(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+) -> list[dict[str, Any]]:
+    responsable = obtener_responsable_firmas_documento_notarial(documento)
+    comentario_evento = (
+        texto(evento.get("COMENTARIO"))
+        or "El documento fue aprobado en revisión externa."
+    )
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=[
+            {
+                "aprobador": responsable,
+                "tipo_notificacion": "Informativa",
+                "movimiento": "Documento aprobado en revisión externa",
+                "comentario_principal": comentario_evento,
+                "link_documento": "",
+            }
+        ],
+    )
+
+
+def buscar_evento_reinicio_revision_externa(
+    *,
+    id_documento: str,
+    id_version_observada: str,
+) -> dict[str, Any] | None:
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO"))
+        == "Proceso reiniciado por revisión externa"
+        and texto(evento.get("ID_VERSION")) == id_version_observada
+    ]
+    if not candidatos:
+        return None
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def reanudar_notificaciones_observacion_revision_externa(
+    *,
+    id_documento: str,
+    id_version_observada: str,
+) -> list[dict[str, Any]]:
+    """Reintenta las notificaciones del reinicio usando el mismo ID_EVENTO."""
+    evento = buscar_evento_reinicio_revision_externa(
+        id_documento=id_documento,
+        id_version_observada=id_version_observada,
+    )
+    if evento is None:
+        return []
+
+    documento = buscar_documento(id_documento)
+    numero_version = entero(documento.get("VERSION_ACTUAL"), "VERSION_ACTUAL")
+    cadena = buscar_cadena_documento_version(id_documento, numero_version)
+    if not cadena:
+        raise LookupError(
+            f"No se encontró la cadena reiniciada del documento {id_documento}"
+        )
+    primer_responsable = obtener_primer_responsable_aprobacion(
+        cadena,
+        contexto=f"Documento {id_documento} versión {numero_version}",
+    )
+    responsable_firmas = obtener_responsable_firmas_cadena(
+        cadena,
+        contexto=f"Documento {id_documento} versión {numero_version}",
+    )
+    especificaciones = construir_especificaciones_reinicio_revision_externa(
+        documento=documento,
+        evento=evento,
+        cadena=cadena,
+        aprobador_destino=primer_responsable,
+        responsable_firmas=responsable_firmas,
+    )
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=especificaciones,
+    )
+
+
+def buscar_evento_estado_paquete_notarial(
+    *,
+    id_documento_raiz: str,
+    id_revision_externa: str,
+    estado_nuevo: str,
+) -> dict[str, Any] | None:
+    prefijo = f"Revisión externa {id_revision_externa}: paquete "
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento_raiz)
+        if texto(evento.get("TIPO_EVENTO")) == "Estado paquete notarial"
+        and texto(evento.get("ESTADO_NUEVO")) == estado_nuevo
+        and texto(evento.get("COMENTARIO")).startswith(prefijo)
+    ]
+    if not candidatos:
+        return None
+    candidatos.sort(
+        key=lambda evento: (
+            parsear_fecha_appsheet(evento.get("FECHA_EVENTO")),
+            texto(evento.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def asegurar_evento_estado_paquete_notarial(
+    *,
+    raiz: dict[str, Any],
+    id_revision_externa: str,
+    estado_anterior: str,
+    estado_nuevo: str,
+    usuario: str,
+    fecha: str,
+) -> dict[str, Any] | None:
+    """Crea una sola evidencia por estado relevante de cada ronda notarial."""
+    if estado_nuevo not in {"Con observaciones", "Listo para notaría"}:
+        return None
+
+    id_raiz = texto(raiz.get("ID_DOCUMENTO"))
+    existente = buscar_evento_estado_paquete_notarial(
+        id_documento_raiz=id_raiz,
+        id_revision_externa=id_revision_externa,
+        estado_nuevo=estado_nuevo,
+    )
+    if existente is not None:
+        return existente
+
+    if estado_nuevo == "Con observaciones":
+        comentario = (
+            f"Revisión externa {id_revision_externa}: paquete con observaciones. "
+            "Existe al menos un documento observado que debe volver a aprobación interna."
+        )
+    else:
+        comentario = (
+            f"Revisión externa {id_revision_externa}: paquete listo para notaría. "
+            "Todos los documentos del paquete fueron aprobados en revisión externa."
+        )
+
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_raiz,
+        "ID_VERSION": texto(raiz.get("ID_VERSION_ACTUAL")),
+        "ID_APROBACION_ACTUAL": texto(raiz.get("ID_APROBACION_ACTUAL")),
+        "TIPO_EVENTO": "Estado paquete notarial",
+        "ESTADO_ANTERIOR": estado_anterior,
+        "ESTADO_NUEVO": estado_nuevo,
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": comentario,
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
+
+
+def notificar_estado_paquete_notarial(
+    *,
+    raiz: dict[str, Any],
+    evento: dict[str, Any],
+) -> list[dict[str, Any]]:
+    responsable = obtener_responsable_firmas_documento_notarial(raiz)
+    estado_nuevo = texto(evento.get("ESTADO_NUEVO"))
+    if estado_nuevo == "Listo para notaría":
+        tipo = "Acción requerida"
+        movimiento = "Paquete listo para enviar a notaría"
+        link_documento = normalizar_url_appsheet(raiz.get("GOOGLE_DOC_URL"))
+    else:
+        tipo = "Informativa"
+        movimiento = "Paquete notarial con observaciones"
+        link_documento = ""
+
+    return notificar_destinatarios_internos(
+        documento=raiz,
+        evento=evento,
+        destinatarios=[
+            {
+                "aprobador": responsable,
+                "tipo_notificacion": tipo,
+                "movimiento": movimiento,
+                "comentario_principal": texto(evento.get("COMENTARIO")),
+                "link_documento": link_documento,
+            }
+        ],
+    )
+
+
+def ejecutar_notificaciones_post_respuesta_revision_externa(
+    *,
+    documento: dict[str, Any],
+    raiz_antes: dict[str, Any],
+    id_revision_externa: str,
+    id_version_enviada: str,
+    resultado: str,
+    comentario: str,
+    usuario: str,
+    fecha: str,
+    estado_paquete_nuevo: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Notifica cambios externos sin revertir la transición si Gmail falla."""
+    resultados: list[dict[str, Any]] = []
+    advertencias: list[str] = []
+
+    try:
+        evento_respuesta = crear_evento_respuesta_revision_externa(
+            id_documento=texto(documento.get("ID_DOCUMENTO")),
+            id_version=id_version_enviada,
+            usuario=usuario,
+            fecha=fecha,
+            resultado=resultado,
+            comentario=comentario,
+            id_revision_externa=id_revision_externa,
+        )
+        if resultado == "Aprobado":
+            documento_actualizado = buscar_documento(
+                texto(documento.get("ID_DOCUMENTO"))
+            )
+            notifs = notificar_aprobacion_revision_externa_documento(
+                documento=documento_actualizado,
+                evento=evento_respuesta,
+            )
+            resultados.extend(notifs)
+            fallidas = [fila for fila in notifs if not fila.get("ok")]
+            if fallidas:
+                advertencias.append(
+                    f"{len(fallidas)} notificación(es) de aprobación externa "
+                    "quedaron omitidas o con error. Revisa Documento_Notificaciones."
+                )
+        elif resultado == "Observado":
+            notifs = reanudar_notificaciones_observacion_revision_externa(
+                id_documento=texto(documento.get("ID_DOCUMENTO")),
+                id_version_observada=id_version_enviada,
+            )
+            resultados.extend(notifs)
+            fallidas = [fila for fila in notifs if not fila.get("ok")]
+            if fallidas:
+                advertencias.append(
+                    f"{len(fallidas)} notificación(es) del documento observado "
+                    "quedaron omitidas o con error. Revisa Documento_Notificaciones."
+                )
+    except Exception as exc:
+        traceback.print_exc()
+        advertencias.append(
+            "La respuesta externa quedó registrada, pero falló su notificación interna: "
+            + str(exc)
+        )
+
+    try:
+        raiz_actual = buscar_documento(texto(raiz_antes.get("ID_DOCUMENTO")))
+        evento_paquete = asegurar_evento_estado_paquete_notarial(
+            raiz=raiz_actual,
+            id_revision_externa=id_revision_externa,
+            estado_anterior=texto(raiz_antes.get("ESTADO_PAQUETE_NOTARIAL")),
+            estado_nuevo=estado_paquete_nuevo,
+            usuario=usuario,
+            fecha=fecha,
+        )
+        if evento_paquete is not None:
+            notifs = notificar_estado_paquete_notarial(
+                raiz=raiz_actual,
+                evento=evento_paquete,
+            )
+            resultados.extend(notifs)
+            fallidas = [fila for fila in notifs if not fila.get("ok")]
+            if fallidas:
+                advertencias.append(
+                    f"{len(fallidas)} notificación(es) del estado del paquete "
+                    "quedaron omitidas o con error. Revisa Documento_Notificaciones."
+                )
+    except Exception as exc:
+        traceback.print_exc()
+        advertencias.append(
+            "El estado del paquete quedó actualizado, pero falló su notificación interna: "
+            + str(exc)
+        )
+
+    return resultados, advertencias
 
 
 def recalcular_revision_y_paquete_notarial(
@@ -10877,6 +11223,20 @@ def registrar_respuesta_revision_externa():
                 usuario=usuario,
                 fecha=fecha,
             )
+            notificaciones_post, advertencias_post = (
+                ejecutar_notificaciones_post_respuesta_revision_externa(
+                    documento=documento,
+                    raiz_antes=raiz,
+                    id_revision_externa=id_revision_externa,
+                    id_version_enviada=id_version_enviada,
+                    resultado=resultado_esperado,
+                    comentario=comentario or texto(detalle.get("COMENTARIO")),
+                    usuario=usuario,
+                    fecha=fecha,
+                    estado_paquete_nuevo=estados["estado_paquete_notarial"],
+                )
+            )
+            advertencias.extend(advertencias_post)
             documento_final = buscar_documento(id_documento)
             return jsonify(
                 {
@@ -10889,6 +11249,7 @@ def registrar_respuesta_revision_externa():
                     "estado": texto(documento_final.get("ESTADO")),
                     **estados,
                     "reinicio": datos_reinicio,
+                    "notificaciones": notificaciones_post,
                     "advertencias": advertencias,
                 }
             )
@@ -10949,29 +11310,26 @@ def registrar_respuesta_revision_externa():
             )
             advertencias.extend(datos_reinicio.get("advertencias") or [])
 
-        try:
-            crear_evento_respuesta_revision_externa(
-                id_documento=id_documento,
-                id_version=id_version_enviada,
-                usuario=usuario,
-                fecha=fecha,
-                resultado=resultado_esperado,
-                comentario=comentario,
-                id_revision_externa=id_revision_externa,
-            )
-        except Exception as exc:
-            traceback.print_exc()
-            advertencias.append(
-                "La respuesta se registró, pero falló el evento de respuesta externa: "
-                f"{exc}"
-            )
-
         estados = recalcular_revision_y_paquete_notarial(
             id_revision_externa=id_revision_externa,
             id_documento_raiz=id_raiz,
             usuario=usuario,
             fecha=fecha,
         )
+        notificaciones_post, advertencias_post = (
+            ejecutar_notificaciones_post_respuesta_revision_externa(
+                documento=documento,
+                raiz_antes=raiz,
+                id_revision_externa=id_revision_externa,
+                id_version_enviada=id_version_enviada,
+                resultado=resultado_esperado,
+                comentario=comentario,
+                usuario=usuario,
+                fecha=fecha,
+                estado_paquete_nuevo=estados["estado_paquete_notarial"],
+            )
+        )
+        advertencias.extend(advertencias_post)
         documento_final = buscar_documento(id_documento)
 
         return jsonify(
@@ -10986,6 +11344,7 @@ def registrar_respuesta_revision_externa():
                 "estado": texto(documento_final.get("ESTADO")),
                 **estados,
                 "reinicio": datos_reinicio,
+                "notificaciones": notificaciones_post,
                 "advertencias": advertencias,
             }
         )
