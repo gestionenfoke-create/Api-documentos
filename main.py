@@ -176,12 +176,12 @@ TABLA_REVISION_EXTERNA_DETALLE = os.environ.get(
 # Tablas de la fase Notaría
 TABLA_NOTARIAS = os.environ.get(
     "TABLA_NOTARIAS",
-    "Notaria",
+    "Notarias",
 )
 
 TABLA_DOCUMENTOS_PRIME = os.environ.get(
     "TABLA_DOCUMENTOS_PRIME",
-    "Documentos_Prime",
+    "Documentos_prime",
 )
 
 TABLA_ENVIOS_NOTARIA = os.environ.get(
