@@ -173,6 +173,27 @@ TABLA_REVISION_EXTERNA_DETALLE = os.environ.get(
     "Documento_Revision_Externa_Detalle",
 )
 
+# Tablas de la fase Notaría
+TABLA_NOTARIAS = os.environ.get(
+    "TABLA_NOTARIAS",
+    "Notaria",
+)
+
+TABLA_DOCUMENTOS_PRIME = os.environ.get(
+    "TABLA_DOCUMENTOS_PRIME",
+    "Documentos_Prime",
+)
+
+TABLA_ENVIOS_NOTARIA = os.environ.get(
+    "TABLA_ENVIOS_NOTARIA",
+    "Documento_Envios_Notaria",
+)
+
+TABLA_ENVIOS_NOTARIA_DETALLE = os.environ.get(
+    "TABLA_ENVIOS_NOTARIA_DETALLE",
+    "Documento_Envios_Notaria_Detalle",
+)
+
 APPSHEET_DOCUMENT_VIEW_URL = os.environ.get(
     "APPSHEET_DOCUMENT_VIEW_URL",
     "",
@@ -13667,6 +13688,1004 @@ def rechazar_firma():
         if id_documento:
             registrar_error_transicion(id_documento, str(exc))
         return {"error": str(exc)}, 500
+
+
+# -----------------------------------------------------------------------------
+# Flujo Notarial - envío del paquete aprobado a notaría
+# -----------------------------------------------------------------------------
+
+ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA = "En notaría"
+ESTADO_DOCUMENTO_EN_NOTARIA = "En notaría"
+EXTENSIONES_ANTECEDENTES_NOTARIA = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx"}
+
+
+def primer_valor(fila: dict[str, Any], *columnas: str) -> str:
+    """Devuelve el primer valor no vacío entre posibles nombres de columna."""
+    for columna in columnas:
+        valor = texto(fila.get(columna))
+        if valor:
+            return valor
+    return ""
+
+
+def buscar_notaria_por_id(id_notaria: str) -> dict[str, Any]:
+    selector = (
+        f"FILTER({TABLA_NOTARIAS}, "
+        f"[ID_NOTARIA] = {literal_appsheet(id_notaria)})"
+    )
+    filas = appsheet_find(TABLA_NOTARIAS, selector)
+    if not filas:
+        raise LookupError(f"No se encontró ID_NOTARIA={id_notaria}")
+    if len(filas) > 1:
+        raise ValueError(f"ID_NOTARIA duplicado: {id_notaria}")
+    return filas[0]
+
+
+def normalizar_datos_notaria(notaria: dict[str, Any]) -> dict[str, str]:
+    datos = {
+        "id_notaria": primer_valor(notaria, "ID_NOTARIA"),
+        "nombre": primer_valor(notaria, "NOMBRE_NOTARIA", "NOMBRE"),
+        "direccion": primer_valor(notaria, "DIRECCION_NOTARIA", "DIRECCION"),
+        "contacto": primer_valor(
+            notaria,
+            "PERSONA_CONTACTO_NOTARIA",
+            "PERSONA_CONTACTO",
+            "ENCARGADO_NOTARIA",
+            "ENCARGADO",
+        ),
+        "email": primer_valor(notaria, "EMAIL_NOTARIA", "EMAIL").lower(),
+        "horario": primer_valor(
+            notaria,
+            "HORARIO_ATENCION_NOTARIA",
+            "HORARIO_ATENCION",
+            "HORARIO",
+        ),
+    }
+    if not datos["id_notaria"]:
+        raise ValueError("La notaría no tiene ID_NOTARIA")
+    if not datos["nombre"]:
+        raise ValueError("La notaría no tiene NOMBRE_NOTARIA")
+    if not datos["email"] or not _EMAIL_RE.fullmatch(datos["email"]):
+        raise ValueError("La notaría no tiene un EMAIL_NOTARIA válido")
+    if not datos["direccion"]:
+        raise ValueError("La notaría no tiene DIRECCION_NOTARIA")
+    if not datos["contacto"]:
+        raise ValueError("La notaría no tiene PERSONA_CONTACTO_NOTARIA")
+    if not datos["horario"]:
+        raise ValueError("La notaría no tiene HORARIO_ATENCION_NOTARIA")
+    return datos
+
+
+def buscar_documentos_prime_propiedad(id_propiedad: str) -> list[dict[str, Any]]:
+    selector = (
+        f"FILTER({TABLA_DOCUMENTOS_PRIME}, "
+        f"[id_Propiedades] = {literal_appsheet(id_propiedad)})"
+    )
+    return appsheet_find(TABLA_DOCUMENTOS_PRIME, selector)
+
+
+def mime_adjunto_desde_nombre(nombre: str) -> tuple[str, str]:
+    extension = PurePosixPath(nombre.lower()).suffix
+    mapa = {
+        ".pdf": ("application", "pdf"),
+        ".png": ("image", "png"),
+        ".jpg": ("image", "jpeg"),
+        ".jpeg": ("image", "jpeg"),
+        ".doc": ("application", "msword"),
+        ".docx": (
+            "application",
+            "vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    }
+    if extension not in mapa:
+        raise ValueError(
+            f"Formato no permitido para antecedente notarial: {nombre!r}"
+        )
+    return mapa[extension]
+
+
+def descargar_file_appsheet(
+    *,
+    table_name: str,
+    valor_file: Any,
+) -> tuple[bytes, str, str, str]:
+    """Descarga una columna File de AppSheet y devuelve bytes/nombre/MIME."""
+    valor_original = texto(valor_file).strip()
+    ruta = normalizar_archivo_observacion_appsheet(valor_original)
+    if not ruta:
+        raise ValueError(f"{table_name}: se recibió un File vacío")
+
+    nombre = nombre_archivo_desde_valor_appsheet(ruta)
+    if not nombre:
+        raise ValueError(f"{table_name}: no se pudo determinar el nombre del archivo")
+
+    extension = PurePosixPath(nombre.lower()).suffix
+    if extension not in EXTENSIONES_ANTECEDENTES_NOTARIA:
+        raise ValueError(
+            f"{table_name}: el archivo {nombre!r} no tiene un formato admitido"
+        )
+
+    if valor_original.lower().startswith(("http://", "https://")) and "gettablefileurl" not in valor_original:
+        url = valor_original
+    else:
+        prepared = requests.Request(
+            "GET",
+            "https://www.appsheet.com/template/gettablefileurl",
+            params={
+                "appName": APPSHEET_APP_ID,
+                "tableName": table_name,
+                "fileName": ruta,
+            },
+        ).prepare()
+        url = prepared.url
+
+    headers = {"Accept": "*/*"}
+    if APPSHEET_ACCESS_KEY:
+        headers["ApplicationAccessKey"] = APPSHEET_ACCESS_KEY
+
+    respuesta = requests.get(url, headers=headers, timeout=90, allow_redirects=True)
+    if respuesta.status_code != 200:
+        raise RuntimeError(
+            f"No se pudo descargar {nombre} desde AppSheet: "
+            f"HTTP {respuesta.status_code} - {respuesta.text[:300]}"
+        )
+    if not respuesta.content:
+        raise RuntimeError(f"AppSheet devolvió vacío el archivo {nombre}")
+
+    maintype, subtype = mime_adjunto_desde_nombre(nombre)
+    return respuesta.content, nombre, maintype, subtype
+
+
+def guardar_docx_enviado_notaria(
+    *,
+    drive_service: Any,
+    google_doc_id: str,
+    contenido: bytes,
+    nombre_docx: str,
+    id_envio_notaria: str,
+) -> dict[str, str]:
+    """Guarda en Drive exactamente los mismos bytes DOCX que se adjuntarán."""
+    metadata_origen = (
+        drive_service.files()
+        .get(
+            fileId=google_doc_id,
+            fields="id,parents",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    parents = metadata_origen.get("parents") or []
+    if not parents:
+        raise RuntimeError(
+            f"El Google Doc {google_doc_id} no tiene una carpeta padre para guardar el respaldo"
+        )
+    folder_id = texto(parents[0])
+
+    base, _ = os.path.splitext(nombre_docx)
+    nombre_respaldo = limpiar_nombre_archivo(
+        f"{base}_ENVIADO_NOTARIA_{id_envio_notaria[:8]}"
+    ) + ".docx"
+
+    existente = buscar_archivo_en_carpeta(
+        drive_service=drive_service,
+        folder_id=folder_id,
+        nombre_archivo=nombre_respaldo,
+    )
+    if existente:
+        file_id = texto(existente.get("id"))
+        return {
+            "id": file_id,
+            "name": texto(existente.get("name")) or nombre_respaldo,
+            "url": texto(existente.get("url")) or f"https://drive.google.com/file/d/{file_id}/view",
+        }
+
+    media = MediaInMemoryUpload(
+        contenido,
+        mimetype=DOCX_MIME_TYPE,
+        resumable=False,
+    )
+    archivo = (
+        drive_service.files()
+        .create(
+            body={
+                "name": nombre_respaldo,
+                "parents": [folder_id],
+                "mimeType": DOCX_MIME_TYPE,
+            },
+            media_body=media,
+            fields="id,name,webViewLink,webContentLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    file_id = texto(archivo.get("id"))
+    return {
+        "id": file_id,
+        "name": texto(archivo.get("name")) or nombre_respaldo,
+        "url": (
+            texto(archivo.get("webViewLink"))
+            or texto(archivo.get("webContentLink"))
+            or f"https://drive.google.com/file/d/{file_id}/view"
+        ),
+    }
+
+
+def buscar_envio_notaria_preparando(id_documento_raiz: str) -> dict[str, Any] | None:
+    selector = (
+        f"FILTER({TABLA_ENVIOS_NOTARIA}, "
+        f"AND([ID_DOCUMENTO_RAIZ] = {literal_appsheet(id_documento_raiz)}, "
+        f"[ESTADO_ENVIO] = \"Preparando\"))"
+    )
+    filas = appsheet_find(TABLA_ENVIOS_NOTARIA, selector)
+    return filas[-1] if filas else None
+
+
+def obtener_o_crear_envio_notaria(
+    *,
+    raiz: dict[str, Any],
+    id_notaria: str,
+    id_propiedad_prime: str,
+    firmantes: list[str],
+    usuario: str,
+    mensaje_adicional: str,
+    datos_notaria: dict[str, str],
+    fecha: str,
+) -> tuple[dict[str, Any], bool]:
+    id_raiz = texto(raiz.get("ID_DOCUMENTO"))
+    existente = buscar_envio_notaria_preparando(id_raiz)
+    if existente:
+        return existente, False
+
+    fila = {
+        "ID_ENVIO_NOTARIA": nuevo_id(),
+        "ID_DOCUMENTO_RAIZ": id_raiz,
+        "ID_NOTARIA": id_notaria,
+        "ID_PROPIEDAD_PRIME": id_propiedad_prime,
+        "DESTINATARIOS_FIRMANTES": ", ".join(firmantes),
+        "FECHA_ENVIO": fecha,
+        "ENVIADO_POR": usuario,
+        "MENSAJE_ADICIONAL": mensaje_adicional,
+        "GMAIL_MESSAGE_ID": "",
+        "GMAIL_THREAD_ID": "",
+        "ESTADO_ENVIO": "Preparando",
+        "NOMBRE_NOTARIA": datos_notaria["nombre"],
+        "DIRECCION_NOTARIA": datos_notaria["direccion"],
+        "PERSONA_CONTACTO_NOTARIA": datos_notaria["contacto"],
+        "EMAIL_NOTARIA": datos_notaria["email"],
+        "HORARIO_ATENCION_NOTARIA": datos_notaria["horario"],
+    }
+    appsheet_action(TABLA_ENVIOS_NOTARIA, "Add", [fila])
+    return fila, True
+
+
+def asegurar_detalle_envio_notaria(
+    *,
+    id_envio_notaria: str,
+    tipo_adjunto: str,
+    id_documento: str = "",
+    id_version: str = "",
+    id_documento_prime: str = "",
+    nombre_archivo: str,
+    drive_file_id: str = "",
+    drive_file_url: str = "",
+    fecha: str,
+) -> None:
+    condiciones = [
+        f"[ID_ENVIO_NOTARIA] = {literal_appsheet(id_envio_notaria)}",
+        f"[TIPO_ADJUNTO] = {literal_appsheet(tipo_adjunto)}",
+        f"[NOMBRE_ARCHIVO] = {literal_appsheet(nombre_archivo)}",
+    ]
+    if id_documento:
+        condiciones.append(f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)}")
+    if id_documento_prime:
+        condiciones.append(
+            f"[ID_DOCUMENTO_PRIME] = {literal_appsheet(id_documento_prime)}"
+        )
+    selector = (
+        f"FILTER({TABLA_ENVIOS_NOTARIA_DETALLE}, AND("
+        + ", ".join(condiciones)
+        + "))"
+    )
+    if appsheet_find(TABLA_ENVIOS_NOTARIA_DETALLE, selector):
+        return
+
+    appsheet_action(
+        TABLA_ENVIOS_NOTARIA_DETALLE,
+        "Add",
+        [
+            {
+                "ID_DETALLE_ENVIO_NOTARIA": nuevo_id(),
+                "ID_ENVIO_NOTARIA": id_envio_notaria,
+                "TIPO_ADJUNTO": tipo_adjunto,
+                "ID_DOCUMENTO": id_documento,
+                "ID_VERSION": id_version,
+                "ID_DOCUMENTO_PRIME": id_documento_prime,
+                "NOMBRE_ARCHIVO": nombre_archivo,
+                "DRIVE_FILE_ID": drive_file_id,
+                "DRIVE_FILE_URL": drive_file_url,
+                "FECHA_CREACION": fecha,
+            }
+        ],
+    )
+
+
+def validar_paquete_para_envio_notaria(
+    *,
+    contexto: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not contexto.get("solicitado_es_raiz"):
+        raise ValueError(
+            "Solo el documento raíz puede iniciar el envío a notaría. "
+            f"Raíz: {contexto.get('id_documento_raiz')}"
+        )
+    if contexto.get("tipo_firma_paquete") != "Notarial":
+        raise ValueError("El paquete no corresponde a Firma Notarial")
+
+    raiz = contexto["raiz"]
+    id_raiz = texto(contexto.get("id_documento_raiz"))
+    estado_paquete = texto(raiz.get("ESTADO_PAQUETE_NOTARIAL"))
+    if estado_paquete != "Listo para notaría":
+        raise ValueError(
+            "Solo un paquete con ESTADO_PAQUETE_NOTARIAL='Listo para notaría' "
+            "puede enviarse a notaría. "
+            f"Estado actual: {estado_paquete!r}"
+        )
+
+    integrantes_notariales = buscar_integrantes_paquete_notarial(id_raiz)
+    ids_notariales = {
+        texto(fila.get("ID_DOCUMENTO")) for fila in integrantes_notariales
+    }
+    ids_jerarquia = {
+        texto(fila.get("id_documento"))
+        for fila in (contexto.get("integrantes") or [])
+    }
+    if ids_notariales != ids_jerarquia:
+        raise ValueError(
+            "La jerarquía actual no coincide con el paquete notarial activo"
+        )
+
+    preparados: list[dict[str, Any]] = []
+    errores: list[str] = []
+    for item in contexto.get("integrantes") or []:
+        documento = item.get("documento") or {}
+        id_documento = texto(documento.get("ID_DOCUMENTO"))
+        titulo = texto(documento.get("TITULO")) or id_documento
+        motivos: list[str] = []
+
+        if texto(documento.get("ID_DOCUMENTO_RAIZ_NOTARIAL")) != id_raiz:
+            motivos.append("no pertenece al paquete notarial activo")
+        if texto(documento.get("ESTADO")) != "Listo para notaría":
+            motivos.append(
+                f"ESTADO={texto(documento.get('ESTADO'))!r}; se requiere 'Listo para notaría'"
+            )
+        resultado = normalizar_resultado_revision_externa(
+            documento.get("RESULTADO_REVISION_EXTERNA")
+        )
+        if resultado != "Aprobado":
+            motivos.append(
+                f"RESULTADO_REVISION_EXTERNA={resultado!r}; se requiere 'Aprobado'"
+            )
+
+        id_version_actual = texto(documento.get("ID_VERSION_ACTUAL"))
+        id_version_aprobada = texto(documento.get("ID_VERSION_REVISION_EXTERNA"))
+        if not id_version_actual:
+            motivos.append("falta ID_VERSION_ACTUAL")
+        if not id_version_aprobada:
+            motivos.append("falta ID_VERSION_REVISION_EXTERNA")
+        if id_version_actual and id_version_aprobada and id_version_actual != id_version_aprobada:
+            motivos.append("la versión actual no coincide con la versión aprobada externamente")
+
+        version = None
+        if id_version_aprobada:
+            try:
+                version = buscar_version_por_id(id_version_aprobada)
+            except Exception as exc:
+                motivos.append(f"no se pudo resolver la versión aprobada: {exc}")
+
+        if version is not None:
+            if texto(version.get("ID_DOCUMENTO")) != id_documento:
+                motivos.append("ID_VERSION_REVISION_EXTERNA pertenece a otro documento")
+            if texto(version.get("ESTADO_VERSION")) != "Activa":
+                motivos.append("la versión aprobada no tiene ESTADO_VERSION='Activa'")
+            if not texto(version.get("GOOGLE_DOC_ID")):
+                motivos.append("la versión aprobada no tiene GOOGLE_DOC_ID")
+
+        if motivos:
+            errores.append(f"{titulo}: " + "; ".join(motivos))
+            continue
+
+        preparados.append(
+            {
+                "documento": documento,
+                "version": version,
+                "id_documento": id_documento,
+                "titulo": titulo,
+                "es_raiz": bool(item.get("es_raiz")),
+                "id_version": id_version_aprobada,
+            }
+        )
+
+    if errores:
+        raise ValueError(
+            "El paquete no está listo para envío a notaría: " + " | ".join(errores)
+        )
+    if not preparados:
+        raise ValueError("El paquete notarial no contiene documentos para enviar")
+    return preparados
+
+
+@medir_operacion("notarial.construir_adjuntos_envio_notaria")
+def construir_adjuntos_envio_notaria(
+    *,
+    drive_service: Any,
+    preparados: list[dict[str, Any]],
+    antecedentes_prime: list[dict[str, Any]],
+    id_envio_notaria: str,
+    fecha: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Construye DOCX aprobados + todos los antecedentes permitidos de Documentos_prime."""
+    adjuntos: list[dict[str, Any]] = []
+    detalle_archivos: list[dict[str, Any]] = []
+
+    # 1) Documentos aprobados para firma: siempre editables DOCX.
+    for item in preparados:
+        version = item["version"]
+        google_doc_id = texto(version.get("GOOGLE_DOC_ID"))
+        nombre_base = texto(version.get("NOMBRE_ARCHIVO")) or item["titulo"]
+        docx_bytes, docx_nombre = exportar_docx_drive(
+            drive_service=drive_service,
+            google_doc_id=google_doc_id,
+            nombre_base=nombre_base,
+        )
+        respaldo = guardar_docx_enviado_notaria(
+            drive_service=drive_service,
+            google_doc_id=google_doc_id,
+            contenido=docx_bytes,
+            nombre_docx=docx_nombre,
+            id_envio_notaria=id_envio_notaria,
+        )
+        adjuntos.append(
+            {
+                "contenido": docx_bytes,
+                "nombre": docx_nombre,
+                "maintype": "application",
+                "subtype": "vnd.openxmlformats-officedocument.wordprocessingml.document",
+            }
+        )
+        detalle = {
+            "tipo": "Documento para firma",
+            "id_documento": item["id_documento"],
+            "id_version": item["id_version"],
+            "titulo": item["titulo"],
+            "nombre": docx_nombre,
+            "drive_file_id": respaldo["id"],
+            "drive_file_url": respaldo["url"],
+        }
+        detalle_archivos.append(detalle)
+        asegurar_detalle_envio_notaria(
+            id_envio_notaria=id_envio_notaria,
+            tipo_adjunto="Documento para firma",
+            id_documento=item["id_documento"],
+            id_version=item["id_version"],
+            nombre_archivo=docx_nombre,
+            drive_file_id=respaldo["id"],
+            drive_file_url=respaldo["url"],
+            fecha=fecha,
+        )
+
+    # 2) Antecedentes complementarios de la propiedad.
+    for fila in antecedentes_prime:
+        valor_file = fila.get("file1")
+        if not texto(valor_file):
+            continue
+        contenido, nombre, maintype, subtype = descargar_file_appsheet(
+            table_name=TABLA_DOCUMENTOS_PRIME,
+            valor_file=valor_file,
+        )
+        adjuntos.append(
+            {
+                "contenido": contenido,
+                "nombre": nombre,
+                "maintype": maintype,
+                "subtype": subtype,
+            }
+        )
+        id_documento_prime = primer_valor(fila, "id_documento", "ID_DOCUMENTO")
+        detalle_archivos.append(
+            {
+                "tipo": "Antecedente",
+                "id_documento_prime": id_documento_prime,
+                "nombre": nombre,
+                "descripcion": primer_valor(fila, "Descripcion", "DESCRIPCION"),
+            }
+        )
+        asegurar_detalle_envio_notaria(
+            id_envio_notaria=id_envio_notaria,
+            tipo_adjunto="Antecedente",
+            id_documento_prime=id_documento_prime,
+            nombre_archivo=nombre,
+            fecha=fecha,
+        )
+
+    if not adjuntos:
+        raise ValueError("No se reunieron archivos para enviar a notaría")
+    return adjuntos, detalle_archivos
+
+
+def construir_email_envio_notaria(
+    *,
+    raiz: dict[str, Any],
+    usuario: str,
+    mensaje_adicional: str,
+    datos_notaria: dict[str, str],
+    detalle_archivos: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    titulo = texto(raiz.get("TITULO")) or texto(raiz.get("ID_DOCUMENTO"))
+    contacto = datos_notaria["contacto"]
+    docs = [f"- {fila['nombre']}" for fila in detalle_archivos if fila.get("tipo") == "Documento para firma"]
+    antecedentes = [f"- {fila['nombre']}" for fila in detalle_archivos if fila.get("tipo") == "Antecedente"]
+
+    asunto = f"Documentos para firma notarial — {titulo}"
+    bloques = [
+        f"Estimado/a {contacto}:",
+        "",
+        f"Se remite el paquete documental asociado a {titulo} para continuar el proceso de firma notarial.",
+        "",
+        "DOCUMENTOS PARA FIRMA / EDICIÓN NOTARIAL (DOCX)",
+        *(docs or ["- Sin documentos"]),
+        "",
+        "ANTECEDENTES COMPLEMENTARIOS (NO REQUIEREN FIRMA)",
+        *(antecedentes or ["- Sin antecedentes complementarios"]),
+    ]
+    if mensaje_adicional:
+        bloques.extend(["", "INDICACIONES ADICIONALES", mensaje_adicional])
+    bloques.extend(
+        [
+            "",
+            "Los antecedentes complementarios se adjuntan únicamente como respaldo y no requieren firma.",
+            "",
+            "Agradeceremos devolver los documentos resultantes del proceso notarial respondiendo a este mismo correo.",
+        ]
+    )
+    cuerpo = "\n".join(bloques)
+
+    def esc(v: Any) -> str:
+        return html.escape(texto(v))
+
+    lista_docs = "".join(f"<li>{esc(fila['nombre'])}</li>" for fila in detalle_archivos if fila.get("tipo") == "Documento para firma") or "<li>Sin documentos</li>"
+    lista_ant = "".join(f"<li>{esc(fila['nombre'])}</li>" for fila in detalle_archivos if fila.get("tipo") == "Antecedente") or "<li>Sin antecedentes complementarios</li>"
+    adicional_html = ""
+    if mensaje_adicional:
+        adicional_html = f"<p><strong>Indicaciones adicionales:</strong><br>{esc(mensaje_adicional).replace(chr(10), '<br>')}</p>"
+
+    cuerpo_html = f"""
+    <html><body style="font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.55;">
+      <h2>Envío de documentos a notaría</h2>
+      <p>Estimado/a <strong>{esc(contacto)}</strong>:</p>
+      <p>Se remite el paquete documental asociado a <strong>{esc(titulo)}</strong> para continuar el proceso de firma notarial.</p>
+      <h3>Documentos para firma / edición notarial (DOCX)</h3>
+      <ul>{lista_docs}</ul>
+      <h3>Antecedentes complementarios (no requieren firma)</h3>
+      <ul>{lista_ant}</ul>
+      {adicional_html}
+      <p>Los antecedentes complementarios se adjuntan únicamente como respaldo y no requieren firma.</p>
+      <p>Agradeceremos devolver los documentos resultantes del proceso notarial respondiendo a este mismo correo.</p>
+    </body></html>
+    """
+    return asunto, cuerpo, cuerpo_html
+
+
+def construir_email_firmante_notaria(
+    *,
+    raiz: dict[str, Any],
+    datos_notaria: dict[str, str],
+) -> tuple[str, str, str]:
+    titulo = texto(raiz.get("TITULO")) or texto(raiz.get("ID_DOCUMENTO"))
+    asunto = f"Documentación disponible para firma en notaría — {titulo}"
+    cuerpo = (
+        "Estimado/a:\n\n"
+        "El proceso de revisión y aprobación de la documentación concluyó exitosamente. "
+        "La documentación fue enviada a notaría para continuar con el proceso de firma.\n\n"
+        f"Notaría: {datos_notaria['nombre']}\n"
+        f"Dirección: {datos_notaria['direccion']}\n"
+        f"Contacto: {datos_notaria['contacto']}\n"
+        f"Correo: {datos_notaria['email']}\n"
+        f"Horario de atención: {datos_notaria['horario']}\n\n"
+        "Para coordinar su firma, favor considerar la información indicada.\n\n"
+        "Esta notificación no contiene documentos adjuntos."
+    )
+    cuerpo_html = f"""
+    <html><body style="font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.6;">
+      <h2>Documentación disponible para firma en notaría</h2>
+      <p>Estimado/a:</p>
+      <p>El proceso de revisión y aprobación de la documentación concluyó exitosamente. La documentación fue enviada a notaría para continuar con el proceso de firma.</p>
+      <table style="border-collapse:collapse;">
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Notaría</td><td>{html.escape(datos_notaria['nombre'])}</td></tr>
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Dirección</td><td>{html.escape(datos_notaria['direccion'])}</td></tr>
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Contacto</td><td>{html.escape(datos_notaria['contacto'])}</td></tr>
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Correo</td><td>{html.escape(datos_notaria['email'])}</td></tr>
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Horario</td><td>{html.escape(datos_notaria['horario'])}</td></tr>
+      </table>
+      <p>Para coordinar su firma, favor considerar la información indicada.</p>
+      <p><strong>Esta notificación no contiene documentos adjuntos.</strong></p>
+    </body></html>
+    """
+    return asunto, cuerpo, cuerpo_html
+
+
+def enviar_notificaciones_firmantes_notaria(
+    *,
+    gmail_service: Any,
+    raiz: dict[str, Any],
+    firmantes: list[str],
+    datos_notaria: dict[str, str],
+    id_envio_notaria: str,
+) -> list[dict[str, Any]]:
+    asunto, cuerpo, cuerpo_html = construir_email_firmante_notaria(
+        raiz=raiz,
+        datos_notaria=datos_notaria,
+    )
+    resultados: list[dict[str, Any]] = []
+    for email in firmantes:
+        try:
+            rfc_message_id = construir_rfc_message_id_notificacion(
+                f"notaria-{id_envio_notaria}-{email}"
+            )
+            respuesta = enviar_email_notificacion(
+                gmail_service=gmail_service,
+                destinatario=email,
+                asunto=asunto,
+                cuerpo_texto=cuerpo,
+                cuerpo_html=cuerpo_html,
+                rfc_message_id=rfc_message_id,
+            )
+            resultados.append(
+                {
+                    "ok": True,
+                    "destinatario": email,
+                    "message_id": respuesta["message_id"],
+                    "thread_id": respuesta["thread_id"],
+                }
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            resultados.append(
+                {
+                    "ok": False,
+                    "destinatario": email,
+                    "error": str(exc),
+                }
+            )
+    return resultados
+
+
+def registrar_error_envio_notaria(id_documento: str, mensaje: str) -> None:
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": texto(mensaje)[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+def actualizar_envio_notaria_enviado(
+    *,
+    id_envio_notaria: str,
+    message_id: str,
+    thread_id: str,
+) -> None:
+    appsheet_action(
+        TABLA_ENVIOS_NOTARIA,
+        "Edit",
+        [
+            {
+                "ID_ENVIO_NOTARIA": id_envio_notaria,
+                "GMAIL_MESSAGE_ID": message_id,
+                "GMAIL_THREAD_ID": thread_id,
+                "ESTADO_ENVIO": "Enviado",
+            }
+        ],
+    )
+
+
+def actualizar_paquete_tras_envio_notaria(
+    *,
+    id_documento_raiz: str,
+    preparados: list[dict[str, Any]],
+    usuario: str,
+    datos_notaria: dict[str, str],
+    mensaje_adicional: str,
+    message_id: str,
+    thread_id: str,
+    fecha: str,
+) -> None:
+    filas: list[dict[str, Any]] = []
+    for item in preparados:
+        id_documento = item["id_documento"]
+        cambios: dict[str, Any] = {
+            "ID_DOCUMENTO": id_documento,
+            "ESTADO": ESTADO_DOCUMENTO_EN_NOTARIA,
+            "FECHA_ULTIMA_ACTUALIZACION": fecha,
+            "OBSERVACION_ACTUAL": "",
+        }
+        if id_documento == id_documento_raiz:
+            cambios.update(
+                {
+                    "ESTADO_PAQUETE_NOTARIAL": ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA,
+                    "DESTINATARIOS_NOTARIA": datos_notaria["email"],
+                    "MENSAJE_ADICIONAL_NOTARIA": mensaje_adicional,
+                    "ENVIADO_NOTARIA_POR": usuario,
+                    "FECHA_ENVIO_NOTARIA": fecha,
+                    "EMAIL_NOTARIA_MESSAGE_ID": message_id,
+                    "GMAIL_THREAD_ID_NOTARIA": thread_id,
+                    "ULTIMO_ENVIADO_POR": usuario,
+                    "FECHA_ULTIMO_ENVIO": fecha,
+                    "ACCION_SOLICITADA": "",
+                }
+            )
+        filas.append(cambios)
+    appsheet_action(TABLA_DOCUMENTOS, "Edit", filas)
+
+
+def crear_eventos_envio_notaria(
+    *,
+    preparados: list[dict[str, Any]],
+    id_documento_raiz: str,
+    usuario: str,
+    fecha: str,
+    datos_notaria: dict[str, str],
+    id_envio_notaria: str,
+    message_id: str,
+) -> dict[str, Any]:
+    evento_raiz: dict[str, Any] | None = None
+    eventos: list[dict[str, Any]] = []
+    for item in preparados:
+        es_raiz = item["id_documento"] == id_documento_raiz
+        evento = {
+            "ID_EVENTO": nuevo_id(),
+            "ID_DOCUMENTO": item["id_documento"],
+            "ID_VERSION": item["id_version"],
+            "ID_APROBACION_ACTUAL": texto(item["documento"].get("ID_APROBACION_ACTUAL")),
+            "TIPO_EVENTO": "Enviado a notaría" if es_raiz else "Incluido en envío a notaría",
+            "ESTADO_ANTERIOR": "Listo para notaría",
+            "ESTADO_NUEVO": ESTADO_DOCUMENTO_EN_NOTARIA,
+            "USUARIO": usuario,
+            "FECHA_EVENTO": fecha,
+            "COMENTARIO": (
+                f"Envío {id_envio_notaria} a {datos_notaria['nombre']} "
+                f"({datos_notaria['email']}). Gmail message ID: {message_id}."
+            ),
+        }
+        eventos.append(evento)
+        if es_raiz:
+            evento_raiz = evento
+    appsheet_action(TABLA_EVENTOS, "Add", eventos)
+    return evento_raiz or eventos[0]
+
+
+@app.route("/enviar-notaria", methods=["POST"])
+def enviar_notaria():
+    """Envía el paquete aprobado a la notaría y notifica a los firmantes."""
+    id_documento_raiz = ""
+    correo_notaria_enviado = False
+    message_id = ""
+    thread_id = ""
+    try:
+        validar_configuracion()
+        validar_token()
+        data = request.get_json(silent=True) or {}
+
+        id_documento_raiz = texto(
+            data.get("id_documento_raiz") or data.get("id_documento")
+        )
+        id_notaria = texto(data.get("id_notaria"))
+        id_propiedad_prime = texto(data.get("id_propiedad_prime"))
+        usuario = texto(data.get("usuario"))
+        firmantes_entrada = data.get("firmantes")
+        mensaje_adicional = texto(data.get("mensaje_adicional"))
+
+        if not id_documento_raiz:
+            return {"error": "Falta id_documento_raiz"}, 400
+
+        contexto = obtener_contexto_jerarquia_documental(id_documento_raiz)
+        raiz = contexto["raiz"]
+        id_raiz = texto(contexto.get("id_documento_raiz"))
+
+        # Reintento ya terminado.
+        if (
+            texto(raiz.get("ESTADO_PAQUETE_NOTARIAL")) == ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA
+            and texto(raiz.get("EMAIL_NOTARIA_MESSAGE_ID"))
+        ):
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento_raiz": id_raiz,
+                    "estado_paquete_notarial": ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA,
+                    "message_id": texto(raiz.get("EMAIL_NOTARIA_MESSAGE_ID")),
+                    "thread_id": texto(raiz.get("GMAIL_THREAD_ID_NOTARIA")),
+                    "fecha_envio_notaria": texto(raiz.get("FECHA_ENVIO_NOTARIA")),
+                }
+            )
+
+        preparados = validar_paquete_para_envio_notaria(contexto=contexto)
+
+        id_notaria = id_notaria or texto(raiz.get("ID_NOTARIA"))
+        id_propiedad_prime = id_propiedad_prime or texto(
+            raiz.get("ID_PROPIEDAD_PRIME_NOTARIA")
+        )
+        if not id_notaria:
+            raise ValueError("No se seleccionó ID_NOTARIA")
+        if not id_propiedad_prime:
+            raise ValueError("No se seleccionó ID_PROPIEDAD_PRIME_NOTARIA")
+        if texto(raiz.get("ID_NOTARIA")) and texto(raiz.get("ID_NOTARIA")) != id_notaria:
+            raise ValueError("ID_NOTARIA del webhook no coincide con Documentos")
+        if (
+            texto(raiz.get("ID_PROPIEDAD_PRIME_NOTARIA"))
+            and texto(raiz.get("ID_PROPIEDAD_PRIME_NOTARIA")) != id_propiedad_prime
+        ):
+            raise ValueError("ID_PROPIEDAD_PRIME_NOTARIA del webhook no coincide con Documentos")
+
+        notaria = buscar_notaria_por_id(id_notaria)
+        datos_notaria = normalizar_datos_notaria(notaria)
+
+        if firmantes_entrada in (None, ""):
+            firmantes_entrada = raiz.get("DESTINATARIOS_FIRMANTES_NOTARIA")
+        firmantes = normalizar_destinatarios(firmantes_entrada)
+        if not firmantes:
+            raise ValueError("No se indicaron firmantes a notificar")
+
+        usuario_registrado = texto(raiz.get("ULTIMO_ENVIADO_POR"))
+        usuario = usuario or usuario_registrado
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("El usuario que envía a notaría no es válido")
+
+        if not mensaje_adicional:
+            mensaje_adicional = texto(raiz.get("MENSAJE_ADICIONAL_NOTARIA"))
+
+        antecedentes_prime = buscar_documentos_prime_propiedad(id_propiedad_prime)
+        if not antecedentes_prime:
+            raise ValueError(
+                "La propiedad seleccionada no tiene registros en Documentos_prime"
+            )
+
+        fecha_envio = ahora_iso()
+        envio, _ = obtener_o_crear_envio_notaria(
+            raiz=raiz,
+            id_notaria=id_notaria,
+            id_propiedad_prime=id_propiedad_prime,
+            firmantes=firmantes,
+            usuario=usuario,
+            mensaje_adicional=mensaje_adicional,
+            datos_notaria=datos_notaria,
+            fecha=fecha_envio,
+        )
+        id_envio_notaria = texto(envio.get("ID_ENVIO_NOTARIA"))
+        if not id_envio_notaria:
+            raise RuntimeError("No se pudo obtener ID_ENVIO_NOTARIA")
+
+        drive_service = obtener_drive_service()
+        adjuntos, detalle_archivos = construir_adjuntos_envio_notaria(
+            drive_service=drive_service,
+            preparados=preparados,
+            antecedentes_prime=antecedentes_prime,
+            id_envio_notaria=id_envio_notaria,
+            fecha=fecha_envio,
+        )
+
+        asunto, cuerpo, cuerpo_html = construir_email_envio_notaria(
+            raiz=raiz,
+            usuario=usuario,
+            mensaje_adicional=mensaje_adicional,
+            datos_notaria=datos_notaria,
+            detalle_archivos=detalle_archivos,
+        )
+        gmail_service = obtener_gmail_service()
+        respuesta = enviar_email_con_adjuntos(
+            gmail_service=gmail_service,
+            destinatarios=[datos_notaria["email"]],
+            asunto=asunto,
+            cuerpo=cuerpo,
+            adjuntos=adjuntos,
+            reply_to=usuario,
+            cuerpo_html=cuerpo_html,
+        )
+        correo_notaria_enviado = True
+        message_id = respuesta["message_id"]
+        thread_id = respuesta.get("thread_id", "")
+
+        # Primero persistimos la evidencia principal del envío a notaría.
+        actualizar_envio_notaria_enviado(
+            id_envio_notaria=id_envio_notaria,
+            message_id=message_id,
+            thread_id=thread_id,
+        )
+        actualizar_paquete_tras_envio_notaria(
+            id_documento_raiz=id_raiz,
+            preparados=preparados,
+            usuario=usuario,
+            datos_notaria=datos_notaria,
+            mensaje_adicional=mensaje_adicional,
+            message_id=message_id,
+            thread_id=thread_id,
+            fecha=fecha_envio,
+        )
+        evento_raiz = crear_eventos_envio_notaria(
+            preparados=preparados,
+            id_documento_raiz=id_raiz,
+            usuario=usuario,
+            fecha=fecha_envio,
+            datos_notaria=datos_notaria,
+            id_envio_notaria=id_envio_notaria,
+            message_id=message_id,
+        )
+
+        # Solo después de confirmar el envío principal se notifica a los firmantes.
+        notificaciones_firmantes = enviar_notificaciones_firmantes_notaria(
+            gmail_service=gmail_service,
+            raiz=raiz,
+            firmantes=firmantes,
+            datos_notaria=datos_notaria,
+            id_envio_notaria=id_envio_notaria,
+        )
+        fallidas = [x for x in notificaciones_firmantes if not x.get("ok")]
+        advertencias: list[str] = []
+        if fallidas:
+            advertencias.append(
+                f"{len(fallidas)} notificación(es) a firmantes fallaron; "
+                "el envío a notaría sí quedó confirmado."
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento_raiz": id_raiz,
+                "id_envio_notaria": id_envio_notaria,
+                "id_notaria": id_notaria,
+                "notaria": datos_notaria["nombre"],
+                "destinatario_notaria": datos_notaria["email"],
+                "estado_paquete_notarial": ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA,
+                "message_id": message_id,
+                "thread_id": thread_id,
+                "cantidad_documentos_firma": len(preparados),
+                "cantidad_antecedentes_prime": len(
+                    [x for x in detalle_archivos if x.get("tipo") == "Antecedente"]
+                ),
+                "cantidad_adjuntos": len(adjuntos),
+                "notificaciones_firmantes": notificaciones_firmantes,
+                "evento_raiz": texto(evento_raiz.get("ID_EVENTO")),
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento_raiz and not correo_notaria_enviado:
+            registrar_error_envio_notaria(id_documento_raiz, str(exc))
+        return {"error": str(exc)}, 403
+    except (ValueError, LookupError) as exc:
+        if id_documento_raiz and not correo_notaria_enviado:
+            registrar_error_envio_notaria(id_documento_raiz, str(exc))
+        return {"error": str(exc)}, 400
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento_raiz and not correo_notaria_enviado:
+            registrar_error_envio_notaria(id_documento_raiz, str(exc))
+        return {
+            "error": str(exc),
+            "correo_notaria_enviado": correo_notaria_enviado,
+            "message_id": message_id,
+            "thread_id": thread_id,
+        }, 500
 
 
 if __name__ == "__main__":
