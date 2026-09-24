@@ -14688,6 +14688,518 @@ def enviar_notaria():
         }, 500
 
 
+# -----------------------------------------------------------------------------
+# Flujo Notarial - devolución desde notaría + notificaciones
+# -----------------------------------------------------------------------------
+
+
+def buscar_registro_prime_origen_notaria(id_documento: str) -> dict[str, Any] | None:
+    selector = (
+        f"FILTER({TABLA_DOCUMENTOS_PRIME}, AND("
+        f"[ID_DOCUMENTO_ORIGEN] = {literal_appsheet(id_documento)}, "
+        f"[ORIGEN_DOCUMENTO] = {literal_appsheet('Notaría')}))"
+    )
+    filas = appsheet_find(TABLA_DOCUMENTOS_PRIME, selector)
+    if not filas:
+        return None
+    return filas[0]
+
+
+def crear_registro_prime_devolucion_notaria(
+    *,
+    documento: dict[str, Any],
+    id_propiedad_prime: str,
+    archivo_devuelto: str,
+    fecha: str,
+) -> dict[str, Any]:
+    """Publica una sola vez el archivo devuelto por notaría en Documentos_Prime."""
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    existente = buscar_registro_prime_origen_notaria(id_documento)
+    if existente is not None:
+        return existente
+
+    id_documento_prime = nuevo_id()
+    titulo = texto(documento.get("TITULO")) or id_documento
+    tipo_documento = texto(documento.get("TIPO_DOCUMENTO")) or "Documento"
+
+    fila = {
+        "id_documento": id_documento_prime,
+        "id_Propiedades": id_propiedad_prime,
+        "Tipo de Documento": tipo_documento,
+        "Descripcion": f"Documento devuelto por notaría - {titulo}",
+        "file1": archivo_devuelto,
+        "Fecha_creacion": fecha,
+        "ID_DOCUMENTO_ORIGEN": id_documento,
+        "ORIGEN_DOCUMENTO": "Notaría",
+    }
+    appsheet_action(TABLA_DOCUMENTOS_PRIME, "Add", [fila])
+    return fila
+
+
+def actualizar_documento_tras_devolucion_notaria(
+    *,
+    id_documento: str,
+    id_documento_prime: str,
+    usuario: str,
+    fecha: str,
+) -> None:
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento,
+                "ID_DOCUMENTO_PRIME_GENERADO": id_documento_prime,
+                "RECIBIDO_NOTARIA_POR": usuario,
+                "FECHA_RECEPCION_NOTARIA": fecha,
+                "ULTIMO_ENVIADO_POR": usuario,
+                "FECHA_ULTIMO_ENVIO": fecha,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
+    )
+
+
+def crear_evento_devolucion_notaria(
+    *,
+    documento: dict[str, Any],
+    id_documento_prime: str,
+    usuario: str,
+    fecha: str,
+) -> dict[str, Any]:
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    comentario_prefijo = f"Documento devuelto por notaría; Prime={id_documento_prime}."
+    existentes = [
+        evento
+        for evento in buscar_eventos_documento(id_documento)
+        if texto(evento.get("TIPO_EVENTO")) == "Respuesta de firma externa"
+        and texto(evento.get("COMENTARIO")).startswith(comentario_prefijo)
+    ]
+    if existentes:
+        existentes.sort(
+            key=lambda e: (
+                parsear_fecha_appsheet(e.get("FECHA_EVENTO")),
+                texto(e.get("ID_EVENTO")),
+            )
+        )
+        return existentes[-1]
+
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": id_documento,
+        "ID_VERSION": texto(documento.get("ID_VERSION_ACTUAL")),
+        "ID_APROBACION_ACTUAL": texto(documento.get("ID_APROBACION_ACTUAL")),
+        "TIPO_EVENTO": "Respuesta de firma externa",
+        "ESTADO_ANTERIOR": ESTADO_DOCUMENTO_EN_NOTARIA,
+        "ESTADO_NUEVO": ESTADO_DOCUMENTO_EN_NOTARIA,
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            comentario_prefijo
+            + " El archivo recibido quedó registrado en el flujo documental "
+            "y publicado en Documentos_Prime."
+        ),
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento
+
+
+def notificar_responsable_documento_devuelto_notaria(
+    *,
+    documento: dict[str, Any],
+    evento: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Notificación interna por cada documento recibido desde notaría."""
+    responsable = obtener_responsable_firmas_documento_notarial(documento)
+    titulo = texto(documento.get("TITULO")) or texto(documento.get("ID_DOCUMENTO"))
+    return notificar_destinatarios_internos(
+        documento=documento,
+        evento=evento,
+        destinatarios=[
+            {
+                "aprobador": responsable,
+                "tipo_notificacion": "Informativa",
+                "movimiento": "Documento recibido desde notaría",
+                "comentario_principal": (
+                    f"Se recibió desde notaría el documento {titulo}. "
+                    "El archivo quedó registrado en el flujo documental y en Documentos_Prime."
+                ),
+                "link_documento": "",
+            }
+        ],
+    )
+
+
+def paquete_notarial_devuelto_completo(id_documento_raiz: str) -> tuple[bool, list[dict[str, Any]]]:
+    integrantes = buscar_integrantes_paquete_notarial(id_documento_raiz)
+    if not integrantes:
+        raise LookupError("El paquete Notarial no contiene documentos asociados")
+    completo = all(
+        bool(texto(fila.get("ID_DOCUMENTO_PRIME_GENERADO")))
+        for fila in integrantes
+    )
+    return completo, integrantes
+
+
+def buscar_evento_cierre_retorno_notaria(id_documento_raiz: str) -> dict[str, Any] | None:
+    prefijo = "Paquete notarial completo: todos los documentos fueron recibidos desde notaría."
+    candidatos = [
+        evento
+        for evento in buscar_eventos_documento(id_documento_raiz)
+        if texto(evento.get("TIPO_EVENTO")) == "Proceso terminado"
+        and texto(evento.get("COMENTARIO")).startswith(prefijo)
+    ]
+    if not candidatos:
+        return None
+    candidatos.sort(
+        key=lambda e: (
+            parsear_fecha_appsheet(e.get("FECHA_EVENTO")),
+            texto(e.get("ID_EVENTO")),
+        )
+    )
+    return candidatos[-1]
+
+
+def crear_evento_cierre_retorno_notaria(
+    *,
+    raiz: dict[str, Any],
+    usuario: str,
+    fecha: str,
+) -> tuple[dict[str, Any], bool]:
+    existente = buscar_evento_cierre_retorno_notaria(texto(raiz.get("ID_DOCUMENTO")))
+    if existente is not None:
+        return existente, False
+
+    evento = {
+        "ID_EVENTO": nuevo_id(),
+        "ID_DOCUMENTO": texto(raiz.get("ID_DOCUMENTO")),
+        "ID_VERSION": texto(raiz.get("ID_VERSION_ACTUAL")),
+        "ID_APROBACION_ACTUAL": texto(raiz.get("ID_APROBACION_ACTUAL")),
+        "TIPO_EVENTO": "Proceso terminado",
+        "ESTADO_ANTERIOR": ESTADO_DOCUMENTO_EN_NOTARIA,
+        "ESTADO_NUEVO": "Proceso terminado",
+        "USUARIO": usuario,
+        "FECHA_EVENTO": fecha,
+        "COMENTARIO": (
+            "Paquete notarial completo: todos los documentos fueron recibidos desde notaría. "
+            "Las devoluciones quedaron incorporadas en Documentos_Prime."
+        ),
+    }
+    appsheet_action(TABLA_EVENTOS, "Add", [evento])
+    return evento, True
+
+
+def construir_email_fin_paquete_notarial(
+    *,
+    raiz: dict[str, Any],
+    datos_notaria: dict[str, str],
+) -> tuple[str, str, str]:
+    titulo = texto(raiz.get("TITULO")) or texto(raiz.get("ID_DOCUMENTO"))
+    asunto = f"Proceso notarial concluido — {titulo}"
+    cuerpo = (
+        "Estimado/a:\n\n"
+        "El proceso notarial de la documentación ha concluido. "
+        "Todos los documentos asociados al paquete fueron recibidos de vuelta desde la notaría "
+        "y registrados correctamente en el sistema.\n\n"
+        f"Notaría: {datos_notaria['nombre']}\n"
+        f"Documento principal: {titulo}\n\n"
+        "No se adjuntan documentos a esta notificación."
+    )
+    cuerpo_html = f"""
+    <html><body style="font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.6;">
+      <h2>Proceso notarial concluido</h2>
+      <p>Estimado/a:</p>
+      <p>El proceso notarial de la documentación ha concluido. Todos los documentos asociados al paquete fueron recibidos de vuelta desde la notaría y registrados correctamente en el sistema.</p>
+      <table style="border-collapse:collapse;">
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Documento principal</td><td>{html.escape(titulo)}</td></tr>
+        <tr><td style="padding:6px 12px 6px 0;font-weight:bold;">Notaría</td><td>{html.escape(datos_notaria['nombre'])}</td></tr>
+      </table>
+      <p><strong>No se adjuntan documentos a esta notificación.</strong></p>
+    </body></html>
+    """
+    return asunto, cuerpo, cuerpo_html
+
+
+def enviar_notificaciones_fin_paquete_notarial(
+    *,
+    gmail_service: Any,
+    raiz: dict[str, Any],
+    firmantes: list[str],
+    datos_notaria: dict[str, str],
+    id_evento_cierre: str,
+) -> list[dict[str, Any]]:
+    """Correo externo individual a firmantes, una vez completo el retorno del paquete."""
+    asunto, cuerpo, cuerpo_html = construir_email_fin_paquete_notarial(
+        raiz=raiz,
+        datos_notaria=datos_notaria,
+    )
+    resultados: list[dict[str, Any]] = []
+    for email in firmantes:
+        try:
+            rfc_message_id = construir_rfc_message_id_notificacion(
+                f"fin-notaria-{id_evento_cierre}-{email}"
+            )
+            respuesta = enviar_email_notificacion(
+                gmail_service=gmail_service,
+                destinatario=email,
+                asunto=asunto,
+                cuerpo_texto=cuerpo,
+                cuerpo_html=cuerpo_html,
+                rfc_message_id=rfc_message_id,
+            )
+            resultados.append(
+                {
+                    "ok": True,
+                    "destinatario": email,
+                    "message_id": respuesta["message_id"],
+                    "thread_id": respuesta["thread_id"],
+                }
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            resultados.append(
+                {
+                    "ok": False,
+                    "destinatario": email,
+                    "error": str(exc),
+                }
+            )
+    return resultados
+
+
+def registrar_error_devolucion_notaria(id_documento: str, mensaje: str) -> None:
+    try:
+        appsheet_action(
+            TABLA_DOCUMENTOS,
+            "Edit",
+            [
+                {
+                    "ID_DOCUMENTO": id_documento,
+                    "ACCION_SOLICITADA": "",
+                    "OBSERVACION_ACTUAL": texto(mensaje)[:1000],
+                    "FECHA_ULTIMA_ACTUALIZACION": ahora_iso(),
+                }
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+@app.route("/registrar-devolucion-notaria", methods=["POST"])
+def registrar_devolucion_notaria():
+    """
+    Registra un documento devuelto por notaría.
+
+    - Publica el archivo en Documentos_Prime.
+    - Notifica internamente al Responsable de firmas por cada devolución.
+    - Cuando todo el paquete está devuelto, notifica una sola vez a los firmantes.
+    """
+    id_documento = ""
+    try:
+        validar_configuracion()
+        validar_token()
+        data = request.get_json(silent=True) or {}
+
+        id_documento = texto(data.get("id_documento"))
+        id_documento_raiz = texto(data.get("id_documento_raiz"))
+        id_propiedad_prime = texto(data.get("id_propiedad_prime"))
+        archivo_devuelto = texto(data.get("archivo_devuelto"))
+        usuario = texto(data.get("usuario"))
+
+        if not id_documento:
+            return {"error": "Falta id_documento"}, 400
+
+        documento = buscar_documento(id_documento)
+        id_raiz_documento = texto(documento.get("ID_DOCUMENTO_RAIZ_NOTARIAL"))
+        id_documento_raiz = id_documento_raiz or id_raiz_documento
+        if not id_documento_raiz:
+            raise ValueError("El documento no tiene ID_DOCUMENTO_RAIZ_NOTARIAL")
+        if id_raiz_documento and id_raiz_documento != id_documento_raiz:
+            raise ValueError("id_documento_raiz no coincide con el documento")
+
+        raiz = buscar_documento(id_documento_raiz)
+        if texto(raiz.get("TIPO_FIRMA")) != "Notarial":
+            raise ValueError("El paquete no corresponde a Firma Notarial")
+        if texto(raiz.get("ESTADO_PAQUETE_NOTARIAL")) != ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA:
+            raise ValueError(
+                "Solo se puede registrar devolución cuando el paquete está En notaría. "
+                f"Estado actual: {texto(raiz.get('ESTADO_PAQUETE_NOTARIAL'))!r}"
+            )
+        if texto(documento.get("ESTADO")) != ESTADO_DOCUMENTO_EN_NOTARIA:
+            raise ValueError(
+                "Solo se puede registrar devolución de un documento En notaría. "
+                f"Estado actual: {texto(documento.get('ESTADO'))!r}"
+            )
+
+        id_propiedad_registrada = texto(raiz.get("ID_PROPIEDAD_PRIME_NOTARIA"))
+        id_propiedad_prime = id_propiedad_prime or id_propiedad_registrada
+        if not id_propiedad_prime:
+            raise ValueError("No existe ID_PROPIEDAD_PRIME_NOTARIA en la raíz")
+        if id_propiedad_registrada and id_propiedad_prime != id_propiedad_registrada:
+            raise ValueError("id_propiedad_prime no coincide con el paquete")
+
+        archivo_devuelto = archivo_devuelto or texto(
+            documento.get("ARCHIVO_DEVUELTO_NOTARIA_TEMP")
+        )
+        if not archivo_devuelto:
+            raise ValueError("No se indicó ARCHIVO_DEVUELTO_NOTARIA_TEMP")
+
+        usuario = usuario or texto(documento.get("RECIBIDO_NOTARIA_POR"))
+        if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
+            raise ValueError("El usuario que registra la devolución no es válido")
+
+        # Idempotencia: si ya existe vínculo a Prime, no volvemos a crear el registro.
+        id_prime_existente = texto(documento.get("ID_DOCUMENTO_PRIME_GENERADO"))
+        if id_prime_existente:
+            completo, _ = paquete_notarial_devuelto_completo(id_documento_raiz)
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "id_documento_raiz": id_documento_raiz,
+                    "id_documento_prime": id_prime_existente,
+                    "paquete_completo": completo,
+                }
+            )
+
+        fecha = ahora_iso()
+        registro_prime = crear_registro_prime_devolucion_notaria(
+            documento=documento,
+            id_propiedad_prime=id_propiedad_prime,
+            archivo_devuelto=archivo_devuelto,
+            fecha=fecha,
+        )
+        id_documento_prime = primer_valor(
+            registro_prime,
+            "id_documento",
+            "ID_DOCUMENTO",
+        )
+        if not id_documento_prime:
+            raise RuntimeError("Documentos_Prime no devolvió id_documento")
+
+        actualizar_documento_tras_devolucion_notaria(
+            id_documento=id_documento,
+            id_documento_prime=id_documento_prime,
+            usuario=usuario,
+            fecha=fecha,
+        )
+
+        documento_actualizado = buscar_documento(id_documento)
+        evento_devolucion = crear_evento_devolucion_notaria(
+            documento=documento_actualizado,
+            id_documento_prime=id_documento_prime,
+            usuario=usuario,
+            fecha=fecha,
+        )
+
+        advertencias: list[str] = []
+        notificaciones_internas: list[dict[str, Any]] = []
+        try:
+            notificaciones_internas = notificar_responsable_documento_devuelto_notaria(
+                documento=documento_actualizado,
+                evento=evento_devolucion,
+            )
+            fallidas = [x for x in notificaciones_internas if not x.get("ok")]
+            if fallidas:
+                advertencias.append(
+                    f"{len(fallidas)} notificación(es) internas quedaron omitidas o con error."
+                )
+        except Exception as exc_notificacion:
+            traceback.print_exc()
+            advertencias.append(
+                "La devolución quedó registrada, pero falló la notificación al Responsable de firmas: "
+                + str(exc_notificacion)
+            )
+
+        paquete_completo, integrantes = paquete_notarial_devuelto_completo(
+            id_documento_raiz
+        )
+        notificaciones_firmantes: list[dict[str, Any]] = []
+        evento_cierre_id = ""
+
+        if paquete_completo:
+            raiz_actual = buscar_documento(id_documento_raiz)
+            evento_cierre, creado = crear_evento_cierre_retorno_notaria(
+                raiz=raiz_actual,
+                usuario=usuario,
+                fecha=fecha,
+            )
+            evento_cierre_id = texto(evento_cierre.get("ID_EVENTO"))
+
+            # Solo el primer cierre dispara correo externo a los firmantes.
+            if creado:
+                firmantes = normalizar_destinatarios(
+                    raiz_actual.get("DESTINATARIOS_FIRMANTES_NOTARIA")
+                )
+                if firmantes:
+                    try:
+                        id_notaria = texto(raiz_actual.get("ID_NOTARIA"))
+                        if not id_notaria:
+                            raise ValueError("La raíz no tiene ID_NOTARIA")
+                        datos_notaria = normalizar_datos_notaria(
+                            buscar_notaria_por_id(id_notaria)
+                        )
+                        gmail_service = obtener_gmail_service()
+                        notificaciones_firmantes = enviar_notificaciones_fin_paquete_notarial(
+                            gmail_service=gmail_service,
+                            raiz=raiz_actual,
+                            firmantes=firmantes,
+                            datos_notaria=datos_notaria,
+                            id_evento_cierre=evento_cierre_id,
+                        )
+                        fallidas = [
+                            x for x in notificaciones_firmantes if not x.get("ok")
+                        ]
+                        if fallidas:
+                            advertencias.append(
+                                f"{len(fallidas)} notificación(es) finales a firmantes fallaron."
+                            )
+                    except Exception as exc_firmantes:
+                        traceback.print_exc()
+                        advertencias.append(
+                            "El paquete quedó completo, pero falló la notificación final a firmantes: "
+                            + str(exc_firmantes)
+                        )
+                else:
+                    advertencias.append(
+                        "El paquete quedó completo, pero no hay DESTINATARIOS_FIRMANTES_NOTARIA."
+                    )
+
+        return jsonify(
+            {
+                "ok": True,
+                "ya_procesado": False,
+                "id_documento": id_documento,
+                "id_documento_raiz": id_documento_raiz,
+                "id_documento_prime": id_documento_prime,
+                "id_evento_devolucion": texto(evento_devolucion.get("ID_EVENTO")),
+                "paquete_completo": paquete_completo,
+                "cantidad_documentos_paquete": len(integrantes),
+                "id_evento_cierre": evento_cierre_id,
+                "notificaciones_internas": notificaciones_internas,
+                "notificaciones_firmantes": notificaciones_firmantes,
+                "advertencias": advertencias,
+            }
+        )
+
+    except PermissionError as exc:
+        if id_documento:
+            registrar_error_devolucion_notaria(id_documento, str(exc))
+        return {"error": str(exc)}, 403
+    except (ValueError, LookupError) as exc:
+        if id_documento:
+            registrar_error_devolucion_notaria(id_documento, str(exc))
+        return {"error": str(exc)}, 400
+    except Exception as exc:
+        traceback.print_exc()
+        if id_documento:
+            registrar_error_devolucion_notaria(id_documento, str(exc))
+        return {"error": str(exc)}, 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
