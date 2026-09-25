@@ -14042,6 +14042,50 @@ def asegurar_detalle_envio_notaria(
     )
 
 
+def eliminar_detalle_envio_notaria_omitido(
+    *,
+    id_envio_notaria: str,
+    tipo_adjunto: str,
+    nombre_archivo: str,
+    id_documento: str = "",
+    id_documento_prime: str = "",
+) -> None:
+    """Elimina del detalle un archivo que finalmente NO será enviado.
+
+    Es especialmente útil para limpiar detalles creados por versiones anteriores
+    del backend antes de incorporar la exclusión automática por tamaño.
+    """
+    condiciones = [
+        f"[ID_ENVIO_NOTARIA] = {literal_appsheet(id_envio_notaria)}",
+        f"[TIPO_ADJUNTO] = {literal_appsheet(tipo_adjunto)}",
+        f"[NOMBRE_ARCHIVO] = {literal_appsheet(nombre_archivo)}",
+    ]
+    if id_documento:
+        condiciones.append(f"[ID_DOCUMENTO] = {literal_appsheet(id_documento)}")
+    if id_documento_prime:
+        condiciones.append(
+            f"[ID_DOCUMENTO_PRIME] = {literal_appsheet(id_documento_prime)}"
+        )
+    selector = (
+        f"FILTER({TABLA_ENVIOS_NOTARIA_DETALLE}, AND("
+        + ", ".join(condiciones)
+        + "))"
+    )
+    filas = appsheet_find(TABLA_ENVIOS_NOTARIA_DETALLE, selector)
+    claves = [
+        texto(fila.get("ID_DETALLE_ENVIO_NOTARIA"))
+        for fila in filas
+        if texto(fila.get("ID_DETALLE_ENVIO_NOTARIA"))
+    ]
+    if not claves:
+        return
+    appsheet_action(
+        TABLA_ENVIOS_NOTARIA_DETALLE,
+        "Delete",
+        [{"ID_DETALLE_ENVIO_NOTARIA": clave} for clave in claves],
+    )
+
+
 def validar_paquete_para_envio_notaria(
     *,
     contexto: dict[str, Any],
@@ -14164,10 +14208,54 @@ def construir_adjuntos_envio_notaria(
     antecedentes_prime: list[dict[str, Any]],
     id_envio_notaria: str,
     fecha: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Construye DOCX aprobados + todos los antecedentes permitidos de Documentos_prime."""
+    limite_bytes: int = MAX_ADJUNTOS_NOTARIA_BYTES,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Construye los adjuntos enviables y separa los archivos demasiado grandes.
+
+    Los archivos cuyo tamaño individual supera ``limite_bytes`` NO se adjuntan al
+    correo de notaría. Se devuelven en ``archivos_omitidos`` para dejar trazabilidad
+    y notificar al encargado del proceso que debe remitirlos por otro medio.
+    """
+    if limite_bytes <= 0:
+        raise ValueError("MAX_ADJUNTOS_NOTARIA_MB debe ser mayor que cero")
+
     adjuntos: list[dict[str, Any]] = []
     detalle_archivos: list[dict[str, Any]] = []
+    archivos_omitidos: list[dict[str, Any]] = []
+
+    def registrar_omitido(
+        *,
+        tipo: str,
+        nombre: str,
+        contenido: bytes,
+        id_documento: str = "",
+        id_version: str = "",
+        id_documento_prime: str = "",
+        titulo: str = "",
+        descripcion: str = "",
+    ) -> None:
+        tamano = len(contenido)
+        archivos_omitidos.append(
+            {
+                "tipo": tipo,
+                "nombre": nombre,
+                "tamano_bytes": tamano,
+                "tamano_mb": round(tamano / (1024 * 1024), 2),
+                "id_documento": id_documento,
+                "id_version": id_version,
+                "id_documento_prime": id_documento_prime,
+                "titulo": titulo,
+                "descripcion": descripcion,
+                "motivo": (
+                    f"Supera el máximo seguro de "
+                    f"{limite_bytes / (1024 * 1024):.2f} MB por archivo."
+                ),
+            }
+        )
 
     # 1) Documentos aprobados para firma: siempre editables DOCX.
     for item in preparados:
@@ -14179,6 +14267,27 @@ def construir_adjuntos_envio_notaria(
             google_doc_id=google_doc_id,
             nombre_base=nombre_base,
         )
+
+        if len(docx_bytes) > limite_bytes:
+            registrar_omitido(
+                tipo="Documento para firma",
+                nombre=docx_nombre,
+                contenido=docx_bytes,
+                id_documento=item["id_documento"],
+                id_version=item["id_version"],
+                titulo=item["titulo"],
+            )
+            try:
+                eliminar_detalle_envio_notaria_omitido(
+                    id_envio_notaria=id_envio_notaria,
+                    tipo_adjunto="Documento para firma",
+                    nombre_archivo=docx_nombre,
+                    id_documento=item["id_documento"],
+                )
+            except Exception:
+                traceback.print_exc()
+            continue
+
         respaldo = guardar_docx_enviado_notaria(
             drive_service=drive_service,
             google_doc_id=google_doc_id,
@@ -14224,6 +14333,28 @@ def construir_adjuntos_envio_notaria(
             table_name=TABLA_DOCUMENTOS_PRIME,
             valor_file=valor_file,
         )
+        id_documento_prime = primer_valor(fila, "id_documento", "ID_DOCUMENTO")
+        descripcion = primer_valor(fila, "Descripcion", "DESCRIPCION")
+
+        if len(contenido) > limite_bytes:
+            registrar_omitido(
+                tipo="Antecedente",
+                nombre=nombre,
+                contenido=contenido,
+                id_documento_prime=id_documento_prime,
+                descripcion=descripcion,
+            )
+            try:
+                eliminar_detalle_envio_notaria_omitido(
+                    id_envio_notaria=id_envio_notaria,
+                    tipo_adjunto="Antecedente",
+                    nombre_archivo=nombre,
+                    id_documento_prime=id_documento_prime,
+                )
+            except Exception:
+                traceback.print_exc()
+            continue
+
         adjuntos.append(
             {
                 "contenido": contenido,
@@ -14232,13 +14363,12 @@ def construir_adjuntos_envio_notaria(
                 "subtype": subtype,
             }
         )
-        id_documento_prime = primer_valor(fila, "id_documento", "ID_DOCUMENTO")
         detalle_archivos.append(
             {
                 "tipo": "Antecedente",
                 "id_documento_prime": id_documento_prime,
                 "nombre": nombre,
-                "descripcion": primer_valor(fila, "Descripcion", "DESCRIPCION"),
+                "descripcion": descripcion,
             }
         )
         asegurar_detalle_envio_notaria(
@@ -14250,8 +14380,16 @@ def construir_adjuntos_envio_notaria(
         )
 
     if not adjuntos:
+        if archivos_omitidos:
+            nombres = ", ".join(x["nombre"] for x in archivos_omitidos)
+            raise ValueError(
+                "Todos los archivos del paquete superan el límite individual de "
+                f"{limite_bytes / (1024 * 1024):.2f} MB y fueron excluidos: {nombres}. "
+                "No existe ningún archivo enviable a la notaría."
+            )
         raise ValueError("No se reunieron archivos para enviar a notaría")
-    return adjuntos, detalle_archivos
+
+    return adjuntos, detalle_archivos, archivos_omitidos
 
 
 def dividir_adjuntos_notaria(
@@ -14745,6 +14883,139 @@ def crear_eventos_envio_notaria(
     return evento_raiz or (eventos[0] if eventos else {})
 
 
+def notificar_encargado_archivos_omitidos_notaria(
+    *,
+    gmail_service: Any,
+    raiz: dict[str, Any],
+    usuario: str,
+    datos_notaria: dict[str, str],
+    id_envio_notaria: str,
+    archivos_omitidos: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Avisa al encargado del proceso sobre archivos excluidos por tamaño.
+
+    Prioridad del destinatario:
+    1) Responsable de firmas de la versión vigente del documento raíz.
+    2) ENCARGADO_ACTUAL_EMAIL del documento raíz.
+    3) Usuario que ejecutó el envío a notaría.
+
+    Esta notificación es informativa y no bloquea el envío de los demás archivos.
+    """
+    if not archivos_omitidos:
+        return {"ok": True, "omitida": True, "motivo": "Sin archivos omitidos"}
+
+    destinatario = ""
+    nombre_destinatario = ""
+    fuente_destinatario = ""
+
+    try:
+        responsable = obtener_responsable_firmas_documento_notarial(raiz)
+        email_responsable = obtener_email_notificacion(responsable)
+        if email_responsable and _EMAIL_RE.fullmatch(email_responsable):
+            destinatario = email_responsable
+            nombre_destinatario = texto(responsable.get("NOMBRE")) or "Responsable de firmas"
+            fuente_destinatario = "Responsable de firmas"
+    except Exception:
+        traceback.print_exc()
+
+    if not destinatario:
+        email_encargado = texto(raiz.get("ENCARGADO_ACTUAL_EMAIL")).strip().lower()
+        if email_encargado and _EMAIL_RE.fullmatch(email_encargado):
+            destinatario = email_encargado
+            nombre_destinatario = texto(raiz.get("ENCARGADO_ACTUAL_NOMBRE")) or "Encargado del proceso"
+            fuente_destinatario = "ENCARGADO_ACTUAL_EMAIL"
+
+    if not destinatario:
+        email_usuario = texto(usuario).strip().lower()
+        if email_usuario and _EMAIL_RE.fullmatch(email_usuario):
+            destinatario = email_usuario
+            nombre_destinatario = "Encargado del proceso"
+            fuente_destinatario = "Usuario que ejecutó el envío"
+
+    if not destinatario:
+        return {
+            "ok": False,
+            "omitida": True,
+            "error": "No se encontró un correo válido para notificar al encargado del proceso.",
+        }
+
+    titulo = texto(raiz.get("TITULO")) or texto(raiz.get("ID_DOCUMENTO"))
+    cantidad = len(archivos_omitidos)
+    limite = f"{MAX_ADJUNTOS_NOTARIA_MB:.2f} MB"
+
+    lineas = []
+    filas_html = []
+    for archivo in archivos_omitidos:
+        nombre = texto(archivo.get("nombre"))
+        tamano_mb = float(archivo.get("tamano_mb") or 0)
+        lineas.append(f"- {nombre} ({tamano_mb:.2f} MB)")
+        filas_html.append(
+            "<li><strong>" + html.escape(nombre) + "</strong> "
+            + f"({tamano_mb:.2f} MB)</li>"
+        )
+
+    if cantidad == 1:
+        asunto = f"Archivo no enviado a notaría por tamaño — {titulo}"
+        frase_exclusion = (
+            f"se excluyó 1 archivo porque supera el límite seguro de {limite} por archivo."
+        )
+        instruccion = (
+            "El archivo indicado no fue enviado a la notaría y debe ser remitido "
+            "a través de otro medio."
+        )
+    else:
+        asunto = f"Archivos no enviados a notaría por tamaño — {titulo}"
+        frase_exclusion = (
+            f"se excluyeron {cantidad} archivos porque superan el límite seguro "
+            f"de {limite} por archivo."
+        )
+        instruccion = (
+            "Los archivos indicados no fueron enviados a la notaría y deben ser "
+            "remitidos a través de otro medio."
+        )
+
+    cuerpo_texto = (
+        f"Estimado/a {nombre_destinatario}:\n\n"
+        f"Durante el envío del paquete '{titulo}' a {datos_notaria['nombre']}, "
+        f"{frase_exclusion}\n\n"
+        + "\n".join(lineas)
+        + f"\n\n{instruccion}"
+        + "\n\nLos demás archivos que cumplen el límite continúan su envío normal."
+    )
+
+    cuerpo_html = f"""
+    <html><body style="font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.6;">
+      <h2>{html.escape(asunto)}</h2>
+      <p>Estimado/a {html.escape(nombre_destinatario)}:</p>
+      <p>Durante el envío del paquete <strong>{html.escape(titulo)}</strong> a
+      <strong>{html.escape(datos_notaria['nombre'])}</strong>, {html.escape(frase_exclusion)}</p>
+      <ul>{''.join(filas_html)}</ul>
+      <p><strong>{html.escape(instruccion)}</strong></p>
+      <p>Los demás archivos que cumplen el límite continúan su envío normal.</p>
+    </body></html>
+    """
+
+    respuesta = enviar_email_notificacion(
+        gmail_service=gmail_service,
+        destinatario=destinatario,
+        asunto=asunto,
+        cuerpo_texto=cuerpo_texto,
+        cuerpo_html=cuerpo_html,
+        rfc_message_id=construir_rfc_message_id_notificacion(
+            f"notaria-omitidos-{id_envio_notaria}-{nuevo_id()}"
+        ),
+    )
+    return {
+        "ok": True,
+        "omitida": False,
+        "destinatario": destinatario,
+        "fuente_destinatario": fuente_destinatario,
+        "cantidad_archivos": cantidad,
+        "message_id": respuesta.get("message_id", ""),
+        "thread_id": respuesta.get("thread_id", ""),
+    }
+
+
 @app.route("/enviar-notaria", methods=["POST"])
 @app.route("/reenviar-notaria", methods=["POST"])
 def enviar_notaria():
@@ -14885,16 +15156,18 @@ def enviar_notaria():
             envio["ESTADO_ENVIO"] = "Preparando"
 
         drive_service = obtener_drive_service()
-        adjuntos, detalle_archivos = construir_adjuntos_envio_notaria(
+        adjuntos, detalle_archivos, archivos_omitidos = construir_adjuntos_envio_notaria(
             drive_service=drive_service,
             preparados=preparados,
             antecedentes_prime=antecedentes_prime,
             id_envio_notaria=id_envio_notaria,
             fecha=fecha_envio,
+            limite_bytes=MAX_ADJUNTOS_NOTARIA_BYTES,
         )
 
         lotes = dividir_adjuntos_notaria(adjuntos)
         total_bytes = sum(len(a.get("contenido") or b"") for a in adjuntos)
+        total_omitidos_bytes = sum(int(x.get("tamano_bytes") or 0) for x in archivos_omitidos)
         nombres_adjuntos = [texto(a.get("nombre")) for a in adjuntos]
         resumen_partes = [
             {
@@ -14924,6 +15197,16 @@ def enviar_notaria():
             cantidad_adjuntos=len(adjuntos),
             total_adjuntos_bytes=total_bytes,
             total_adjuntos_mb=round(total_bytes / (1024 * 1024), 2),
+            cantidad_adjuntos_omitidos=len(archivos_omitidos),
+            total_omitidos_mb=round(total_omitidos_bytes / (1024 * 1024), 2),
+            archivos_omitidos=[
+                {
+                    "nombre": texto(x.get("nombre")),
+                    "tamano_mb": x.get("tamano_mb"),
+                    "tipo": texto(x.get("tipo")),
+                }
+                for x in archivos_omitidos
+            ],
             limite_por_correo_mb=MAX_ADJUNTOS_NOTARIA_MB,
             cantidad_partes=len(lotes),
             partes_ya_enviadas=partes_ya_enviadas,
@@ -15171,6 +15454,58 @@ def enviar_notaria():
                 "eventos de trazabilidad: " + str(exc_evento)
             )
 
+        # Si algún archivo individual supera el límite, el envío continúa sin él
+        # y se avisa al encargado del proceso para que lo remita por otro medio.
+        notificacion_archivos_omitidos: dict[str, Any] = {}
+        if archivos_omitidos:
+            resumen_omitidos = ", ".join(
+                f"{texto(x.get('nombre'))} ({float(x.get('tamano_mb') or 0):.2f} MB)"
+                for x in archivos_omitidos
+            )
+            advertencias.append(
+                f"Se omitieron {len(archivos_omitidos)} archivo(s) por superar "
+                f"{MAX_ADJUNTOS_NOTARIA_MB:.2f} MB: {resumen_omitidos}. "
+                "Deben enviarse a la notaría por otro medio."
+            )
+            try:
+                notificacion_archivos_omitidos = notificar_encargado_archivos_omitidos_notaria(
+                    gmail_service=gmail_service,
+                    raiz=raiz,
+                    usuario=usuario,
+                    datos_notaria=datos_notaria,
+                    id_envio_notaria=id_envio_notaria,
+                    archivos_omitidos=archivos_omitidos,
+                )
+                if not notificacion_archivos_omitidos.get("ok"):
+                    advertencias.append(
+                        "No fue posible notificar al encargado sobre los archivos omitidos: "
+                        + texto(notificacion_archivos_omitidos.get("error"))
+                    )
+                log_envio_notaria(
+                    "notificacion_archivos_omitidos",
+                    id_documento_raiz=id_raiz,
+                    id_envio_notaria=id_envio_notaria,
+                    cantidad_archivos=len(archivos_omitidos),
+                    archivos=[
+                        {
+                            "nombre": texto(x.get("nombre")),
+                            "tamano_mb": x.get("tamano_mb"),
+                        }
+                        for x in archivos_omitidos
+                    ],
+                    resultado=notificacion_archivos_omitidos,
+                )
+            except Exception as exc_omitidos:
+                traceback.print_exc()
+                notificacion_archivos_omitidos = {
+                    "ok": False,
+                    "error": str(exc_omitidos),
+                }
+                advertencias.append(
+                    "El envío a notaría continuó, pero falló la notificación al encargado "
+                    f"sobre los archivos omitidos: {exc_omitidos}"
+                )
+
         # El reenvío explícito NO vuelve a notificar a los firmantes.
         notificaciones_firmantes: list[dict[str, Any]] = []
         if paquete_actualizado and not reenvio_explicito:
@@ -15235,7 +15570,19 @@ def enviar_notaria():
                 ),
                 "cantidad_adjuntos": len(adjuntos),
                 "total_adjuntos_mb": round(total_bytes / (1024 * 1024), 2),
+                "cantidad_adjuntos_omitidos": len(archivos_omitidos),
+                "total_omitidos_mb": round(total_omitidos_bytes / (1024 * 1024), 2),
+                "archivos_omitidos": [
+                    {
+                        "nombre": texto(x.get("nombre")),
+                        "tamano_mb": x.get("tamano_mb"),
+                        "tipo": texto(x.get("tipo")),
+                        "motivo": texto(x.get("motivo")),
+                    }
+                    for x in archivos_omitidos
+                ],
                 "limite_por_correo_mb": MAX_ADJUNTOS_NOTARIA_MB,
+                "notificacion_archivos_omitidos": notificacion_archivos_omitidos,
                 "notificaciones_firmantes": notificaciones_firmantes,
                 "evento_raiz": texto(evento_raiz.get("ID_EVENTO")),
                 "advertencias": advertencias,
