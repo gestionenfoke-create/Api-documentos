@@ -13697,6 +13697,8 @@ def rechazar_firma():
 
 ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA = "En notaría"
 ESTADO_DOCUMENTO_EN_NOTARIA = "En notaría"
+ESTADO_DOCUMENTO_PROCESO_TERMINADO = "Proceso terminado"
+ESTADO_PAQUETE_NOTARIAL_CERRADO = "Cerrado"
 EXTENSIONES_ANTECEDENTES_NOTARIA = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx"}
 
 # Tamaño máximo de archivos reales por correo a notaría.
@@ -15681,12 +15683,14 @@ def actualizar_documento_tras_devolucion_notaria(
         [
             {
                 "ID_DOCUMENTO": id_documento,
+                "ESTADO": ESTADO_DOCUMENTO_PROCESO_TERMINADO,
                 "ID_DOCUMENTO_PRIME_GENERADO": id_documento_prime,
                 "RECIBIDO_NOTARIA_POR": usuario,
                 "FECHA_RECEPCION_NOTARIA": fecha,
                 "ULTIMO_ENVIADO_POR": usuario,
                 "FECHA_ULTIMO_ENVIO": fecha,
                 "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "FECHA_CIERRE": fecha,
                 "OBSERVACION_ACTUAL": "",
                 "ACCION_SOLICITADA": "",
             }
@@ -15725,7 +15729,7 @@ def crear_evento_devolucion_notaria(
         "ID_APROBACION_ACTUAL": texto(documento.get("ID_APROBACION_ACTUAL")),
         "TIPO_EVENTO": "Respuesta de firma externa",
         "ESTADO_ANTERIOR": ESTADO_DOCUMENTO_EN_NOTARIA,
-        "ESTADO_NUEVO": ESTADO_DOCUMENTO_EN_NOTARIA,
+        "ESTADO_NUEVO": ESTADO_DOCUMENTO_PROCESO_TERMINADO,
         "USUARIO": usuario,
         "FECHA_EVENTO": fecha,
         "COMENTARIO": (
@@ -15775,6 +15779,27 @@ def paquete_notarial_devuelto_completo(id_documento_raiz: str) -> tuple[bool, li
     return completo, integrantes
 
 
+def cerrar_paquete_notarial_tras_devoluciones(
+    *,
+    id_documento_raiz: str,
+    fecha: str,
+) -> None:
+    """Cierra el paquete una vez que todos sus documentos volvieron de notaría."""
+    appsheet_action(
+        TABLA_DOCUMENTOS,
+        "Edit",
+        [
+            {
+                "ID_DOCUMENTO": id_documento_raiz,
+                "ESTADO_PAQUETE_NOTARIAL": ESTADO_PAQUETE_NOTARIAL_CERRADO,
+                "FECHA_ULTIMA_ACTUALIZACION": fecha,
+                "OBSERVACION_ACTUAL": "",
+                "ACCION_SOLICITADA": "",
+            }
+        ],
+    )
+
+
 def buscar_evento_cierre_retorno_notaria(id_documento_raiz: str) -> dict[str, Any] | None:
     prefijo = "Paquete notarial completo: todos los documentos fueron recibidos desde notaría."
     candidatos = [
@@ -15811,7 +15836,7 @@ def crear_evento_cierre_retorno_notaria(
         "ID_APROBACION_ACTUAL": texto(raiz.get("ID_APROBACION_ACTUAL")),
         "TIPO_EVENTO": "Proceso terminado",
         "ESTADO_ANTERIOR": ESTADO_DOCUMENTO_EN_NOTARIA,
-        "ESTADO_NUEVO": "Proceso terminado",
+        "ESTADO_NUEVO": ESTADO_DOCUMENTO_PROCESO_TERMINADO,
         "USUARIO": usuario,
         "FECHA_EVENTO": fecha,
         "COMENTARIO": (
@@ -15954,6 +15979,25 @@ def registrar_devolucion_notaria():
         raiz = buscar_documento(id_documento_raiz)
         if texto(raiz.get("TIPO_FIRMA")) != "Notarial":
             raise ValueError("El paquete no corresponde a Firma Notarial")
+
+        # Idempotencia antes de validar estados: una devolución ya registrada puede
+        # tener ESTADO='Proceso terminado' y el paquete puede estar 'Cerrado'.
+        id_prime_existente = texto(documento.get("ID_DOCUMENTO_PRIME_GENERADO"))
+        if id_prime_existente:
+            completo, _ = paquete_notarial_devuelto_completo(id_documento_raiz)
+            return jsonify(
+                {
+                    "ok": True,
+                    "ya_procesado": True,
+                    "id_documento": id_documento,
+                    "id_documento_raiz": id_documento_raiz,
+                    "id_documento_prime": id_prime_existente,
+                    "estado_documento": texto(documento.get("ESTADO")),
+                    "estado_paquete_notarial": texto(raiz.get("ESTADO_PAQUETE_NOTARIAL")),
+                    "paquete_completo": completo,
+                }
+            )
+
         if texto(raiz.get("ESTADO_PAQUETE_NOTARIAL")) != ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA:
             raise ValueError(
                 "Solo se puede registrar devolución cuando el paquete está En notaría. "
@@ -15981,21 +16025,6 @@ def registrar_devolucion_notaria():
         usuario = usuario or texto(documento.get("RECIBIDO_NOTARIA_POR"))
         if not usuario or not _EMAIL_RE.fullmatch(usuario.lower()):
             raise ValueError("El usuario que registra la devolución no es válido")
-
-        # Idempotencia: si ya existe vínculo a Prime, no volvemos a crear el registro.
-        id_prime_existente = texto(documento.get("ID_DOCUMENTO_PRIME_GENERADO"))
-        if id_prime_existente:
-            completo, _ = paquete_notarial_devuelto_completo(id_documento_raiz)
-            return jsonify(
-                {
-                    "ok": True,
-                    "ya_procesado": True,
-                    "id_documento": id_documento,
-                    "id_documento_raiz": id_documento_raiz,
-                    "id_documento_prime": id_prime_existente,
-                    "paquete_completo": completo,
-                }
-            )
 
         fecha = ahora_iso()
         registro_prime = crear_registro_prime_devolucion_notaria(
@@ -16061,6 +16090,18 @@ def registrar_devolucion_notaria():
             )
             evento_cierre_id = texto(evento_cierre.get("ID_EVENTO"))
 
+            try:
+                cerrar_paquete_notarial_tras_devoluciones(
+                    id_documento_raiz=id_documento_raiz,
+                    fecha=fecha,
+                )
+            except Exception as exc_cierre_paquete:
+                traceback.print_exc()
+                advertencias.append(
+                    "Todos los documentos fueron recibidos, pero no fue posible cambiar "
+                    "ESTADO_PAQUETE_NOTARIAL a 'Cerrado': " + str(exc_cierre_paquete)
+                )
+
             # Solo el primer cierre dispara correo externo a los firmantes.
             if creado:
                 firmantes = normalizar_destinatarios(
@@ -16111,6 +16152,12 @@ def registrar_devolucion_notaria():
                 "paquete_completo": paquete_completo,
                 "cantidad_documentos_paquete": len(integrantes),
                 "id_evento_cierre": evento_cierre_id,
+                "estado_documento": ESTADO_DOCUMENTO_PROCESO_TERMINADO,
+                "estado_paquete_notarial": (
+                    ESTADO_PAQUETE_NOTARIAL_CERRADO
+                    if paquete_completo
+                    else ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA
+                ),
                 "notificaciones_internas": notificaciones_internas,
                 "notificaciones_firmantes": notificaciones_firmantes,
                 "advertencias": advertencias,
