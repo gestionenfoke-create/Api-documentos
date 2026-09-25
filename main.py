@@ -13699,6 +13699,12 @@ ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA = "En notaría"
 ESTADO_DOCUMENTO_EN_NOTARIA = "En notaría"
 EXTENSIONES_ANTECEDENTES_NOTARIA = {".pdf", ".png", ".jpg", ".jpeg", ".doc", ".docx"}
 
+# Tamaño máximo de archivos reales por correo a notaría.
+# Gmail codifica los adjuntos en base64, lo que aumenta el tamaño del mensaje
+# aproximadamente un 33 %. 17 MiB deja margen bajo el límite de Gmail.
+MAX_ADJUNTOS_NOTARIA_MB = float(os.environ.get("MAX_ADJUNTOS_NOTARIA_MB", "17"))
+MAX_ADJUNTOS_NOTARIA_BYTES = int(MAX_ADJUNTOS_NOTARIA_MB * 1024 * 1024)
+
 
 def primer_valor(fila: dict[str, Any], *columnas: str) -> str:
     """Devuelve el primer valor no vacío entre posibles nombres de columna."""
@@ -14248,6 +14254,82 @@ def construir_adjuntos_envio_notaria(
     return adjuntos, detalle_archivos
 
 
+def dividir_adjuntos_notaria(
+    adjuntos: list[dict[str, Any]],
+    *,
+    limite_bytes: int = MAX_ADJUNTOS_NOTARIA_BYTES,
+) -> list[dict[str, Any]]:
+    """Agrupa adjuntos respetando un máximo de bytes reales por correo.
+
+    El límite se aplica antes de la codificación MIME/base64. Mantenerlo en torno
+    a 17 MiB deja margen suficiente para que el mensaje final no se acerque al
+    límite habitual de Gmail.
+    """
+    if limite_bytes <= 0:
+        raise ValueError("MAX_ADJUNTOS_NOTARIA_MB debe ser mayor que cero")
+    if not adjuntos:
+        raise ValueError("No existen adjuntos para dividir")
+
+    lotes: list[dict[str, Any]] = []
+    lote_actual: list[dict[str, Any]] = []
+    indices_actuales: list[int] = []
+    bytes_actuales = 0
+
+    for indice, adjunto in enumerate(adjuntos):
+        contenido = adjunto.get("contenido")
+        nombre = texto(adjunto.get("nombre")) or f"adjunto_{indice + 1}"
+        if not isinstance(contenido, bytes) or not contenido:
+            raise ValueError(f"El adjunto {nombre} no contiene bytes válidos")
+
+        tamano = len(contenido)
+        if tamano > limite_bytes:
+            raise ValueError(
+                f"El archivo {nombre} pesa {tamano / (1024 * 1024):.2f} MB y supera "
+                f"el máximo seguro de {limite_bytes / (1024 * 1024):.2f} MB para un "
+                "único correo. Debe reducirse o enviarse mediante otro mecanismo."
+            )
+
+        if lote_actual and bytes_actuales + tamano > limite_bytes:
+            lotes.append(
+                {
+                    "adjuntos": lote_actual,
+                    "indices": indices_actuales,
+                    "total_bytes": bytes_actuales,
+                }
+            )
+            lote_actual = []
+            indices_actuales = []
+            bytes_actuales = 0
+
+        lote_actual.append(adjunto)
+        indices_actuales.append(indice)
+        bytes_actuales += tamano
+
+    if lote_actual:
+        lotes.append(
+            {
+                "adjuntos": lote_actual,
+                "indices": indices_actuales,
+                "total_bytes": bytes_actuales,
+            }
+        )
+
+    return lotes
+
+
+def normalizar_lista_ids_gmail(valor: Any) -> list[str]:
+    """Convierte uno o varios IDs Gmail guardados en texto a una lista limpia."""
+    bruto = texto(valor)
+    if not bruto:
+        return []
+    partes = re.split(r"[,;\n]+", bruto)
+    return [x.strip() for x in partes if x.strip()]
+
+
+def serializar_lista_ids_gmail(valores: list[str]) -> str:
+    return ", ".join([texto(x) for x in valores if texto(x)])
+
+
 def construir_email_envio_notaria(
     *,
     raiz: dict[str, Any],
@@ -14255,24 +14337,49 @@ def construir_email_envio_notaria(
     mensaje_adicional: str,
     datos_notaria: dict[str, str],
     detalle_archivos: list[dict[str, Any]],
+    numero_parte: int = 1,
+    total_partes: int = 1,
 ) -> tuple[str, str, str]:
     titulo = texto(raiz.get("TITULO")) or texto(raiz.get("ID_DOCUMENTO"))
     contacto = datos_notaria["contacto"]
-    docs = [f"- {fila['nombre']}" for fila in detalle_archivos if fila.get("tipo") == "Documento para firma"]
-    antecedentes = [f"- {fila['nombre']}" for fila in detalle_archivos if fila.get("tipo") == "Antecedente"]
+    docs = [
+        f"- {fila['nombre']}"
+        for fila in detalle_archivos
+        if fila.get("tipo") == "Documento para firma"
+    ]
+    antecedentes = [
+        f"- {fila['nombre']}"
+        for fila in detalle_archivos
+        if fila.get("tipo") == "Antecedente"
+    ]
 
-    asunto = f"Documentos para firma notarial — {titulo}"
+    sufijo_parte = f" — Parte {numero_parte} de {total_partes}" if total_partes > 1 else ""
+    asunto = f"Documentos para firma notarial — {titulo}{sufijo_parte}"
+
     bloques = [
         f"Estimado/a {contacto}:",
         "",
         f"Se remite el paquete documental asociado a {titulo} para continuar el proceso de firma notarial.",
-        "",
-        "DOCUMENTOS PARA FIRMA / EDICIÓN NOTARIAL (DOCX)",
-        *(docs or ["- Sin documentos"]),
-        "",
-        "ANTECEDENTES COMPLEMENTARIOS (NO REQUIEREN FIRMA)",
-        *(antecedentes or ["- Sin antecedentes complementarios"]),
     ]
+    if total_partes > 1:
+        bloques.extend(
+            [
+                "",
+                f"IMPORTANTE: este correo corresponde a la PARTE {numero_parte} DE {total_partes} del envío.",
+                "Revise todas las partes para contar con el paquete documental completo.",
+            ]
+        )
+
+    bloques.extend(
+        [
+            "",
+            "DOCUMENTOS PARA FIRMA / EDICIÓN NOTARIAL (DOCX)",
+            *(docs or ["- En esta parte no se incluyen documentos para firma"]),
+            "",
+            "ANTECEDENTES COMPLEMENTARIOS (NO REQUIEREN FIRMA)",
+            *(antecedentes or ["- En esta parte no se incluyen antecedentes complementarios"]),
+        ]
+    )
     if mensaje_adicional:
         bloques.extend(["", "INDICACIONES ADICIONALES", mensaje_adicional])
     bloques.extend(
@@ -14288,17 +14395,37 @@ def construir_email_envio_notaria(
     def esc(v: Any) -> str:
         return html.escape(texto(v))
 
-    lista_docs = "".join(f"<li>{esc(fila['nombre'])}</li>" for fila in detalle_archivos if fila.get("tipo") == "Documento para firma") or "<li>Sin documentos</li>"
-    lista_ant = "".join(f"<li>{esc(fila['nombre'])}</li>" for fila in detalle_archivos if fila.get("tipo") == "Antecedente") or "<li>Sin antecedentes complementarios</li>"
+    lista_docs = "".join(
+        f"<li>{esc(fila['nombre'])}</li>"
+        for fila in detalle_archivos
+        if fila.get("tipo") == "Documento para firma"
+    ) or "<li>En esta parte no se incluyen documentos para firma</li>"
+    lista_ant = "".join(
+        f"<li>{esc(fila['nombre'])}</li>"
+        for fila in detalle_archivos
+        if fila.get("tipo") == "Antecedente"
+    ) or "<li>En esta parte no se incluyen antecedentes complementarios</li>"
     adicional_html = ""
     if mensaje_adicional:
-        adicional_html = f"<p><strong>Indicaciones adicionales:</strong><br>{esc(mensaje_adicional).replace(chr(10), '<br>')}</p>"
+        adicional_html = (
+            f"<p><strong>Indicaciones adicionales:</strong><br>"
+            f"{esc(mensaje_adicional).replace(chr(10), '<br>')}</p>"
+        )
+    bloque_parte_html = ""
+    if total_partes > 1:
+        bloque_parte_html = f"""
+        <div style="margin:16px 0;padding:12px 14px;background:#fff7ed;border:1px solid #fdba74;border-radius:8px;">
+          <strong>Parte {numero_parte} de {total_partes}</strong><br>
+          Este envío fue dividido por tamaño. Revise todas las partes para contar con el paquete completo.
+        </div>
+        """
 
     cuerpo_html = f"""
     <html><body style="font-family:Arial,Helvetica,sans-serif;color:#111827;line-height:1.55;">
       <h2>Envío de documentos a notaría</h2>
       <p>Estimado/a <strong>{esc(contacto)}</strong>:</p>
       <p>Se remite el paquete documental asociado a <strong>{esc(titulo)}</strong> para continuar el proceso de firma notarial.</p>
+      {bloque_parte_html}
       <h3>Documentos para firma / edición notarial (DOCX)</h3>
       <ul>{lista_docs}</ul>
       <h3>Antecedentes complementarios (no requieren firma)</h3>
@@ -14489,6 +14616,50 @@ def actualizar_envio_notaria_enviado(
     )
 
 
+def actualizar_progreso_envio_notaria(
+    *,
+    id_envio_notaria: str,
+    message_ids: list[str],
+    thread_ids: list[str],
+    fecha: str,
+) -> None:
+    """Guarda el progreso de un envío multipartes sin marcarlo todavía Enviado."""
+    appsheet_action(
+        TABLA_ENVIOS_NOTARIA,
+        "Edit",
+        [
+            {
+                "ID_ENVIO_NOTARIA": id_envio_notaria,
+                "GMAIL_MESSAGE_ID": serializar_lista_ids_gmail(message_ids),
+                "GMAIL_THREAD_ID": serializar_lista_ids_gmail(thread_ids),
+                "FECHA_ENVIO": fecha,
+                "ESTADO_ENVIO": "Preparando",
+            }
+        ],
+    )
+
+
+def reiniciar_progreso_reenvio_notaria(
+    *,
+    id_envio_notaria: str,
+    fecha: str,
+) -> None:
+    """Inicia un nuevo intento explícito sin crear otra cabecera ni respaldos DOCX."""
+    appsheet_action(
+        TABLA_ENVIOS_NOTARIA,
+        "Edit",
+        [
+            {
+                "ID_ENVIO_NOTARIA": id_envio_notaria,
+                "GMAIL_MESSAGE_ID": "",
+                "GMAIL_THREAD_ID": "",
+                "FECHA_ENVIO": fecha,
+                "ESTADO_ENVIO": "Preparando",
+            }
+        ],
+    )
+
+
 def actualizar_paquete_tras_envio_notaria(
     *,
     id_documento_raiz: str,
@@ -14577,10 +14748,14 @@ def crear_eventos_envio_notaria(
 @app.route("/enviar-notaria", methods=["POST"])
 @app.route("/reenviar-notaria", methods=["POST"])
 def enviar_notaria():
-    """Envía o reenvía de forma controlada el paquete aprobado a notaría.
+    """Envía/reenvía el paquete notarial dividiéndolo automáticamente por tamaño.
 
-    /enviar-notaria: flujo normal e idempotente.
-    /reenviar-notaria: reenvío manual explícito para un paquete que ya está En notaría.
+    - /enviar-notaria: envío inicial e idempotente.
+    - /reenviar-notaria: reenvío manual explícito cuando el paquete ya está En notaría.
+
+    El progreso se persiste por cada correo aceptado por Gmail en la cabecera
+    Documento_Envios_Notaria. Si el flujo se interrumpe, el siguiente intento
+    continúa desde la parte faltante mientras la cabecera permanezca Preparando.
     """
     id_documento_raiz = ""
     correo_notaria_aceptado_gmail = False
@@ -14612,10 +14787,7 @@ def enviar_notaria():
         id_raiz = texto(contexto.get("id_documento_raiz"))
         estado_paquete_actual = texto(raiz.get("ESTADO_PAQUETE_NOTARIAL"))
         message_id_existente = texto(raiz.get("EMAIL_NOTARIA_MESSAGE_ID"))
-        accion_actual = texto(raiz.get("ACCION_SOLICITADA"))
 
-        # En el endpoint normal, un retry automático posterior a Gmail no puede
-        # duplicar el correo: el checkpoint limpia ACCION_SOLICITADA.
         if (
             not reenvio_explicito
             and estado_paquete_actual == ESTADO_PAQUETE_NOTARIAL_EN_NOTARIA
@@ -14628,6 +14800,7 @@ def enviar_notaria():
                     "id_documento_raiz": id_raiz,
                     "estado_paquete_notarial": estado_paquete_actual,
                     "message_id": message_id_existente,
+                    "message_ids": normalizar_lista_ids_gmail(message_id_existente),
                     "thread_id": texto(raiz.get("GMAIL_THREAD_ID_NOTARIA")),
                     "fecha_envio_notaria": texto(raiz.get("FECHA_ENVIO_NOTARIA")),
                     "mensaje": "El envío ya estaba registrado; no se duplicó el correo.",
@@ -14700,6 +14873,17 @@ def enviar_notaria():
         if not id_envio_notaria:
             raise RuntimeError("No se pudo obtener ID_ENVIO_NOTARIA")
 
+        # Un reenvío explícito inicia una nueva serie de partes, salvo que una
+        # serie anterior haya quedado Preparando y deba continuarse.
+        if reenvio_explicito and texto(envio.get("ESTADO_ENVIO")) != "Preparando":
+            reiniciar_progreso_reenvio_notaria(
+                id_envio_notaria=id_envio_notaria,
+                fecha=fecha_envio,
+            )
+            envio["GMAIL_MESSAGE_ID"] = ""
+            envio["GMAIL_THREAD_ID"] = ""
+            envio["ESTADO_ENVIO"] = "Preparando"
+
         drive_service = obtener_drive_service()
         adjuntos, detalle_archivos = construir_adjuntos_envio_notaria(
             drive_service=drive_service,
@@ -14709,86 +14893,239 @@ def enviar_notaria():
             fecha=fecha_envio,
         )
 
-        asunto, cuerpo, cuerpo_html = construir_email_envio_notaria(
-            raiz=raiz,
-            usuario=usuario,
-            mensaje_adicional=mensaje_adicional,
-            datos_notaria=datos_notaria,
-            detalle_archivos=detalle_archivos,
-        )
-
+        lotes = dividir_adjuntos_notaria(adjuntos)
         total_bytes = sum(len(a.get("contenido") or b"") for a in adjuntos)
         nombres_adjuntos = [texto(a.get("nombre")) for a in adjuntos]
+        resumen_partes = [
+            {
+                "parte": i + 1,
+                "cantidad_adjuntos": len(lote["adjuntos"]),
+                "total_mb": round(lote["total_bytes"] / (1024 * 1024), 2),
+                "archivos": [texto(x.get("nombre")) for x in lote["adjuntos"]],
+            }
+            for i, lote in enumerate(lotes)
+        ]
+
+        ids_enviados = normalizar_lista_ids_gmail(envio.get("GMAIL_MESSAGE_ID"))
+        threads_enviados = normalizar_lista_ids_gmail(envio.get("GMAIL_THREAD_ID"))
+        partes_ya_enviadas = len(ids_enviados)
+        if partes_ya_enviadas > len(lotes):
+            raise ValueError(
+                "La cabecera de envío registra más correos que las partes calculadas; "
+                "revisa Documento_Envios_Notaria antes de continuar."
+            )
+
         log_envio_notaria(
             "antes_gmail",
             id_documento_raiz=id_raiz,
             id_envio_notaria=id_envio_notaria,
             reenvio_explicito=reenvio_explicito,
             destinatario=datos_notaria["email"],
-            asunto=asunto,
             cantidad_adjuntos=len(adjuntos),
-            nombres_adjuntos=nombres_adjuntos,
             total_adjuntos_bytes=total_bytes,
             total_adjuntos_mb=round(total_bytes / (1024 * 1024), 2),
+            limite_por_correo_mb=MAX_ADJUNTOS_NOTARIA_MB,
+            cantidad_partes=len(lotes),
+            partes_ya_enviadas=partes_ya_enviadas,
+            nombres_adjuntos=nombres_adjuntos,
+            resumen_partes=resumen_partes,
         )
 
         gmail_service = obtener_gmail_service()
-        respuesta = enviar_email_con_adjuntos(
-            gmail_service=gmail_service,
-            destinatarios=[datos_notaria["email"]],
-            asunto=asunto,
-            cuerpo=cuerpo,
-            adjuntos=adjuntos,
-            reply_to=usuario,
-            cuerpo_html=cuerpo_html,
-        )
-        correo_notaria_aceptado_gmail = True
-        message_id = respuesta["message_id"]
-        thread_id = respuesta.get("thread_id", "")
-        label_ids = respuesta.get("label_ids") or []
+        respuestas_partes: list[dict[str, Any]] = []
 
-        log_envio_notaria(
-            "gmail_aceptado",
-            id_documento_raiz=id_raiz,
-            id_envio_notaria=id_envio_notaria,
-            destinatario=datos_notaria["email"],
-            message_id=message_id,
-            thread_id=thread_id,
-            label_ids=label_ids,
-        )
+        # Conserva en la respuesta las partes que ya estaban persistidas.
+        for i in range(partes_ya_enviadas):
+            respuestas_partes.append(
+                {
+                    "parte": i + 1,
+                    "reanudada": True,
+                    "message_id": ids_enviados[i],
+                    "thread_id": threads_enviados[i] if i < len(threads_enviados) else "",
+                }
+            )
 
-        # Desde que Gmail devuelve ID, ningún error de persistencia secundaria
-        # debe devolver HTTP 500: eso provocaría retries automáticos y duplicados.
+        for indice in range(partes_ya_enviadas, len(lotes)):
+            lote = lotes[indice]
+            numero_parte = indice + 1
+            detalles_lote = [detalle_archivos[i] for i in lote["indices"]]
+            asunto, cuerpo, cuerpo_html = construir_email_envio_notaria(
+                raiz=raiz,
+                usuario=usuario,
+                mensaje_adicional=mensaje_adicional,
+                datos_notaria=datos_notaria,
+                detalle_archivos=detalles_lote,
+                numero_parte=numero_parte,
+                total_partes=len(lotes),
+            )
+
+            log_envio_notaria(
+                "antes_gmail_parte",
+                id_documento_raiz=id_raiz,
+                id_envio_notaria=id_envio_notaria,
+                parte=numero_parte,
+                total_partes=len(lotes),
+                destinatario=datos_notaria["email"],
+                asunto=asunto,
+                cantidad_adjuntos=len(lote["adjuntos"]),
+                total_mb=round(lote["total_bytes"] / (1024 * 1024), 2),
+                archivos=[texto(x.get("nombre")) for x in lote["adjuntos"]],
+            )
+
+            try:
+                respuesta = enviar_email_con_adjuntos(
+                    gmail_service=gmail_service,
+                    destinatarios=[datos_notaria["email"]],
+                    asunto=asunto,
+                    cuerpo=cuerpo,
+                    adjuntos=lote["adjuntos"],
+                    reply_to=usuario,
+                    cuerpo_html=cuerpo_html,
+                )
+            except Exception as exc_parte:
+                traceback.print_exc()
+                mensaje_error = (
+                    f"Falló el envío de la parte {numero_parte} de {len(lotes)} a notaría: "
+                    f"{exc_parte}"
+                )
+                registrar_error_envio_notaria(id_raiz, mensaje_error)
+                log_envio_notaria(
+                    "error_gmail_parte",
+                    id_documento_raiz=id_raiz,
+                    id_envio_notaria=id_envio_notaria,
+                    parte=numero_parte,
+                    total_partes=len(lotes),
+                    partes_enviadas=len(ids_enviados),
+                    error=str(exc_parte),
+                )
+                if ids_enviados:
+                    return jsonify(
+                        {
+                            "ok": False,
+                            "envio_parcial": True,
+                            "id_documento_raiz": id_raiz,
+                            "id_envio_notaria": id_envio_notaria,
+                            "parte_fallida": numero_parte,
+                            "total_partes": len(lotes),
+                            "partes_enviadas": len(ids_enviados),
+                            "message_ids": ids_enviados,
+                            "error": str(exc_parte),
+                            "mensaje": (
+                                "El envío quedó parcial. Al ejecutar nuevamente la misma acción, "
+                                "el backend continuará desde la parte faltante."
+                            ),
+                        }
+                    ), 200
+                raise
+
+            correo_notaria_aceptado_gmail = True
+            message_id = respuesta["message_id"]
+            thread_id = respuesta.get("thread_id", "")
+            label_ids = respuesta.get("label_ids") or []
+            ids_enviados.append(message_id)
+            threads_enviados.append(thread_id)
+
+            try:
+                actualizar_progreso_envio_notaria(
+                    id_envio_notaria=id_envio_notaria,
+                    message_ids=ids_enviados,
+                    thread_ids=threads_enviados,
+                    fecha=fecha_envio,
+                )
+            except Exception as exc_progreso:
+                traceback.print_exc()
+                mensaje_error = (
+                    f"Gmail aceptó la parte {numero_parte}, pero no fue posible persistir "
+                    f"el progreso del envío: {exc_progreso}"
+                )
+                registrar_error_envio_notaria(id_raiz, mensaje_error)
+                log_envio_notaria(
+                    "error_persistencia_parte",
+                    id_documento_raiz=id_raiz,
+                    id_envio_notaria=id_envio_notaria,
+                    parte=numero_parte,
+                    message_id=message_id,
+                    error=str(exc_progreso),
+                )
+                return jsonify(
+                    {
+                        "ok": False,
+                        "envio_parcial": True,
+                        "gmail_acepto_correo": True,
+                        "parte": numero_parte,
+                        "message_id": message_id,
+                        "error": str(exc_progreso),
+                        "mensaje": (
+                            "Gmail aceptó esta parte, pero el progreso no pudo guardarse. "
+                            "No reintentes automáticamente hasta revisar Documento_Envios_Notaria."
+                        ),
+                    }
+                ), 200
+
+            respuestas_partes.append(
+                {
+                    "parte": numero_parte,
+                    "reanudada": False,
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "label_ids": label_ids,
+                    "cantidad_adjuntos": len(lote["adjuntos"]),
+                    "total_mb": round(lote["total_bytes"] / (1024 * 1024), 2),
+                }
+            )
+            log_envio_notaria(
+                "gmail_aceptado_parte",
+                id_documento_raiz=id_raiz,
+                id_envio_notaria=id_envio_notaria,
+                parte=numero_parte,
+                total_partes=len(lotes),
+                destinatario=datos_notaria["email"],
+                message_id=message_id,
+                thread_id=thread_id,
+                label_ids=label_ids,
+            )
+
+        if len(ids_enviados) != len(lotes):
+            raise RuntimeError(
+                f"Se enviaron {len(ids_enviados)} de {len(lotes)} partes; el paquete no puede cerrarse."
+            )
+
+        message_ids_texto = serializar_lista_ids_gmail(ids_enviados)
+        thread_ids_texto = serializar_lista_ids_gmail(threads_enviados)
+        message_id = ids_enviados[0] if ids_enviados else ""
+        thread_id = threads_enviados[0] if threads_enviados else ""
+        correo_notaria_aceptado_gmail = bool(ids_enviados)
         advertencias: list[str] = []
 
+        # Solo después de completar TODAS las partes se marca el paquete En notaría.
         try:
             registrar_checkpoint_gmail_notaria(
                 id_documento_raiz=id_raiz,
                 usuario=usuario,
                 destinatario_notaria=datos_notaria["email"],
                 mensaje_adicional=mensaje_adicional,
-                message_id=message_id,
-                thread_id=thread_id,
+                message_id=message_ids_texto,
+                thread_id=thread_ids_texto,
                 fecha=fecha_envio,
             )
         except Exception as exc_checkpoint:
             traceback.print_exc()
             advertencias.append(
-                "Gmail aceptó el correo, pero falló el checkpoint inmediato en Documentos: "
+                "Todas las partes fueron aceptadas por Gmail, pero falló el checkpoint en Documentos: "
                 + str(exc_checkpoint)
             )
 
         try:
             actualizar_envio_notaria_enviado(
                 id_envio_notaria=id_envio_notaria,
-                message_id=message_id,
-                thread_id=thread_id,
+                message_id=message_ids_texto,
+                thread_id=thread_ids_texto,
                 fecha=fecha_envio,
             )
         except Exception as exc_envio:
             traceback.print_exc()
             advertencias.append(
-                "Gmail aceptó el correo, pero no fue posible actualizar Documento_Envios_Notaria: "
+                "Todas las partes fueron aceptadas por Gmail, pero no fue posible cerrar Documento_Envios_Notaria: "
                 + str(exc_envio)
             )
 
@@ -14800,15 +15137,15 @@ def enviar_notaria():
                 usuario=usuario,
                 datos_notaria=datos_notaria,
                 mensaje_adicional=mensaje_adicional,
-                message_id=message_id,
-                thread_id=thread_id,
+                message_id=message_ids_texto,
+                thread_id=thread_ids_texto,
                 fecha=fecha_envio,
             )
             paquete_actualizado = True
         except Exception as exc_paquete:
             traceback.print_exc()
             advertencias.append(
-                "Gmail aceptó el correo, pero falló la actualización del estado del paquete: "
+                "Todas las partes fueron aceptadas por Gmail, pero falló la actualización del estado del paquete: "
                 + str(exc_paquete)
             )
 
@@ -14821,7 +15158,11 @@ def enviar_notaria():
                 fecha=fecha_envio,
                 datos_notaria=datos_notaria,
                 id_envio_notaria=id_envio_notaria,
-                message_id=message_id,
+                message_id=(
+                    f"{message_id} (+{len(ids_enviados)-1} parte(s) adicional(es))"
+                    if len(ids_enviados) > 1
+                    else message_id
+                ),
             )
         except Exception as exc_evento:
             traceback.print_exc()
@@ -14830,8 +15171,9 @@ def enviar_notaria():
                 "eventos de trazabilidad: " + str(exc_evento)
             )
 
+        # El reenvío explícito NO vuelve a notificar a los firmantes.
         notificaciones_firmantes: list[dict[str, Any]] = []
-        if paquete_actualizado:
+        if paquete_actualizado and not reenvio_explicito:
             notificaciones_firmantes = enviar_notificaciones_firmantes_notaria(
                 gmail_service=gmail_service,
                 raiz=raiz,
@@ -14843,9 +15185,9 @@ def enviar_notaria():
             if fallidas:
                 advertencias.append(
                     f"{len(fallidas)} notificación(es) a firmantes fallaron; "
-                    "el correo principal ya fue aceptado por Gmail."
+                    "el envío a notaría ya fue completado."
                 )
-        else:
+        elif not paquete_actualizado:
             advertencias.append(
                 "No se notificó a los firmantes porque no fue posible confirmar "
                 "la actualización del estado del paquete."
@@ -14856,7 +15198,10 @@ def enviar_notaria():
             id_documento_raiz=id_raiz,
             id_envio_notaria=id_envio_notaria,
             message_id=message_id,
+            message_ids=ids_enviados,
+            cantidad_partes=len(lotes),
             paquete_actualizado=paquete_actualizado,
+            reenvio_explicito=reenvio_explicito,
             advertencias=advertencias,
         )
 
@@ -14880,13 +15225,17 @@ def enviar_notaria():
                 ),
                 "message_id": message_id,
                 "thread_id": thread_id,
-                "gmail_label_ids": label_ids,
+                "message_ids": ids_enviados,
+                "thread_ids": threads_enviados,
+                "cantidad_partes": len(lotes),
+                "partes": respuestas_partes,
                 "cantidad_documentos_firma": len(preparados),
                 "cantidad_antecedentes_prime": len(
                     [x for x in detalle_archivos if x.get("tipo") == "Antecedente"]
                 ),
                 "cantidad_adjuntos": len(adjuntos),
                 "total_adjuntos_mb": round(total_bytes / (1024 * 1024), 2),
+                "limite_por_correo_mb": MAX_ADJUNTOS_NOTARIA_MB,
                 "notificaciones_firmantes": notificaciones_firmantes,
                 "evento_raiz": texto(evento_raiz.get("ID_EVENTO")),
                 "advertencias": advertencias,
@@ -14904,11 +15253,9 @@ def enviar_notaria():
     except Exception as exc:
         traceback.print_exc()
         if correo_notaria_aceptado_gmail:
-            # No devolver 500 después de Gmail: evita reintento automático con
-            # posible correo duplicado. El detalle queda en Cloud Logging.
             return jsonify(
                 {
-                    "ok": True,
+                    "ok": False,
                     "gmail_acepto_correo": True,
                     "entrega_destinatario_confirmada": False,
                     "error_post_gmail": str(exc),
