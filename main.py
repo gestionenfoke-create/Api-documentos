@@ -371,6 +371,43 @@ def limpiar_nombre_archivo(nombre: str) -> str:
     return nombre[:180] or "Documento"
 
 
+def nombre_base_archivo_documento(
+    documento: dict[str, Any],
+    id_documento: str = "",
+) -> str:
+    """
+    Construye el nombre base de archivos de Drive incluyendo TIPO_DOCUMENTO.
+
+    Evita colisiones entre documentos con el mismo TITULO pero distinto tipo,
+    por ejemplo:
+      Instrucciones_Esteban Dell Orto 6751
+      Promesa_Esteban Dell Orto 6751
+    """
+    tipo = limpiar_nombre_archivo(texto(documento.get("TIPO_DOCUMENTO")))
+    titulo = limpiar_nombre_archivo(
+        texto(documento.get("TITULO"))
+        or (f"Documento_{id_documento}" if id_documento else "Documento")
+    )
+
+    if not tipo or tipo == "Documento":
+        return titulo
+
+    # Si el usuario ya comenzó el título con el tipo, no lo duplica.
+    tipo_cf = tipo.casefold()
+    titulo_cf = titulo.casefold()
+    if titulo_cf == tipo_cf:
+        return tipo
+    if titulo_cf.startswith(tipo_cf):
+        resto = titulo[len(tipo):]
+        if resto[:1] in {" ", "_", "-", "–", "—"}:
+            resto = resto.lstrip(" _-–—")
+            return limpiar_nombre_archivo(
+                f"{tipo}_{resto}" if resto else tipo
+            )
+
+    return limpiar_nombre_archivo(f"{tipo}_{titulo}")
+
+
 def validar_configuracion() -> None:
     faltantes: list[str] = []
 
@@ -1866,8 +1903,12 @@ def crear_documento():
 
         fecha_creacion = ahora_iso()
         id_version = nuevo_id()
+        nombre_base_archivo = nombre_base_archivo_documento(
+            documento,
+            id_documento,
+        )
         nombre_archivo = limpiar_nombre_archivo(
-            f"{titulo}_V01_BORRADOR"
+            f"{nombre_base_archivo}_V01_BORRADOR"
         )
 
         drive_service = obtener_drive_service()
@@ -2161,8 +2202,12 @@ def enviar_revision():
             raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
 
         titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        nombre_base_archivo = nombre_base_archivo_documento(
+            documento,
+            id_documento,
+        )
         nombre_archivo = limpiar_nombre_archivo(
-            f"{titulo}_V{numero_version:02d}_REV{numero_revision_nueva:02d}"
+            f"{nombre_base_archivo}_V{numero_version:02d}_REV{numero_revision_nueva:02d}"
         )
         fecha = ahora_iso()
 
@@ -2957,8 +3002,12 @@ def aprobar_revision():
                     f"El responsable de orden {siguiente_orden} no tiene correo"
                 )
 
+            nombre_base_archivo = nombre_base_archivo_documento(
+                documento,
+                id_documento,
+            )
             nombre_archivo = limpiar_nombre_archivo(
-                f"{titulo}_V{numero_version:02d}"
+                f"{nombre_base_archivo}_V{numero_version:02d}"
                 f"_REV{numero_revision_nueva:02d}"
             )
 
@@ -3153,11 +3202,15 @@ def aprobar_revision():
         )
 
         sufijo_salida = config_salida["sufijo_archivo"]
+        nombre_base_archivo = nombre_base_archivo_documento(
+            documento,
+            id_documento,
+        )
         nombre_archivo = limpiar_nombre_archivo(
-            f"{titulo}_V{numero_version:02d}_{sufijo_salida}"
+            f"{nombre_base_archivo}_V{numero_version:02d}_{sufijo_salida}"
         )
         nombre_pdf = limpiar_nombre_archivo(
-            f"{titulo}_V{numero_version:02d}_{sufijo_salida}.pdf"
+            f"{nombre_base_archivo}_V{numero_version:02d}_{sufijo_salida}.pdf"
         )
 
         version_existente = buscar_version_numero_revision(
@@ -3939,13 +3992,17 @@ def rechazar_revision():
             raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
 
         titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        nombre_base_archivo = nombre_base_archivo_documento(
+            documento,
+            id_documento,
+        )
         if es_borrador:
             nombre_archivo = limpiar_nombre_archivo(
-                f"{titulo}_V{numero_version_nueva:02d}_BORRADOR"
+                f"{nombre_base_archivo}_V{numero_version_nueva:02d}_BORRADOR"
             )
         else:
             nombre_archivo = limpiar_nombre_archivo(
-                f"{titulo}_V{numero_version_nueva:02d}"
+                f"{nombre_base_archivo}_V{numero_version_nueva:02d}"
                 f"_REV{numero_revision_nueva:02d}"
             )
 
@@ -11620,9 +11677,12 @@ def procesar_observacion_revision_externa(
         raise ValueError("La plantilla no tiene CARPETA_DESTINO_ID")
 
     numero_version_nueva = numero_version_anterior + 1
+    nombre_base_archivo = nombre_base_archivo_documento(
+        documento,
+        id_documento,
+    )
     nombre_archivo = limpiar_nombre_archivo(
-        f"{texto(documento.get('TITULO')) or f'Documento_{id_documento}'}_"
-        f"V{numero_version_nueva:02d}_BORRADOR"
+        f"{nombre_base_archivo}_V{numero_version_nueva:02d}_BORRADOR"
     )
     drive_service = obtener_drive_service()
 
@@ -12831,7 +12891,10 @@ def cerrar_documento_firmado_del_paquete(
 
     fecha = ahora_iso()
     pdf_subido = buscar_pdf_cargado_appsheet(drive_service, valor_pdf_firmado)
-    titulo_archivo = limpiar_nombre_archivo(titulo)
+    titulo_archivo = nombre_base_archivo_documento(
+        documento,
+        id_documento,
+    )
     nombre_final = f"{titulo_archivo}_V{numero_version:02d}_FIRMADO.pdf"
     pdf_final = copiar_pdf_firmado_o_reutilizar(
         drive_service=drive_service,
@@ -13427,8 +13490,12 @@ def rechazar_firma():
         numero_version_nueva = numero_version_anterior + 1
         numero_revision_nueva = 0
         titulo = texto(documento.get("TITULO")) or f"Documento_{id_documento}"
+        nombre_base_archivo = nombre_base_archivo_documento(
+            documento,
+            id_documento,
+        )
         nombre_archivo = limpiar_nombre_archivo(
-            f"{titulo}_V{numero_version_nueva:02d}_BORRADOR"
+            f"{nombre_base_archivo}_V{numero_version_nueva:02d}_BORRADOR"
         )
         fecha = ahora_iso()
         drive_service = obtener_drive_service()
