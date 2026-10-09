@@ -692,6 +692,50 @@ def normalizar_respuesta_appsheet(data: Any) -> list[dict[str, Any]]:
     )
 
 
+def normalizar_filas_para_appsheet(
+    rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """
+    Normaliza valores enriquecidos devueltos por AppSheet antes de volver a
+    enviarlos mediante la API.
+
+    En particular, las columnas de tipo Url pueden llegar desde AppSheet como:
+        {"Url": "https://...", "LinkText": "https://..."}
+
+    La API de edición, sin embargo, exige el valor URL como texto plano.
+    Centralizar esta conversión evita que cualquier flujo vuelva a enviar por
+    accidente el objeto enriquecido completo.
+    """
+    filas_normalizadas: list[dict[str, Any]] = []
+
+    for fila in rows or []:
+        if not isinstance(fila, dict):
+            filas_normalizadas.append(fila)
+            continue
+
+        nueva = dict(fila)
+        for columna, valor in list(nueva.items()):
+            nombre_columna = str(columna).upper()
+
+            # Todas nuestras columnas URL siguen esta convención. Además se
+            # contempla cualquier objeto AppSheet con la forma Url/LinkText.
+            es_columna_url = (
+                nombre_columna.endswith("_URL")
+                or nombre_columna == "URL"
+            )
+            es_url_enriquecida = (
+                isinstance(valor, dict)
+                and any(clave in valor for clave in ("Url", "URL", "url"))
+            )
+
+            if es_columna_url or es_url_enriquecida:
+                nueva[columna] = normalizar_url_appsheet(valor)
+
+        filas_normalizadas.append(nueva)
+
+    return filas_normalizadas
+
+
 def appsheet_action(
     table_name: str,
     action: str,
@@ -719,10 +763,12 @@ def appsheet_action(
     if selector:
         properties["Selector"] = selector
 
+    rows_normalizadas = normalizar_filas_para_appsheet(rows)
+
     payload = {
         "Action": action,
         "Properties": properties,
-        "Rows": rows or [],
+        "Rows": rows_normalizadas,
     }
 
     inicio_appsheet = time.perf_counter()
@@ -2781,6 +2827,138 @@ def crear_evento_preparado_firma(
     )
 
 
+
+def reconciliar_aprobacion_revision_parcial(
+    *,
+    documento: dict[str, Any],
+    aprobacion_cerrada: dict[str, Any],
+    usuario: str,
+) -> dict[str, Any]:
+    """Repara una aprobación que avanzó cadena/versiones pero falló al editar Documentos.
+
+    Caso típico: la copia Drive y Documento_Versiones se crearon, la fila del
+    aprobador quedó Cerrado/Aprobado y el siguiente responsable quedó activo,
+    pero el Edit final de Documentos falló (por ejemplo, por un Url enriquecido
+    de AppSheet). La reparación reutiliza exactamente la versión ya creada; no
+    genera otra copia en Drive ni otra revisión.
+    """
+    id_documento = texto(documento.get("ID_DOCUMENTO"))
+    id_aprobacion_cerrada = texto(aprobacion_cerrada.get("ID_APROBACION_ACTUAL"))
+    id_aprobacion_documento = texto(documento.get("ID_APROBACION_ACTUAL"))
+
+    # Si Documentos ya avanzó a otra aprobación, no hay nada que reconciliar.
+    if not id_documento or id_aprobacion_documento != id_aprobacion_cerrada:
+        return {"reparado": False, "motivo": "Documentos ya apunta a otra aprobación"}
+
+    numero_version = entero(documento.get("VERSION_ACTUAL"), "VERSION_ACTUAL")
+    orden_cerrado = entero(aprobacion_cerrada.get("ORDEN"), "ORDEN")
+    cadena = buscar_cadena_actual_documento(
+        id_documento=id_documento,
+        numero_version=numero_version,
+    )
+
+    # 1) Aprobación intermedia: localizar el siguiente responsable ya activado.
+    siguientes = sorted(
+        [
+            fila
+            for fila in cadena
+            if entero(fila.get("ORDEN"), "ORDEN") > orden_cerrado
+            and not es_responsable_firmas(fila)
+            and es_verdadero(fila.get("CADENA_ACTIVA"))
+            and texto(fila.get("ESTADO")) == "En revisión"
+        ],
+        key=lambda fila: entero(fila.get("ORDEN"), "ORDEN"),
+    )
+
+    fecha = ahora_iso()
+    actor = usuario or texto(aprobacion_cerrada.get("APROBADOR"))
+
+    if siguientes:
+        siguiente = siguientes[0]
+        id_version_nueva = texto(siguiente.get("ID_VERSION_TRABAJADA"))
+        if not id_version_nueva:
+            raise ValueError(
+                "La aprobación quedó parcial, pero el siguiente responsable no tiene "
+                "ID_VERSION_TRABAJADA"
+            )
+        version = buscar_version_por_id(id_version_nueva)
+        copia = {
+            "id": texto(version.get("GOOGLE_DOC_ID")),
+            "url": normalizar_url_appsheet(version.get("GOOGLE_DOC_URL")),
+            "name": texto(version.get("NOMBRE_ARCHIVO")),
+        }
+        if not copia["id"]:
+            raise ValueError("La versión de recuperación no tiene GOOGLE_DOC_ID")
+        numero_revision = entero(version.get("NUMERO_REVISION"), "NUMERO_REVISION")
+        actualizar_documento_aprobacion_intermedia(
+            id_documento=id_documento,
+            numero_version=numero_version,
+            numero_revision=numero_revision,
+            id_version=id_version_nueva,
+            copia=copia,
+            siguiente=siguiente,
+            usuario=actor,
+            fecha=fecha,
+        )
+        return {
+            "reparado": True,
+            "tipo": "intermedia",
+            "id_version": id_version_nueva,
+            "id_aprobacion_actual": texto(siguiente.get("ID_APROBACION_ACTUAL")),
+        }
+
+    # 2) Último aprobador: la cadena ya pudo haber quedado en gestión externa.
+    responsables = [
+        fila
+        for fila in cadena
+        if es_responsable_firmas(fila) and es_verdadero(fila.get("CADENA_ACTIVA"))
+    ]
+    if responsables:
+        responsable = responsables[0]
+        id_version_nueva = texto(responsable.get("ID_VERSION_TRABAJADA"))
+        if not id_version_nueva:
+            raise ValueError(
+                "La aprobación final quedó parcial, pero el Responsable de firmas no "
+                "tiene ID_VERSION_TRABAJADA"
+            )
+        version = buscar_version_por_id(id_version_nueva)
+        copia = {
+            "id": texto(version.get("GOOGLE_DOC_ID")),
+            "url": normalizar_url_appsheet(version.get("GOOGLE_DOC_URL")),
+            "name": texto(version.get("NOMBRE_ARCHIVO")),
+        }
+        pdf = {
+            "id": texto(version.get("PDF_VERSION_ID")),
+            "url": normalizar_url_appsheet(version.get("PDF_VERSION_URL")),
+            "name": "",
+        }
+        numero_revision = entero(version.get("NUMERO_REVISION"), "NUMERO_REVISION")
+        tipo_firma = obtener_tipo_firma_efectivo_documento(id_documento)
+        actualizar_documento_listo_salida_externa(
+            id_documento=id_documento,
+            numero_version=numero_version,
+            numero_revision=numero_revision,
+            id_version=id_version_nueva,
+            copia=copia,
+            pdf=pdf,
+            responsable_firmas=responsable,
+            tipo_firma=tipo_firma,
+            usuario=actor,
+            fecha=fecha,
+        )
+        return {
+            "reparado": True,
+            "tipo": "final",
+            "id_version": id_version_nueva,
+            "id_aprobacion_actual": texto(responsable.get("ID_APROBACION_ACTUAL")),
+        }
+
+    raise ValueError(
+        "La aprobación figura Cerrado/Aprobado, pero no se encontró un siguiente "
+        "responsable activo ni un Responsable de firmas activo para reparar Documentos"
+    )
+
+
 @app.route("/aprobar-revision", methods=["POST"])
 def aprobar_revision():
     id_documento = ""
@@ -2862,10 +3040,36 @@ def aprobar_revision():
             ):
                 notificaciones_reintento: list[dict[str, Any]] = []
                 advertencias_reintento: list[str] = []
+                reparacion: dict[str, Any] = {"reparado": False}
+
+                # Una ejecución anterior pudo alcanzar a cerrar la aprobación y
+                # crear la nueva versión, pero fallar al actualizar Documentos.
+                # Reconciliamos antes de aplicar la idempotencia para no dejar la
+                # fila apuntando al aprobador cerrado.
+                try:
+                    reparacion = reconciliar_aprobacion_revision_parcial(
+                        documento=documento,
+                        aprobacion_cerrada=aprobacion_solicitada,
+                        usuario=usuario,
+                    )
+                    if reparacion.get("reparado"):
+                        documento = buscar_documento(id_documento)
+                        estado_documento = texto(documento.get("ESTADO"))
+                        advertencias_reintento.append(
+                            "Se reparó automáticamente una aprobación parcial "
+                            "reutilizando la versión ya creada."
+                        )
+                except Exception as exc_reparacion:
+                    traceback.print_exc()
+                    raise RuntimeError(
+                        "La aprobación anterior quedó parcialmente procesada y no "
+                        f"pudo reconciliarse automáticamente: {exc_reparacion}"
+                    ) from exc_reparacion
+
                 try:
                     (
                         notificaciones_reintento,
-                        advertencias_reintento,
+                        advertencias_notificacion,
                     ) = reanudar_notificaciones_aprobacion_revision(
                         documento=documento,
                         id_aprobacion_aprueba=(
@@ -2873,6 +3077,7 @@ def aprobar_revision():
                         ),
                         datos_solicitud=data,
                     )
+                    advertencias_reintento.extend(advertencias_notificacion)
                 except Exception as exc_notificacion:
                     traceback.print_exc()
                     advertencias_reintento.append(
@@ -2885,6 +3090,7 @@ def aprobar_revision():
                     {
                         "ok": True,
                         "ya_procesado": True,
+                        "reparacion_parcial": reparacion,
                         "id_documento": id_documento,
                         "estado": estado_documento,
                         "id_version": texto(
@@ -2893,7 +3099,7 @@ def aprobar_revision():
                         "google_doc_id": texto(
                             documento.get("GOOGLE_DOC_ID")
                         ),
-                        "google_doc_url": texto(
+                        "google_doc_url": normalizar_url_appsheet(
                             documento.get("GOOGLE_DOC_URL")
                         ),
                         "notificaciones": notificaciones_reintento,
