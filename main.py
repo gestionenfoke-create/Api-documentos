@@ -475,6 +475,16 @@ def obtener_gmail_service():
     )
 
 
+def obtener_docs_service():
+    """Cliente Google Docs API usando las mismas credenciales OAuth del servicio."""
+    return build(
+        "docs",
+        "v1",
+        credentials=obtener_google_credentials(),
+        cache_discovery=False,
+    )
+
+
 @medir_operacion("drive.copiar_plantilla")
 def copiar_plantilla(
     drive_service: Any,
@@ -5719,6 +5729,247 @@ def construir_historial_comentarios(
         "".join(bloques_html),
     )
 
+
+
+def _iterar_text_runs_google_docs(elementos: Any):
+    """Recorre párrafos, tablas y TOC y entrega sus textRun."""
+    if not isinstance(elementos, list):
+        return
+
+    for elemento in elementos:
+        if not isinstance(elemento, dict):
+            continue
+
+        parrafo = elemento.get("paragraph")
+        if isinstance(parrafo, dict):
+            for parte in parrafo.get("elements") or []:
+                if not isinstance(parte, dict):
+                    continue
+                text_run = parte.get("textRun")
+                if isinstance(text_run, dict):
+                    yield text_run
+
+        tabla = elemento.get("table")
+        if isinstance(tabla, dict):
+            for fila in tabla.get("tableRows") or []:
+                if not isinstance(fila, dict):
+                    continue
+                for celda in fila.get("tableCells") or []:
+                    if not isinstance(celda, dict):
+                        continue
+                    yield from _iterar_text_runs_google_docs(
+                        celda.get("content") or []
+                    )
+
+        toc = elemento.get("tableOfContents")
+        if isinstance(toc, dict):
+            yield from _iterar_text_runs_google_docs(
+                toc.get("content") or []
+            )
+
+
+def _iterar_contenidos_documento_google(doc: dict[str, Any]):
+    """Entrega listas de StructuralElement del cuerpo y de tabs si existen."""
+    body = doc.get("body")
+    if isinstance(body, dict):
+        yield body.get("content") or []
+
+    for coleccion in ("headers", "footers", "footnotes"):
+        valores = doc.get(coleccion)
+        if isinstance(valores, dict):
+            for item in valores.values():
+                if isinstance(item, dict):
+                    yield item.get("content") or []
+
+    def recorrer_tabs(tabs: Any):
+        if not isinstance(tabs, list):
+            return
+        for tab in tabs:
+            if not isinstance(tab, dict):
+                continue
+            document_tab = tab.get("documentTab")
+            if isinstance(document_tab, dict):
+                body_tab = document_tab.get("body")
+                if isinstance(body_tab, dict):
+                    yield body_tab.get("content") or []
+                for coleccion in ("headers", "footers", "footnotes"):
+                    valores_tab = document_tab.get(coleccion)
+                    if isinstance(valores_tab, dict):
+                        for item in valores_tab.values():
+                            if isinstance(item, dict):
+                                yield item.get("content") or []
+            yield from recorrer_tabs(tab.get("childTabs") or [])
+
+    yield from recorrer_tabs(doc.get("tabs") or [])
+
+
+@medir_operacion("docs.leer_sugerencias")
+def obtener_sugerencias_google_doc(
+    google_doc_id: str,
+) -> list[dict[str, str]]:
+    """
+    Lee las sugerencias pendientes de texto del Google Doc.
+
+    Se consideran inserciones y eliminaciones sugeridas. Los fragmentos que
+    comparten suggestion id se agrupan para mostrar un único cambio lógico.
+    """
+    google_doc_id = texto(google_doc_id)
+    if not google_doc_id:
+        return []
+
+    docs_service = obtener_docs_service()
+
+    # includeTabsContent no está disponible en todas las versiones del cliente
+    # discovery. Se intenta primero para cubrir documentos con tabs y, si la
+    # librería no reconoce el parámetro, se usa la lectura estándar.
+    try:
+        solicitud = docs_service.documents().get(
+            documentId=google_doc_id,
+            suggestionsViewMode="SUGGESTIONS_INLINE",
+            includeTabsContent=True,
+        )
+    except TypeError:
+        solicitud = docs_service.documents().get(
+            documentId=google_doc_id,
+            suggestionsViewMode="SUGGESTIONS_INLINE",
+        )
+
+    doc = solicitud.execute()
+
+    cambios: dict[tuple[str, str], dict[str, str]] = {}
+    orden: list[tuple[str, str]] = []
+
+    for contenido in _iterar_contenidos_documento_google(doc):
+        for text_run in _iterar_text_runs_google_docs(contenido):
+            contenido_texto = str(text_run.get("content") or "")
+            if not contenido_texto:
+                continue
+
+            tipos_ids = (
+                ("Inserción", text_run.get("suggestedInsertionIds") or []),
+                ("Eliminación", text_run.get("suggestedDeletionIds") or []),
+            )
+            for tipo, ids in tipos_ids:
+                for suggestion_id in ids:
+                    suggestion_id = texto(suggestion_id)
+                    if not suggestion_id:
+                        continue
+                    clave = (tipo, suggestion_id)
+                    if clave not in cambios:
+                        cambios[clave] = {
+                            "tipo": tipo,
+                            "suggestion_id": suggestion_id,
+                            "texto": "",
+                        }
+                        orden.append(clave)
+                    cambios[clave]["texto"] += contenido_texto
+
+    resultado: list[dict[str, str]] = []
+    for clave in orden:
+        cambio = cambios[clave]
+        contenido = re.sub(r"[ \t]+", " ", cambio["texto"])
+        contenido = re.sub(r"\n{3,}", "\n\n", contenido).strip()
+        if not contenido:
+            continue
+        resultado.append(
+            {
+                "tipo": cambio["tipo"],
+                "suggestion_id": cambio["suggestion_id"],
+                "texto": contenido,
+            }
+        )
+
+    return resultado
+
+
+def construir_control_cambios_email(
+    documento: dict[str, Any],
+) -> tuple[str, str]:
+    """
+    Construye el bloque de control de cambios para todos los correos internos.
+
+    La consulta es no bloqueante: si Google Docs API no está habilitada o no se
+    puede leer el archivo, el correo igualmente se envía indicando que la
+    consulta automática no estuvo disponible.
+    """
+    google_doc_id = texto(documento.get("GOOGLE_DOC_ID"))
+    if not google_doc_id:
+        mensaje = (
+            "No fue posible consultar sugerencias pendientes porque el "
+            "documento no tiene GOOGLE_DOC_ID."
+        )
+        return (
+            mensaje,
+            "<p style='margin:0;color:#92400e;'>"
+            + html.escape(mensaje)
+            + "</p>",
+        )
+
+    try:
+        sugerencias = obtener_sugerencias_google_doc(google_doc_id)
+    except Exception as exc:
+        traceback.print_exc()
+        mensaje = (
+            "No fue posible consultar automáticamente las sugerencias "
+            "pendientes de Google Docs. Revise el documento directamente. "
+            f"Detalle técnico: {texto(exc)[:240]}"
+        )
+        return (
+            mensaje,
+            "<p style='margin:0;color:#92400e;'>"
+            + html.escape(mensaje)
+            + "</p>",
+        )
+
+    if not sugerencias:
+        mensaje = "No se detectan sugerencias pendientes en la versión actual."
+        return (
+            mensaje,
+            "<p style='margin:0;color:#166534;'>"
+            + html.escape(mensaje)
+            + "</p>",
+        )
+
+    inserciones = sum(1 for s in sugerencias if s["tipo"] == "Inserción")
+    eliminaciones = sum(1 for s in sugerencias if s["tipo"] == "Eliminación")
+    encabezado = (
+        f"Se detectaron {len(sugerencias)} sugerencia(s) pendiente(s): "
+        f"{inserciones} inserción(es) y {eliminaciones} eliminación(es)."
+    )
+
+    lineas = [encabezado]
+    bloques_html = [
+        "<p style='margin:0 0 10px 0;font-weight:700;'>"
+        + html.escape(encabezado)
+        + "</p>"
+    ]
+
+    for indice, sugerencia in enumerate(sugerencias, start=1):
+        tipo = sugerencia["tipo"]
+        contenido = sugerencia["texto"]
+        # Evita que una sugerencia enorme domine el correo; el documento sigue
+        # siendo la fuente completa y se entrega mediante el botón de acceso.
+        contenido_email = contenido
+        if len(contenido_email) > 1200:
+            contenido_email = contenido_email[:1197].rstrip() + "..."
+
+        lineas.append(
+            f"{indice}. {tipo.upper()}: {contenido_email}"
+        )
+        fondo = "#ecfdf5" if tipo == "Inserción" else "#fef2f2"
+        borde = "#10b981" if tipo == "Inserción" else "#ef4444"
+        bloques_html.append(
+            "<div style='margin:8px 0;padding:10px 12px;"
+            f"background:{fondo};border-left:4px solid {borde};"
+            "border-radius:5px;'>"
+            f"<div style='font-weight:700;font-size:12px;'>{html.escape(tipo.upper())}</div>"
+            f"<div style='margin-top:4px;white-space:pre-wrap;'>{html.escape(contenido_email)}</div>"
+            "</div>"
+        )
+
+    return "\n".join(lineas), "".join(bloques_html)
+
+
 def construir_email_notificacion(
     *,
     documento: dict[str, Any],
@@ -5730,6 +5981,8 @@ def construir_email_notificacion(
     historial_html: str,
     link_documento: str,
     link_appsheet: str,
+    control_cambios_texto: str = "",
+    control_cambios_html: str = "",
 ) -> tuple[str, str, str]:
     if tipo_notificacion not in TIPOS_NOTIFICACION_VALIDOS:
         raise ValueError(
@@ -5766,12 +6019,11 @@ def construir_email_notificacion(
         or "No se registró un comentario adicional."
     )
 
-    lineas_enlaces = [f"Abrir en AppSheet: {link_appsheet}"]
-    if tipo_notificacion == "Acción requerida" and link_documento:
-        lineas_enlaces.insert(
-            0,
-            f"Abrir documento: {link_documento}",
-        )
+    lineas_enlaces: list[str] = []
+    if link_documento:
+        lineas_enlaces.append(f"Abrir documento: {link_documento}")
+    if link_appsheet:
+        lineas_enlaces.append(f"Ir a App Prime: {link_appsheet}")
 
     cuerpo_texto = (
         f"{tipo_notificacion.upper()}\n\n"
@@ -5784,6 +6036,9 @@ def construir_email_notificacion(
         f"Responsable actual: {responsable}\n\n"
         f"Último movimiento:\n{movimiento}\n\n"
         f"Comentario:\n{comentario_texto}\n\n"
+        + "CONTROL DE CAMBIOS (SUGERENCIAS PENDIENTES)\n\n"
+        + (control_cambios_texto or "No se pudo obtener información de sugerencias.")
+        + "\n\n"
         + "\n".join(lineas_enlaces)
         + "\n\nHISTORIAL DEL FLUJO\n\n"
         + historial_texto
@@ -5791,7 +6046,7 @@ def construir_email_notificacion(
     )
 
     botones_html: list[str] = []
-    if tipo_notificacion == "Acción requerida" and link_documento:
+    if link_documento:
         botones_html.append(
             """
             <a href="{url}" style="
@@ -5818,7 +6073,7 @@ def construir_email_notificacion(
             text-decoration:none;
             border-radius:6px;
             font-weight:700;
-        ">Abrir en AppSheet</a>
+        ">Ir a App Prime</a>
         """.format(url=html.escape(link_appsheet, quote=True))
     )
 
@@ -5890,6 +6145,19 @@ def construir_email_notificacion(
               <div style="white-space:pre-wrap;">{comentario_principal}</div>
             </div>
 
+            <div style="
+                padding:14px 16px;
+                margin:18px 0;
+                border-radius:8px;
+                background:#f8fafc;
+                border:1px solid #e2e8f0;
+            ">
+              <div style="font-weight:700; margin-bottom:8px;">
+                Control de cambios · sugerencias pendientes
+              </div>
+              {control_cambios_html}
+            </div>
+
             <div style="margin:22px 0;">
               {botones}
             </div>
@@ -5922,6 +6190,10 @@ def construir_email_notificacion(
         movimiento=html.escape(movimiento),
         comentario_principal=html.escape(comentario_texto),
         botones="".join(botones_html),
+        control_cambios_html=(
+            control_cambios_html
+            or "<p style='margin:0;color:#6b7280;'>Sin información disponible.</p>"
+        ),
         historial_html=historial_html,
         td_label=(
             "padding:8px 10px;border-bottom:1px solid #e5e7eb;"
@@ -6243,12 +6515,12 @@ def procesar_notificacion_individual(
     )
     email = obtener_email_notificacion(aprobador)
 
-    # Por diseño, solo las notificaciones de Acción requerida guardan
-    # y muestran el enlace directo al documento editable.
+    # Todos los correos internos de la cadena incluyen acceso al documento.
+    # Si la especificación no trae un link explícito, se usa la URL vigente
+    # del documento para evitar correos sin acceso después de reinicios.
     link_documento = (
         normalizar_url_appsheet(link_documento)
-        if tipo_notificacion == "Acción requerida"
-        else ""
+        or normalizar_url_appsheet(documento.get("GOOGLE_DOC_URL"))
     )
 
     if not email or not _EMAIL_RE.fullmatch(email):
@@ -6267,6 +6539,9 @@ def procesar_notificacion_individual(
             id_evento_excluir=id_evento,
             )
         )
+        control_cambios_texto, control_cambios_html = (
+            construir_control_cambios_email(documento)
+        )
 
         asunto, cuerpo_texto, cuerpo_html = (
             construir_email_notificacion(
@@ -6279,6 +6554,8 @@ def procesar_notificacion_individual(
                 historial_html=historial_html,
                 link_documento=link_documento,
                 link_appsheet=link_appsheet,
+                control_cambios_texto=control_cambios_texto,
+                control_cambios_html=control_cambios_html,
             )
         )
 
@@ -6700,6 +6977,9 @@ def notificar_destinatarios_internos_optimizado(
             id_evento_excluir=id_evento,
             mapa_nombres=mapa_nombres,
         )
+        control_cambios_texto, control_cambios_html = (
+            construir_control_cambios_email(documento)
+        )
         notificaciones_existentes = buscar_notificaciones_documento(
             id_documento
         )
@@ -6738,8 +7018,7 @@ def notificar_destinatarios_internos_optimizado(
             normalizar_url_appsheet(
                 especificacion.get("link_documento")
             )
-            if tipo_notificacion == "Acción requerida"
-            else ""
+            or normalizar_url_appsheet(documento.get("GOOGLE_DOC_URL"))
         )
 
         try:
@@ -6755,6 +7034,8 @@ def notificar_destinatarios_internos_optimizado(
                 historial_html=historial_html,
                 link_documento=link_documento,
                 link_appsheet=link_appsheet,
+                control_cambios_texto=control_cambios_texto,
+                control_cambios_html=control_cambios_html,
             )
             clave = construir_clave_idempotencia(
                 id_evento=id_evento,
@@ -7907,39 +8188,54 @@ def construir_especificaciones_reinicio_firma(
         texto(evento.get("COMENTARIO"))
         or "El documento recibió observaciones durante la firma."
     )
+    link_vigente = normalizar_url_appsheet(
+        documento.get("GOOGLE_DOC_URL")
+    )
     especificaciones: list[dict[str, Any]] = [
         {
             "aprobador": aprobador_destino,
             "tipo_notificacion": "Acción requerida",
             "movimiento": "Proceso reiniciado por observaciones de firma",
             "comentario_principal": comentario_evento,
-            "link_documento": normalizar_url_appsheet(
-                documento.get("GOOGLE_DOC_URL")
-            ),
+            "link_documento": link_vigente,
         }
     ]
 
-    if aprobador_confirma is not None:
-        especificaciones.append(
-            {
-                "aprobador": aprobador_confirma,
-                "tipo_notificacion": "Confirmación",
-                "movimiento": "Observaciones de firma registradas",
-                "comentario_principal": comentario_evento,
-                "link_documento": "",
-            }
-        )
+    correos_reservados = {
+        obtener_email_notificacion(aprobador_destino).lower()
+    }
 
+    if aprobador_confirma is not None:
+        email_confirma = obtener_email_notificacion(aprobador_confirma).lower()
+        if email_confirma and email_confirma not in correos_reservados:
+            especificaciones.append(
+                {
+                    "aprobador": aprobador_confirma,
+                    "tipo_notificacion": "Confirmación",
+                    "movimiento": "Observaciones de firma registradas",
+                    "comentario_principal": comentario_evento,
+                    "link_documento": link_vigente,
+                }
+            )
+            correos_reservados.add(email_confirma)
+
+    # El resto de la cadena recibe una única notificación informativa. Se
+    # excluyen los correos ya cubiertos arriba para evitar que el elaborador
+    # reciba después una segunda versión del mismo aviso con menor prioridad.
     for integrante in cadena:
+        email_integrante = obtener_email_notificacion(integrante).lower()
+        if not email_integrante or email_integrante in correos_reservados:
+            continue
         especificaciones.append(
             {
                 "aprobador": integrante,
                 "tipo_notificacion": "Informativa",
                 "movimiento": "El proceso volvió a borrador",
                 "comentario_principal": comentario_evento,
-                "link_documento": "",
+                "link_documento": link_vigente,
             }
         )
+        correos_reservados.add(email_integrante)
 
     return especificaciones
 
@@ -8313,6 +8609,9 @@ def diagnostico_notificacion():
             texto(data.get("comentario_principal"))
             or texto(evento.get("COMENTARIO"))
         )
+        control_cambios_texto, control_cambios_html = (
+            construir_control_cambios_email(documento)
+        )
 
         asunto, cuerpo_texto, cuerpo_html = (
             construir_email_notificacion(
@@ -8325,6 +8624,8 @@ def diagnostico_notificacion():
                 historial_html=historial_html,
                 link_documento=link_documento,
                 link_appsheet=link_appsheet,
+                control_cambios_texto=control_cambios_texto,
+                control_cambios_html=control_cambios_html,
             )
         )
 
@@ -8350,6 +8651,7 @@ def diagnostico_notificacion():
                 "movimiento": movimiento,
                 "comentario_principal": comentario_principal,
                 "historial_texto": historial_texto,
+                "control_cambios_texto": control_cambios_texto,
                 "cuerpo_texto": cuerpo_texto,
                 "cuerpo_html": cuerpo_html,
             }
