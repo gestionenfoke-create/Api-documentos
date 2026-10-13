@@ -14341,11 +14341,28 @@ def normalizar_datos_notaria(notaria: dict[str, Any]) -> dict[str, str]:
 
 
 def buscar_documentos_prime_propiedad(id_propiedad: str) -> list[dict[str, Any]]:
+    """Devuelve solo antecedentes Prime marcados expresamente para notaría.
+
+    La columna Documentos_prime[ENVIAR_NOTARIO] actúa como selector explícito:
+    únicamente las filas con valor TRUE se consideran antecedentes del envío.
+    Filas FALSE, vacías o sin valor quedan fuera.
+    """
     selector = (
-        f"FILTER({TABLA_DOCUMENTOS_PRIME}, "
-        f"[id_Propiedades] = {literal_appsheet(id_propiedad)})"
+        f"FILTER({TABLA_DOCUMENTOS_PRIME}, AND("
+        f"[id_Propiedades] = {literal_appsheet(id_propiedad)}, "
+        f"[ENVIAR_NOTARIO] = TRUE))"
     )
-    return appsheet_find(TABLA_DOCUMENTOS_PRIME, selector)
+    filas = appsheet_find(TABLA_DOCUMENTOS_PRIME, selector)
+
+    # Defensa adicional por si la API devolviera una representación distinta
+    # del Yes/No de AppSheet. Nunca incorporar una fila no marcada explícitamente.
+    return [
+        fila
+        for fila in filas
+        if str(fila.get("ENVIAR_NOTARIO", "")).strip().lower()
+        in {"true", "1", "yes", "si", "sí"}
+        or fila.get("ENVIAR_NOTARIO") is True
+    ]
 
 
 def mime_adjunto_desde_nombre(nombre: str) -> tuple[str, str]:
@@ -15700,10 +15717,8 @@ def enviar_notaria():
             mensaje_adicional = texto(raiz.get("MENSAJE_ADICIONAL_NOTARIA"))
 
         antecedentes_prime = buscar_documentos_prime_propiedad(id_propiedad_prime)
-        if not antecedentes_prime:
-            raise ValueError(
-                "La propiedad seleccionada no tiene registros en Documentos_prime"
-            )
+        # Es válido que no exista ningún antecedente Prime marcado para notaría.
+        # En ese caso se envían solamente los documentos DOCX del paquete.
 
         fecha_envio = ahora_iso()
         envio, cabecera_creada = obtener_o_crear_envio_notaria(
