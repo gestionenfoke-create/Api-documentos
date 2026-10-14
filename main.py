@@ -491,6 +491,7 @@ def copiar_plantilla(
     template_id: str,
     folder_id: str,
     nombre_documento: str,
+    copiar_comentarios_sugerencias: bool = False,
 ) -> dict[str, str]:
     metadata = {
         "name": nombre_documento,
@@ -504,6 +505,10 @@ def copiar_plantilla(
             body=metadata,
             fields="id,name,webViewLink",
             supportsAllDrives=True,
+            # En Google Drive API las sugerencias de Google Docs no se copian
+            # por defecto. copyComments=True conserva comentarios abiertos y
+            # sugerencias pendientes (modo "Sugerencias" / control de cambios).
+            copyComments=copiar_comentarios_sugerencias,
         )
         .execute()
     )
@@ -676,6 +681,8 @@ def copiar_archivo_o_reutilizar(
         template_id=source_file_id,
         folder_id=folder_id,
         nombre_documento=nombre_archivo,
+        # Las copias entre versiones deben mantener el control de cambios.
+        copiar_comentarios_sugerencias=True,
     )
 
 
